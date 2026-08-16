@@ -122,7 +122,19 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - Key fixes: MMU table reads (0x600C5000) for `esp_ota_get_running_partition`; SYSTIMER TARGET0/TARGET2 with
     correct INTC sources (37/39), unit1 select, period-mode tick, live counter reads for `esp_timer_get_time`.
   - App is a silent LED blink (debug report disabled) → no UART output expected; runs stable, no panics.
-  - Emulator throughput with ticks: ~18–20 M cycles/s (tick trap overhead dominates).
+  - Emulator throughput with ticks: ~18–20 M cycles/s (native, tick trap overhead dominates).
+- [x] **WASM build + browser test of C3** — 2026-08-16.
+  - `make CC=emcc wasm_defconfig` + `CONFIG_SYSTEM=y CONFIG_ELF_LOADER=y CONFIG_ESP32_C3=y` (no SDL).
+  - wasm 631 KB + js 70 KB (no embedded demos/DTB in ELF-loader mode). ~100–115 M cycles/s in wasm (faster than
+    native due to block chaining).
+  - Fixed mk/wasm.mk: DTB embed only when `!CONFIG_ELF_LOADER` (C3 needs no /minimal.dtb; system wasm mode needs it).
+  - Node headless test + headless-Chrome CDP test pass: full ROM banner, bootloader, app to idle task.
+  - Browser glue: `system.html` gained "Run ESP32-C3 App" button (fetches esp32c3/{elf,merged.bin}, writes MEMFS);
+    `system-pre.js` gained `run_esp32c3(elf, flash)` → `callMain(['-C','esp32c3','-F',flash,elf])`.
+  - Demo: `make prepare-web` or serve `demo/system/` (dev server: `python3 tools/dev-server.py --directory demo`),
+    open http://127.0.0.1:8000/system/system.html.
+  - Note: rebuilding wasm after native and vice versa needs `rm -rf build/softfloat build/devices` (archive/objects
+    are toolchain-specific; make does not detect the toolchain switch).
 - [ ] Phase 3: Port SoC layer to C6 (adds 802.15.4, USB-serial-JTAG, TWAI) — next.
 
 ## Known issues / gotchas

@@ -553,7 +553,7 @@ have_seen:
         if (addr >= C3_PERIPH_BASE + 0x3B040u &&
             addr < C3_PERIPH_BASE + 0x3B060u) {
             uint32_t w = esp32_sha_digest_word((addr - C3_PERIPH_BASE - 0x3B040u) >> 2);
-            {
+            if (0) {
                 static int dumped;
                 if (!dumped && sha_len > 1000) {
                     dumped = 1;
@@ -833,24 +833,24 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 esp32_sha_reset();
                 sha_reset_pending = 0;
             }
-            fprintf(stderr, "DBG: sha-mode val=0x%08x len=%u\n", val, sha_len);
+            if (0) fprintf(stderr, "DBG: sha-mode val=0x%08x len=%u\n", val, sha_len);
             mmio32[off >> 2] = val;
             return;
         }
         if (addr == C3_PERIPH_BASE + 0x3B010u) { /* SHA_START */
-            fprintf(stderr, "DBG: sha-start val=0x%08x len=%u\n", val, sha_len);
+            if (0) fprintf(stderr, "DBG: sha-start val=0x%08x len=%u\n", val, sha_len);
             mmio32[off >> 2] = val;
             return;
         }
         if (addr == C3_PERIPH_BASE + 0x3B014u) { /* SHA_CONTINUE */
-            fprintf(stderr, "DBG: sha-cont val=0x%08x len=%u\n", val, sha_len);
+            if (0) fprintf(stderr, "DBG: sha-cont val=0x%08x len=%u\n", val, sha_len);
             mmio32[off >> 2] = val;
             return;
         }
         if (addr >= C3_PERIPH_BASE + 0x3B040u &&
             addr < C3_PERIPH_BASE + 0x3B0C0u) { /* SHA message words */
             esp32_sha_feed_word(val);
-            fprintf(stderr, "DBG: sha-feed addr=0x%08x val=0x%08x len=%u\n",
+            if (0) fprintf(stderr, "DBG: sha-feed addr=0x%08x val=0x%08x len=%u\n",
                     addr, val, sha_len);
             mmio32[off >> 2] = val;
             return;
@@ -914,39 +914,39 @@ uint32_t esp32_read_w(riscv_t *rv, uint32_t addr)
                        (unsigned long long) rv->csr_cycle, rv->X[8], rv->X[19],
                        rv->PC);
        }
-       if (rv->csr_cycle < 10000000u && (rv->csr_cycle & 0xFFFu) == 0)
-           fprintf(stderr, "DBG: mrd-w pc=0x%08x addr=0x%08x\n", rv->PC, addr);
-       if (0 && rv->csr_cycle >= 10000000u && (rv->csr_cycle & 0xFFFu) == 0)
-           fprintf(stderr, "DBG: mrd-x pc=0x%08x addr=0x%08x\n", rv->PC, addr);
-        if (addr >= 0x6003B000u && addr < 0x6003C000u)
-            fprintf(stderr, "DBG: sha-rd-in pc=0x%08x addr=0x%08x\n", rv->PC,
-                    addr);
-        {
-            uint32_t v = esp32_mmio_read(PRIV(rv)->esp32c3, addr);
-            if (addr >= 0x60008800u && addr < 0x60008880u)
-                fprintf(stderr, "DBG: efuse-rd pc=0x%08x addr=0x%08x val=0x%08x\n",
-                        rv->PC, addr, v);
-            return v;
-        }
-    }
-    if (addr == 0x60004038u)
-        fprintf(stderr, "DBG: strap-read pc=0x%08x\n", rv->PC);
-    uint32_t val;
-    uint32_t off = esp32_flash_window_off(PRIV(rv)->esp32c3, addr);
-    if (off == ~0u)
-        off = addr - r->base;
-    memcpy(&val, r->data + off, 4);
-    if (addr >= 0x3C7E0000u && addr < 0x3C800000u && rv->PC == 0x403cf4acu)
-        fprintf(stderr, "DBG: alias-rd pc=0x%08x addr=0x%08x val=0x%08x\n",
-                rv->PC, addr, val);
+if (0 && rv->csr_cycle < 10000000u && (rv->csr_cycle & 0xFFFu) == 0)
+            fprintf(stderr, "DBG: mrd-w pc=0x%08x addr=0x%08x\n", rv->PC, addr);
+        if (0 && rv->csr_cycle >= 10000000u && (rv->csr_cycle & 0xFFFu) == 0)
+            fprintf(stderr, "DBG: mrd-x pc=0x%08x addr=0x%08x\n", rv->PC, addr);
+         if (0 && addr >= 0x6003B000u && addr < 0x6003C000u)
+             fprintf(stderr, "DBG: sha-rd-in pc=0x%08x addr=0x%08x\n", rv->PC,
+                     addr);
+         {
+             uint32_t v = esp32_mmio_read(PRIV(rv)->esp32c3, addr);
+             if (0 && addr >= 0x60008800u && addr < 0x60008880u)
+                 fprintf(stderr, "DBG: efuse-rd pc=0x%08x addr=0x%08x val=0x%08x\n",
+                         rv->PC, addr, v);
+             return v;
+         }
+     }
+     if (0 && addr == 0x60004038u)
+         fprintf(stderr, "DBG: strap-read pc=0x%08x\n", rv->PC);
+     uint32_t val;
+     uint32_t off = esp32_flash_window_off(PRIV(rv)->esp32c3, addr);
+     if (off == ~0u)
+         off = addr - r->base;
+     memcpy(&val, r->data + off, 4);
+     if (0 && addr >= 0x3C7E0000u && addr < 0x3C800000u && rv->PC == 0x403cf4acu)
+         fprintf(stderr, "DBG: alias-rd pc=0x%08x addr=0x%08x val=0x%08x\n",
+                 rv->PC, addr, val);
     if (addr >= C3_FLASH_I_BASE && addr < C3_FLASH_I_BASE + 0x1000u)
-        fprintf(stderr, "DBG: flash-read  pc=0x%08x addr=0x%08x val=0x%08x\n",
+        if (0) fprintf(stderr, "DBG: flash-read  pc=0x%08x addr=0x%08x val=0x%08x\n",
                 rv->PC, addr, val);
     if (addr >= C3_FLASH_I_BASE + 0x1000u && addr < C3_FLASH_I_BASE + 0x200000u)
-        fprintf(stderr, "DBG: flash-read  pc=0x%08x addr=0x%08x val=0x%08x\n",
+        if (0) fprintf(stderr, "DBG: flash-read  pc=0x%08x addr=0x%08x val=0x%08x\n",
                 rv->PC, addr, val);
     if (addr >= C3_FLASH_D_BASE && addr < C3_FLASH_D_BASE + 0x200000u)
-        fprintf(stderr, "DBG: flashd-read pc=0x%08x addr=0x%08x val=0x%08x\n",
+        if (0) fprintf(stderr, "DBG: flashd-read pc=0x%08x addr=0x%08x val=0x%08x\n",
                 rv->PC, addr, val);
     return val;
 }
@@ -964,20 +964,20 @@ uint16_t esp32_read_s(riscv_t *rv, uint32_t addr)
         uint32_t off = esp32_flash_window_off(PRIV(rv)->esp32c3, addr);
         uint16_t v;
         memcpy(&v, r->data + off, 2);
-        fprintf(stderr, "DBG: verify-s pc=0x%08x addr=0x%08x val=0x%04x\n",
+        if (0) fprintf(stderr, "DBG: verify-s pc=0x%08x addr=0x%08x val=0x%04x\n",
                 rv->PC, addr, v);
     }
-    if (addr == 0x60004038u)
+    if (0 && addr == 0x60004038u)
         fprintf(stderr, "DBG: strap-read-s pc=0x%08x\n", rv->PC);
     if (rv->PC >= 0x403cf000u && rv->PC < 0x403d0560u &&
         addr >= 0x3c7e0000u && addr < 0x3c7f0000u) {
-        fprintf(stderr, "DBG: verify-l pc=0x%08x addr=0x%08x val=0x%08x\n",
+        if (0) fprintf(stderr, "DBG: verify-l pc=0x%08x addr=0x%08x val=0x%08x\n",
                 rv->PC, addr,
                 *(uint32_t *)(r->data + (addr - r->base)));
     }
     if (rv->PC >= 0x403cf000u && rv->PC < 0x403d0560u &&
         addr >= 0x3c7f0000u && addr < 0x3c800000u) {
-        fprintf(stderr, "DBG: verify-m pc=0x%08x addr=0x%08x val=0x%08x\n",
+        if (0) fprintf(stderr, "DBG: verify-m pc=0x%08x addr=0x%08x val=0x%08x\n",
                 rv->PC, addr,
                 *(uint32_t *)(r->data + (addr - r->base)));
     }
@@ -987,7 +987,7 @@ uint16_t esp32_read_s(riscv_t *rv, uint32_t addr)
         off = addr - r->base;
     memcpy(&val, r->data + off, 2);
     if (addr >= C3_FLASH_I_BASE && addr < C3_FLASH_I_BASE + 0x1000u)
-        fprintf(stderr, "DBG: flash-reads pc=0x%08x addr=0x%08x val=0x%04x\n",
+        if (0) fprintf(stderr, "DBG: flash-reads pc=0x%08x addr=0x%08x val=0x%04x\n",
                 rv->PC, addr, val);
     return val;
 }
@@ -997,22 +997,22 @@ uint8_t esp32_read_b(riscv_t *rv, uint32_t addr)
     esp32_region_t *r = esp32_lookup(rv, addr);
     if (!r || r->type != ESP32_REG_RAM) {
         if (addr == 0x600C4034u)
-            fprintf(stderr, "DBG: mrd-b pc=0x%08x addr=0x%08x\n", rv->PC, addr);
+            if (0) fprintf(stderr, "DBG: mrd-b pc=0x%08x addr=0x%08x\n", rv->PC, addr);
         return (uint8_t) esp32_mmio_read(PRIV(rv)->esp32c3, addr);
     }
-    if (addr == 0x60004038u)
+    if (0 && addr == 0x60004038u)
         fprintf(stderr, "DBG: strap-read-b pc=0x%08x\n", rv->PC);
     if (rv->PC >= 0x403cf180u && rv->PC < 0x403cf200u)
-        fprintf(stderr, "DBG: chkrd-b pc=0x%08x addr=0x%08x val=0x%02x\n",
+        if (0) fprintf(stderr, "DBG: chkrd-b pc=0x%08x addr=0x%08x val=0x%02x\n",
                 rv->PC, addr, r->data[addr - r->base]);
     if (addr >= C3_FLASH_I_BASE && addr < C3_FLASH_I_BASE + 0x1000u)
-        fprintf(stderr, "DBG: flash-readb pc=0x%08x addr=0x%08x val=0x%02x\n",
+        if (0) fprintf(stderr, "DBG: flash-readb pc=0x%08x addr=0x%08x val=0x%02x\n",
                 rv->PC, addr, r->data[addr - r->base]);
     if (rv->PC >= 0x403cf000u && rv->PC < 0x403d0560u &&
         addr >= C3_FLASH_D_BASE && addr < C3_FLASH_D_BASE + 0x10000u &&
         addr != 0x3c000020u) {
         uint32_t off = esp32_flash_window_off(PRIV(rv)->esp32c3, addr);
-        fprintf(stderr, "DBG: verify-b pc=0x%08x addr=0x%08x val=0x%02x\n",
+        if (0) fprintf(stderr, "DBG: verify-b pc=0x%08x addr=0x%08x val=0x%02x\n",
                 rv->PC, addr, r->data[off]);
     }
     uint32_t off = esp32_flash_window_off(PRIV(rv)->esp32c3, addr);
@@ -1029,7 +1029,7 @@ static void acc_trace_write(riscv_t *rv, uint32_t addr, uint32_t val)
 {
     if (addr == 0x3fcde508u) {
         if (acc_writes < 8 || (val != last_acc && acc_writes < 4000)) {
-            fprintf(stderr, "DBG: accw %d pc=0x%08x val=0x%08x\n", acc_writes, rv->PC, val);
+            if (0) fprintf(stderr, "DBG: accw %d pc=0x%08x val=0x%08x\n", acc_writes, rv->PC, val);
         }
         last_acc = val;
         acc_writes++;
@@ -1043,17 +1043,17 @@ void esp32_write_w(riscv_t *rv, uint32_t addr, uint32_t val)
         uint32_t idx = (addr - C3_MMU_TABLE_BASE) >> 2;
         soc->mmu[idx] = val;
         if (rv->PC >= 0x403cf000u && rv->PC < 0x403d1000u)
-            fprintf(stderr, "DBG: mmu-w idx=%u page=0x%08x pc=0x%08x\n", idx,
+            if (0) fprintf(stderr, "DBG: mmu-w idx=%u page=0x%08x pc=0x%08x\n", idx,
                     val, rv->PC);
         return;
     }
-    if (addr >= 0x3FCDF100u && addr < 0x3FCDF130u)
+    if (0 && addr >= 0x3FCDF100u && addr < 0x3FCDF130u)
         fprintf(stderr, "DBG: write[0x%08x]=0x%08x from pc=0x%08x\n", addr,
                 val, rv->PC);
-    if (addr >= 0x3FCD5800u && addr < 0x3FCD5820u)
+    if (0 && addr >= 0x3FCD5800u && addr < 0x3FCD5820u)
         fprintf(stderr, "DBG: hdr-wr[0x%08x]=0x%08x from pc=0x%08x\n", addr,
                 val, rv->PC);
-    if (rv->PC >= 0x40057e52u && rv->PC < 0x40057f10u)
+    if (0 && rv->PC >= 0x40057e52u && rv->PC < 0x40057f10u)
         fprintf(stderr, "DBG: mcpy-wr[0x%08x]=0x%08x from pc=0x%08x\n", addr,
                 val, rv->PC);
     esp32_region_t *r = esp32_lookup(rv, addr);

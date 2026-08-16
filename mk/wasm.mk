@@ -74,8 +74,12 @@ ifeq ($(CONFIG_SYSTEM),y)
 CFLAGS_emcc += -sINITIAL_MEMORY=768MB \
                -DMEM_SIZE=0x20000000 \
                -sEXPORTED_RUNTIME_METHODS='["callMain","FS"]' \
-               --embed-file build/minimal.dtb@/minimal.dtb \
                --pre-js $(WEB_JS_RESOURCES)/system-pre.js
+# Linux kernel boot mode (no ELF loader) needs the compiled-in DTB. The
+# ELF-loader system mode (e.g. the ESP32-C3 machine) never touches it.
+ifneq ($(CONFIG_ELF_LOADER),y)
+CFLAGS_emcc += --embed-file build/minimal.dtb@/minimal.dtb
+endif
 else
 CFLAGS_emcc += -sINITIAL_MEMORY=320MB \
                -DMEM_SIZE=0x10000000 \
@@ -266,9 +270,11 @@ start_web_deps := check-demo-dir-exist $(BIN) $(XTERM_DATA)
 ifeq ($(CONFIG_SYSTEM),y)
 # rootfs.web.cpio is the upstream rootfs.cpio with an /etc/init.d/S99automount
 # overlay so the guest auto-mounts /dev/vda at /mnt during boot.
-start_web_deps += $(BUILD_DTB) $(BUILD_DTB2C) \
-                  $(OUT)/linux-image/Image \
+start_web_deps += $(OUT)/linux-image/Image \
                   $(OUT)/linux-image/rootfs.web.cpio
+ifneq ($(CONFIG_ELF_LOADER),y)
+start_web_deps += $(BUILD_DTB) $(BUILD_DTB2C)
+endif
 else
 # User mode also stages large game data alongside the WASM bundle so the
 # WEB_FILES copy step succeeds. These targets pull from DOOM_DATA/QUAKE_DATA

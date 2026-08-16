@@ -503,6 +503,7 @@
 
     <div class="controls-panel progressive-load">
       <button class="btn btn-primary" id="runSysButton" disabled>Boot Linux</button>
+      <button class="btn btn-secondary" id="runEsp32c3Button" disabled>Run ESP32-C3 App</button>
     </div>
 
     <div class="canvas-panel progressive-load">
@@ -632,6 +633,7 @@
     const statusText = document.getElementById('statusText');
     const progressElement = document.getElementById('progress');
     const runSysButton = document.getElementById('runSysButton');
+    const runEsp32c3Button = document.getElementById('runEsp32c3Button');
 
     // Fetch a file with progress reporting, return Uint8Array
     async function fetchWithProgress(url, label) {
@@ -717,6 +719,45 @@
         statusBadge.classList.add('loading');
         if (term) term.write(`\x1b[31mError: ${err.message}\x1b[0m\r\n`);
         runSysButton.disabled = false;
+      }
+    });
+
+    // ESP32-C3 app mode: fetch the firmware ELF + merged flash image, then
+    // boot them through the esp32c3 machine (callMain '-C esp32c3 -F flash elf').
+    const ESP32C3_ELF = 'esp32c3/esp32test.ino.elf';
+    const ESP32C3_FLASH = 'esp32c3/esp32test.ino.merged.bin';
+
+    runEsp32c3Button?.addEventListener('click', async () => {
+      runEsp32c3Button.disabled = true;
+      statusText.textContent = 'Downloading ESP32-C3 firmware...';
+      statusBadge.classList.add('loading');
+      if (term) term.write('\x1b[33mDownloading ESP32-C3 firmware...\x1b[0m\r\n');
+
+      try {
+        const [elfData, flashData] = await Promise.all([
+          fetchWithProgress(ESP32C3_ELF, 'App ELF'),
+          fetchWithProgress(ESP32C3_FLASH, 'Flash image'),
+        ]);
+
+        if (term) term.write('\x1b[33mWriting firmware to VFS...\x1b[0m\r\n');
+        try {
+          Module.FS.mkdir('/esp32c3');
+        } catch (e) { /* already exists */ }
+        Module.FS.writeFile('/' + ESP32C3_ELF, elfData);
+        Module.FS.writeFile('/' + ESP32C3_FLASH, flashData);
+
+        statusText.textContent = 'Booting ESP32-C3 app...';
+        statusBadge.classList.remove('loading');
+        if (term) term.write('\x1b[33mBooting ESP32-C3 app...\x1b[0m\r\n');
+
+        Module._indirect_rv_halt();
+        Module['run_esp32c3'](ESP32C3_ELF, ESP32C3_FLASH);
+      } catch (err) {
+        console.error('ESP32-C3 boot failed:', err);
+        statusText.textContent = 'Download failed';
+        statusBadge.classList.add('loading');
+        if (term) term.write(`\x1b[31mError: ${err.message}\x1b[0m\r\n`);
+        runEsp32c3Button.disabled = false;
       }
     });
 
@@ -955,6 +996,7 @@
         initTerminalWithKeyHandler();
         // Enable boot button now that emulator is ready
         if (runSysButton) runSysButton.disabled = false;
+        if (runEsp32c3Button) runEsp32c3Button.disabled = false;
         setTimeout(() => ProgressiveLoader.hide(), 300);
       }
     };
