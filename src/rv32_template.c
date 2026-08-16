@@ -583,6 +583,7 @@ RVOP(hret, {
 
 /* MRET: return from traps in M-mode */
 RVOP(mret, {
+    rv->is_trapped = false;
     rv->priv_mode = (rv->csr_mstatus & MSTATUS_MPP) >> MSTATUS_MPP_SHIFT;
     rv->csr_mstatus &= ~(MSTATUS_MPP);
 

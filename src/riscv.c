@@ -32,6 +32,9 @@
 #endif
 
 #include "elf.h"
+#if RV32_HAS(ESP32_C3)
+#include "esp32c3.h"
+#endif
 #include "mpool.h"
 #include "riscv.h"
 #include "riscv_private.h"
@@ -668,6 +671,11 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     rv_log_info("Log level: %s", rv_log_level_string(attr->log_level));
 
 #if !RV32_HAS(SYSTEM_MMIO)
+    #if RV32_HAS(ESP32_C3)
+    /* ESP32-C3: the SoC owns ELF loading (esp32c3_boot), skip the upstream
+     * flat-memory loader entirely. */
+    if (!attr->esp32c3) {
+#endif
     elf_t *elf = elf_new();
     assert(elf);
 
@@ -706,6 +714,9 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     assert(rv_set_pc(rv, hdr->e_entry));
 
     elf_delete(elf);
+#if RV32_HAS(ESP32_C3)
+    }
+#endif
 
 /* combine with USE_ELF for system test suite */
 #if RV32_HAS(SYSTEM)
@@ -971,6 +982,19 @@ riscv_t *rv_create(riscv_user_t rv_attr)
 #endif
 #endif
 
+    #if RV32_HAS(ESP32_C3)
+    if (attr->esp32c3) {
+        /* ESP32-C3 machine: load the ELF into the SoC memory model and
+         * install the SoC I/O handlers (M-mode, no MMU).
+         * The C3 core handles misaligned data accesses natively (the ROM
+         * startup deliberately performs a word load from an odd address). */
+        rv->PC = esp32c3_boot(attr->esp32c3, attr->data.user.elf_program);
+        PRIV(rv)->allow_misalign = true;
+        esp32c3_install_io(rv);
+        return rv;
+    }
+#endif /* RV32_HAS(ESP32_C3) */
+
     return rv;
 
 #if RV32_HAS(JIT)
@@ -1183,7 +1207,7 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
     memset(rv->X, 0, sizeof(uint32_t) * N_RV_REGS);
 
     vm_attr_t *attr = PRIV(rv);
-#if !RV32_HAS(SYSTEM_MMIO)
+#if !RV32_HAS(SYSTEM_MMIO) && !RV32_HAS(ESP32_C3)
     int argc = attr->argc;
     char **args = attr->argv;
     memory_t *mem = attr->mem;
@@ -1203,8 +1227,15 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
 #endif
 
     /* set the default stack pointer */
+#if RV32_HAS(ESP32_C3)
+    /* ESP32-C3: stack pointer is set by the SoC boot path (DRAM top) */
+    if (!attr->esp32c3)
+        rv->X[rv_reg_sp] =
+            attr->mem_size - attr->stack_size - attr->args_offset_size;
+#else
     rv->X[rv_reg_sp] =
         attr->mem_size - attr->stack_size - attr->args_offset_size;
+#endif
 
     /* User-mode: Store 'argc' and 'args' of the target program in 'state->mem'.
      * System-mode: Skip this - kernel boot doesn't use argc/argv.
@@ -1236,7 +1267,7 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
      *
      * TODO: access to envp
      */
-#if !RV32_HAS(SYSTEM_MMIO)
+#if !RV32_HAS(SYSTEM_MMIO) && !RV32_HAS(ESP32_C3)
     /* copy args to RAM */
     uintptr_t args_size = (1 + argc + 1) * sizeof(uint32_t);
     uintptr_t args_bottom = attr->mem_size - attr->stack_size;
@@ -1312,6 +1343,13 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
     rv->csr_satp = 0;
     memset(rv->dtlb, 0, sizeof(rv->dtlb));
     memset(rv->itlb, 0, sizeof(rv->itlb));
+#if RV32_HAS(ESP32_C3)
+    if (attr->esp32c3) {
+        /* ESP32-C3 bare-metal firmware runs in M-mode, stack at DRAM top */
+        rv->priv_mode = RV_PRIV_M_MODE;
+        rv->X[rv_reg_sp] = C3_DRAM_TOP;
+    }
+#endif /* RV32_HAS(ESP32_C3) */
 #else
     /* ISA simulation defaults to M-mode */
     rv->priv_mode = RV_PRIV_M_MODE;

@@ -282,6 +282,15 @@ config ELF_LOADER
       Enable this for running 'make check' tests in system mode.
       Disable this for booting Linux kernel images.
 
+config ESP32_C3
+    bool "ESP32-C3 SoC support"
+    default n
+    depends on SYSTEM && ELF_LOADER
+    help
+      Enable the ESP32-C3 SoC model (single combined WASM target chip #1).
+      Boots ESP-IDF / Arduino firmware in M-mode with UART0, SYSTIMER, INTC,
+      GPIO, eFuse and stub peripheral banks. Select at runtime with -C esp32c3.
+
 endmenu
 
 # Performance Optimizations

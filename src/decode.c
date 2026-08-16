@@ -976,7 +976,9 @@ static inline bool op_jal(rv_insn_t *ir, const uint32_t insn)
 
 FORCE_INLINE bool csr_is_writable(const uint32_t csr)
 {
-    return csr < 0xc00;
+    /* ir->imm is sign-extended from the 12-bit CSR field; mask before
+     * comparing so custom read/write CSRs (0x800-0x8FF) pass. */
+    return (csr & 0xFFF) < 0xc00;
 }
 
 /* SYSTEM: I-type

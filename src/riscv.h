@@ -578,6 +578,11 @@ typedef struct {
     /* userspace or system emulation data */
     vm_data_t data;
 
+#if RV32_HAS(ESP32_C3)
+    /* ESP32-C3 SoC model (NULL when not in ESP32 mode) */
+    struct esp32c3_soc *esp32c3;
+#endif /* RV32_HAS(ESP32_C3) */
+
     /* number of cycle(instruction) in a rv_step call*/
     int cycle_per_step;
 

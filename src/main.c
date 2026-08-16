@@ -16,6 +16,10 @@
 #include "em_runtime.h"
 #endif
 
+#if RV32_HAS(ESP32_C3)
+#include "esp32c3.h"
+#endif
+
 #include "elf.h"
 #include "io.h"
 #include "riscv.h"
@@ -45,10 +49,15 @@ static bool opt_quiet_outputs = false;
 /* target executable */
 static char *opt_prog_name;
 
+#if RV32_HAS(ESP32_C3)
+/* ESP32 chip selection (-C esp32c3) */
+static char *opt_esp32_chip;
+#endif
+
 /* target argc and argv */
 static int prog_argc;
 static char **prog_args;
-static const char *optstr = "tgqmhpd:a:k:i:b:x:";
+static const char *optstr = "tgqmhpd:a:k:i:b:x:C:F:";
 
 /* enable misaligned memory access */
 static bool opt_misaligned = false;
@@ -141,6 +150,9 @@ static void print_usage(const char *filename)
 #endif
         "  -d [filename]: dump registers as JSON to the "
         "given file or `-` (STDOUT)\n"
+#if RV32_HAS(ESP32_C3)
+        "  -C esp32c3 : run the ELF as an ESP32-C3 application\n"
+#endif
         "  -q : Suppress outputs other than `dump-registers`\n"
         "  -a [filename] : dump signature to the given file, "
         "required by arch-test test\n"
@@ -211,6 +223,15 @@ static bool parse_args(int argc, char **args)
         case 'p':
             opt_prof_data = true;
             break;
+#if RV32_HAS(ESP32_C3)
+        case 'C':
+            opt_esp32_chip = optarg;
+            emu_argc++;
+            break;
+        case 'F':
+            esp32c3_flash_image_path = optarg;
+            break;
+#endif
         case 'd':
             opt_dump_regs = true;
             registers_out_file = optarg;
@@ -375,7 +396,7 @@ int main(int argc, char **args)
         .args_offset_size = ARGS_OFFSET_SIZE,
         .argc = prog_argc,
         .argv = prog_args,
-        .log_level = LOG_WARN,
+        .log_level = LOG_TRACE,
         .run_flag = run_flag,
         .profile_output_file = prof_out_file,
         .cycle_per_step = CYCLE_PER_STEP,
@@ -384,6 +405,16 @@ int main(int argc, char **args)
         .fd_stdout = STDOUT_FILENO,
         .fd_stderr = STDERR_FILENO,
     };
+#if RV32_HAS(ESP32_C3)
+    if (opt_esp32_chip) {
+        if (strcmp(opt_esp32_chip, "esp32c3") == 0) {
+            attr.esp32c3 = esp32c3_new();
+        } else {
+            rv_log_fatal("Unsupported chip: %s", opt_esp32_chip);
+            return 1;
+        }
+    }
+#endif
 #if RV32_HAS(SYSTEM_MMIO)
     attr.data.system.kernel = opt_kernel_img;
     attr.data.system.initrd = opt_rootfs_img;
