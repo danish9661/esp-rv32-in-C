@@ -19,6 +19,9 @@
 #if RV32_HAS(ESP32_C3)
 #include "esp32c3.h"
 #endif
+#if RV32_HAS(ESP32_C6)
+#include "esp32c6.h"
+#endif
 
 #include "elf.h"
 #include "io.h"
@@ -49,8 +52,8 @@ static bool opt_quiet_outputs = false;
 /* target executable */
 static char *opt_prog_name;
 
-#if RV32_HAS(ESP32_C3)
-/* ESP32 chip selection (-C esp32c3) */
+#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
+/* ESP32 chip selection (-C esp32c3 / -C esp32c6) */
 static char *opt_esp32_chip;
 #endif
 
@@ -153,6 +156,9 @@ static void print_usage(const char *filename)
 #if RV32_HAS(ESP32_C3)
         "  -C esp32c3 : run the ELF as an ESP32-C3 application\n"
 #endif
+#if RV32_HAS(ESP32_C6)
+        "  -C esp32c6 : run the ELF as an ESP32-C6 application\n"
+#endif
         "  -q : Suppress outputs other than `dump-registers`\n"
         "  -a [filename] : dump signature to the given file, "
         "required by arch-test test\n"
@@ -223,13 +229,20 @@ static bool parse_args(int argc, char **args)
         case 'p':
             opt_prof_data = true;
             break;
-#if RV32_HAS(ESP32_C3)
+#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
         case 'C':
             opt_esp32_chip = optarg;
             emu_argc++;
             break;
+#endif
+#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
         case 'F':
+#if RV32_HAS(ESP32_C3)
             esp32c3_flash_image_path = optarg;
+#endif
+#if RV32_HAS(ESP32_C6)
+            esp32c6_flash_image_path = optarg;
+#endif
             break;
 #endif
         case 'd':
@@ -405,10 +418,12 @@ int main(int argc, char **args)
         .fd_stdout = STDOUT_FILENO,
         .fd_stderr = STDERR_FILENO,
     };
-#if RV32_HAS(ESP32_C3)
+#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
     if (opt_esp32_chip) {
         if (strcmp(opt_esp32_chip, "esp32c3") == 0) {
             attr.esp32c3 = esp32c3_new();
+        } else if (strcmp(opt_esp32_chip, "esp32c6") == 0) {
+            attr.esp32c6 = esp32c6_new();
         } else {
             rv_log_fatal("Unsupported chip: %s", opt_esp32_chip);
             return 1;

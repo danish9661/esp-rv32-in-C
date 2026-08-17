@@ -35,6 +35,9 @@
 #if RV32_HAS(ESP32_C3)
 #include "esp32c3.h"
 #endif
+#if RV32_HAS(ESP32_C6)
+#include "esp32c6.h"
+#endif
 #include "mpool.h"
 #include "riscv.h"
 #include "riscv_private.h"
@@ -256,7 +259,7 @@ static void *t2c_runloop(void *arg)
             block = NULL;
 #endif
         /* Compile only if block still exists in cache */
-        if (block)
+        if (block && block->translatable)
             t2c_compile(rv, block, &rv->cache_lock);
         else
             pthread_mutex_unlock(&rv->cache_lock);
@@ -676,6 +679,9 @@ riscv_t *rv_create(riscv_user_t rv_attr)
      * flat-memory loader entirely. */
     if (!attr->esp32c3) {
 #endif
+    #if RV32_HAS(ESP32_C6)
+    if (!attr->esp32c6) {
+#endif
     elf_t *elf = elf_new();
     assert(elf);
 
@@ -715,6 +721,9 @@ riscv_t *rv_create(riscv_user_t rv_attr)
 
     elf_delete(elf);
 #if RV32_HAS(ESP32_C3)
+    }
+#endif
+#if RV32_HAS(ESP32_C6)
     }
 #endif
 
@@ -995,6 +1004,17 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     }
 #endif /* RV32_HAS(ESP32_C3) */
 
+    #if RV32_HAS(ESP32_C6)
+    if (attr->esp32c6) {
+        /* ESP32-C6 machine: load the ELF into the SoC memory model and
+         * install the SoC I/O handlers (M-mode, no MMU). */
+        rv->PC = esp32c6_boot(attr->esp32c6, attr->data.user.elf_program);
+        PRIV(rv)->allow_misalign = true;
+        esp32c6_install_io(rv);
+        return rv;
+    }
+#endif /* RV32_HAS(ESP32_C6) */
+
     return rv;
 
 #if RV32_HAS(JIT)
@@ -1049,23 +1069,28 @@ static void rv_run_and_trace(riscv_t *rv)
     assert(rv);
 
     vm_attr_t *attr = PRIV(rv);
-    assert(attr && attr->data.user.elf_program);
+    assert(attr);
     attr->cycle_per_step = 1;
 
-    const char UNUSED *prog_name = attr->data.user.elf_program;
-    elf_t *elf = elf_new();
-    assert(elf && elf_open(elf, prog_name));
+    /* trace mode needs a symbol source; without an ELF (flash-image boot)
+     * just trace raw PCs */
+    elf_t *elf = NULL;
+    if (attr->data.user.elf_program) {
+        elf = elf_new();
+        assert(elf && elf_open(elf, attr->data.user.elf_program));
+    }
 
     for (; !rv_has_halted(rv);) { /* run until the flag is done */
         /* trace execution */
         uint32_t pc = rv_get_pc(rv);
-        const char *sym = elf_find_symbol(elf, pc);
+        const char *sym = elf ? elf_find_symbol(elf, pc) : NULL;
         rv_log_trace("%08x  %s", pc, (sym ? sym : ""));
 
         rv_step(rv); /* step instructions */
     }
 
-    elf_delete(elf);
+    if (elf)
+        elf_delete(elf);
 }
 #endif
 
@@ -1084,6 +1109,8 @@ void rv_run(riscv_t *rv)
     assert(attr &&
 #if RV32_HAS(SYSTEM_MMIO)
            attr->data.system.kernel && attr->data.system.initrd
+#elif RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
+           (attr->esp32c3 || attr->esp32c6 || attr->data.user.elf_program)
 #else
            attr->data.user.elf_program
 #endif
@@ -1232,7 +1259,14 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
     if (!attr->esp32c3)
         rv->X[rv_reg_sp] =
             attr->mem_size - attr->stack_size - attr->args_offset_size;
-#else
+#endif
+#if RV32_HAS(ESP32_C6)
+    /* ESP32-C6: stack pointer is set by the SoC boot path (SRAM top) */
+    if (!attr->esp32c6)
+        rv->X[rv_reg_sp] =
+            attr->mem_size - attr->stack_size - attr->args_offset_size;
+#endif
+#if !RV32_HAS(ESP32_C3) && !RV32_HAS(ESP32_C6)
     rv->X[rv_reg_sp] =
         attr->mem_size - attr->stack_size - attr->args_offset_size;
 #endif
@@ -1350,6 +1384,13 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
         rv->X[rv_reg_sp] = C3_DRAM_TOP;
     }
 #endif /* RV32_HAS(ESP32_C3) */
+#if RV32_HAS(ESP32_C6)
+    if (attr->esp32c6) {
+        /* ESP32-C6 bare-metal firmware runs in M-mode, stack in HP-SRAM */
+        rv->priv_mode = RV_PRIV_M_MODE;
+        rv->X[rv_reg_sp] = C6_SRAM_BASE + C6_SRAM_SIZE;
+    }
+#endif /* RV32_HAS(ESP32_C6) */
 #else
     /* ISA simulation defaults to M-mode */
     rv->priv_mode = RV_PRIV_M_MODE;

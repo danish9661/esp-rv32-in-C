@@ -33,6 +33,9 @@ extern struct target_ops gdbstub_ops;
 #if RV32_HAS(ESP32_C3)
 #include "esp32c3.h"
 #endif
+#if RV32_HAS(ESP32_C6)
+#include "esp32c6.h"
+#endif
 
 #if RV32_HAS(JIT)
 #include "cache.h"
@@ -379,6 +382,8 @@ static uint32_t *csr_get_ptr(riscv_t *rv, uint32_t csr)
         return (uint32_t *) (&rv->csr_mtval);
     case CSR_MIP: /* Machine Interrupt Pending */
         return (uint32_t *) (&rv->csr_mip);
+    case CSR_MIE: /* Machine Interrupt Enable */
+        return (uint32_t *) (&rv->csr_mie);
 
     /* Machine Counter/Timers */
     case CSR_CYCLE: /* Cycle counter for RDCYCLE instruction */
@@ -400,7 +405,7 @@ static uint32_t *csr_get_ptr(riscv_t *rv, uint32_t csr)
     case 0x802: /* ESP32-C3 ROM uses custom CSR 0x802 as cycle counter */
         return (uint32_t *) &rv->csr_cycle;
     case 0x7E2: /* ESP32-C3 bootloader cycle counter (CSR 0x7E2) */
-        fprintf(stderr, "DBG: csr7e2 pc=0x%08x cycle=%llu\n", rv->PC,
+        if (0) fprintf(stderr, "DBG: csr7e2 pc=0x%08x cycle=%llu\n", rv->PC,
                 (unsigned long long) rv->csr_cycle);
         return (uint32_t *) &rv->csr_cycle;
 #if RV32_HAS(EXT_F)
@@ -1472,10 +1477,20 @@ retranslate:
 
         /* decode the instruction */
         if (!rv_decode(ir, insn)) {
-            fprintf(stderr, "DBG: rv_decode fail insn=%08x pc=%08x\n", insn,
-                    block->pc_end);
+            static unsigned long dfl_count;
+            if (dfl_count++ < 40u)
+                fprintf(stderr, "DBG: rv_decode fail insn=%08x pc=%08x\n", insn,
+                        block->pc_end);
             rv->compressed = is_compressed(insn);
-            SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ILLEGAL_INSN, insn);
+            /* Set the trap state WITHOUT invoking on_trap: the handler would
+             * run to completion (e.g., mret) and clear is_trapped while we
+             * are still inside block_translate, leaving rv_step unable to
+             * deliver the trap when we return NULL. rv_step delivers it via
+             * its is_trapped check instead.
+             */
+            rv->csr_mcause = ILLEGAL_INSN;
+            rv->csr_mtval = insn;
+            rv->is_trapped = true;
             break;
         }
         ir->impl = dispatch_table[ir->opcode];
@@ -2396,6 +2411,13 @@ void rv_step(void *arg)
             esp32c3_check_interrupt(rv);
         }
 #endif
+#if RV32_HAS(ESP32_C6)
+        if (PRIV(rv)->esp32c6) {
+            /* advance ESP32 peripherals and deliver M-mode interrupts */
+            esp32c6_periodic(rv);
+            esp32c6_check_interrupt(rv);
+        }
+#endif
 
 #ifdef __EMSCRIPTEN__
         // Resume from saved instruction after stack unwind
@@ -2496,7 +2518,8 @@ void rv_step(void *arg)
 #if RV32_HAS(JIT)
 #if RV32_HAS(T2C)
         /* executed through the tier-2 JIT compiler */
-        if (ATOMIC_LOAD(&block->hot2, ATOMIC_ACQUIRE)) {
+        if (block->translatable &&
+            ATOMIC_LOAD(&block->hot2, ATOMIC_ACQUIRE)) {
             /* Atomic load-acquire pairs with store-release in t2c_compile().
              * Ensures we see the updated block->func after observing hot2=true.
              */
@@ -2516,7 +2539,8 @@ void rv_step(void *arg)
             prev = NULL;
             continue;
         } /* check if invoking times of t1 generated code exceed threshold */
-        else if (!ATOMIC_LOAD(&block->compiled, ATOMIC_RELAXED) &&
+        else if (block->translatable &&
+                 !ATOMIC_LOAD(&block->compiled, ATOMIC_RELAXED) &&
                  ATOMIC_LOAD(&block->n_invoke, ATOMIC_RELAXED) >= THRESHOLD) {
             ATOMIC_STORE(&block->compiled, true, ATOMIC_RELAXED);
             queue_entry_t *entry = malloc(sizeof(queue_entry_t));

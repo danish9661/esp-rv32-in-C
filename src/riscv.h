@@ -583,6 +583,11 @@ typedef struct {
     struct esp32c3_soc *esp32c3;
 #endif /* RV32_HAS(ESP32_C3) */
 
+#if RV32_HAS(ESP32_C6)
+    /* ESP32-C6 SoC model (NULL when not in ESP32 mode) */
+    struct esp32c6_soc *esp32c6;
+#endif /* RV32_HAS(ESP32_C6) */
+
     /* number of cycle(instruction) in a rv_step call*/
     int cycle_per_step;
 

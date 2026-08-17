@@ -56,11 +56,14 @@ OBJS_EXT :=
 ifeq ($(CONFIG_ESP32_C3),y)
 OBJS_EXT += esp32c3.o
 endif
+ifeq ($(CONFIG_ESP32_C6),y)
+OBJS_EXT += esp32c6.o
+endif
 deps :=
 
 # Feature Flags (Kconfig -> RV32_FEATURE_*)
 $(call set-features, ELF_LOADER MOP_FUSION BLOCK_CHAINING LOG_COLOR)
-$(call set-features, SYSTEM GOLDFISH_RTC ARCH_TEST ESP32_C3)
+$(call set-features, SYSTEM GOLDFISH_RTC ARCH_TEST ESP32_C3 ESP32_C6)
 $(call set-features, EXT_M EXT_A EXT_F EXT_C EXT_V RV32E)
 $(call set-features, Zicsr Zifencei Zba Zbb Zbc Zbs)
 $(call set-features, SDL SDL_MIXER GDBSTUB JIT)

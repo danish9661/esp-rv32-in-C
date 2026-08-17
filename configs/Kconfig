@@ -291,6 +291,15 @@ config ESP32_C3
       Boots ESP-IDF / Arduino firmware in M-mode with UART0, SYSTIMER, INTC,
       GPIO, eFuse and stub peripheral banks. Select at runtime with -C esp32c3.
 
+config ESP32_C6
+    bool "ESP32-C6 SoC support"
+    default n
+    depends on SYSTEM && ELF_LOADER
+    help
+      Enable the ESP32-C6 SoC model. Boots ESP-IDF / Arduino firmware in
+      M-mode with UART0, SYSTIMER, interrupt matrix + PLIC/CLINT, GPIO,
+      eFuse and stub peripheral banks. Select at runtime with -C esp32c6.
+
 endmenu
 
 # Performance Optimizations
