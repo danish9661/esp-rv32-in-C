@@ -60,7 +60,7 @@ static char *opt_esp32_chip;
 /* target argc and argv */
 static int prog_argc;
 static char **prog_args;
-static const char *optstr = "tgqmhpd:a:k:i:b:x:C:F:";
+static const char *optstr = "tgqmhpd:a:k:i:b:x:C:F:U:";
 
 /* enable misaligned memory access */
 static bool opt_misaligned = false;
@@ -158,6 +158,8 @@ static void print_usage(const char *filename)
 #endif
 #if RV32_HAS(ESP32_C6)
         "  -C esp32c6 : run the ELF as an ESP32-C6 application\n"
+        "  -U <fifo> : ESP32-C6 UART RX injection source (host writes "
+        "command bytes here)\n"
 #endif
         "  -q : Suppress outputs other than `dump-registers`\n"
         "  -a [filename] : dump signature to the given file, "
@@ -242,6 +244,11 @@ static bool parse_args(int argc, char **args)
 #endif
 #if RV32_HAS(ESP32_C6)
             esp32c6_flash_image_path = optarg;
+#endif
+            break;
+        case 'U':
+#if RV32_HAS(ESP32_C6)
+            esp32c6_uart_rx_path = optarg;
 #endif
             break;
 #endif

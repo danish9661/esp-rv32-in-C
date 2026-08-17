@@ -20,11 +20,14 @@
  */
 
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "esp32c6.h"
 #include "esp32c6_rom.h"
@@ -210,6 +213,12 @@ struct esp32c6_soc {
     char uart_line[256];
     int uart_line_len;
 
+    /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
+    uint8_t uart_rx[128];
+    unsigned int uart_rx_head;
+    unsigned int uart_rx_tail;
+    int uart_rx_fd; /* host injection fd, -1 when not open */
+
     /* flash cache MMU page table: 256 x 64KB pages, programmed through
      * SPI_MEM_MMU_ITEM_CONTENT (0x6000237C) with page size
      * 2^(16-mode) (mode = SPI_MEM_MMU_PAGE_MODE bits[4:3]) */
@@ -224,6 +233,9 @@ void (*esp32c6_gpio_output)(int pin, bool level) = NULL;
 /* Optional flash image (bootloader @ 0x0 + partitions @ 0x8000 + app @
  * 0x10000). When set, the machine boots from the ROM reset vector. */
 const char *esp32c6_flash_image_path = NULL;
+
+/* Optional UART RX injection source (FIFO file the host writes to). */
+const char *esp32c6_uart_rx_path = NULL;
 
 /* ------------------------------------------------------------------ */
 /* Region helpers                                                      */
@@ -261,6 +273,7 @@ esp32c6_t *esp32c6_new(void)
     esp32c6_t *soc = calloc(1, sizeof(esp32c6_t));
     assert(soc);
     soc->systimer_conf = 0x40000000u; /* TIMER_UNIT0_WORK_EN default 1 */
+    soc->uart_rx_fd = -1;
 
     /* flash backing shared by the i/d-cache window */
     uint8_t *flash = calloc(1, C6_FLASH_SIZE);
@@ -457,16 +470,21 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     /* UART0 */
     if (addr < C6_PERIPH_BASE + 0x1000u) {
         switch (off) {
+        case UART_FIFO_REG:
+            if (soc->uart_rx_head != soc->uart_rx_tail) {
+                uint8_t b = soc->uart_rx[soc->uart_rx_tail];
+                soc->uart_rx_tail = (soc->uart_rx_tail + 1) %
+                                    sizeof(soc->uart_rx);
+                return b;
+            }
+            return 0; /* empty FIFO reads as zero */
         case UART_STATUS_REG:
-            return 0; /* TX FIFO empty */
-        case UART_CLKDIV_CONF_REG: {
-            static unsigned long n;
-            if ((n++ & 0xFFu) == 0)
-                fprintf(stderr, "DBG-CLK read val=%08x\n",
-                        mmio32[off >> 2] & ~0x1u);
+            /* RXFIFO_CNT [5:0]; TX side left at 0 (always room) */
+            return (soc->uart_rx_head - soc->uart_rx_tail) &
+                   (sizeof(soc->uart_rx) - 1u);
+        case UART_CLKDIV_CONF_REG:
             /* the divider sync completes instantly in the model */
             return mmio32[off >> 2] & ~0x1u;
-        }
         default:
             return mmio32[off >> 2];
         }
@@ -476,13 +494,8 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         if (addr == C6_PERIPH_BASE + 0x2000u ||
             addr == C6_PERIPH_BASE + 0x3000u)
             return 0; /* SPI_CMD always reads done (self-clears) */
-        if (addr == C6_PERIPH_BASE + 0x2000u + SPI_AXI_STATUS_REG) {
-            static unsigned long n;
-            if ((n++ & 0xFFu) == 0)
-                fprintf(stderr, "DBG-SPI170 read val=%08x\n",
-                        mmio32[off >> 2] | 0x80000000u);
+        if (addr == C6_PERIPH_BASE + 0x2000u + SPI_AXI_STATUS_REG)
             return mmio32[off >> 2] | 0x80000000u; /* MSPI idle */
-        }
 
         if (addr == C6_PERIPH_BASE + 0x202Cu)
             return 0x2u; /* SPI0 status: flash ready */
@@ -665,28 +678,16 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             case SPI_MMU_ITEM_CONTENT:
                 if (soc->mmu_index < 256)
                     soc->mmu[soc->mmu_index] = val;
-                if (0) fprintf(stderr,
-                        "DBG: mmu-cnt idx=%u val=0x%08x pc=0x%08x ra=0x%08x\n",
-                        soc->mmu_index, val, rv->PC, rv->X[1]);
                 return;
             case SPI_MMU_ITEM_INDEX:
                 soc->mmu_index = val & 0xFFu;
-                if (0) fprintf(stderr,
-                        "DBG: mmu-idx val=0x%08x pc=0x%08x ra=0x%08x\n",
-                        val, rv->PC, rv->X[1]);
                 return;
             case SPI_MMU_PAGE_MODE:
                 soc->mmu_page_mode = val;
-                if (0) fprintf(stderr, "DBG: mmu-mode val=0x%08x pc=0x%08x\n",
-                        val, rv->PC);
                 return;
             }
         }
         mmio32[off >> 2] = val;
-        if (0 && addr >= C6_PERIPH_BASE + 0x3000u &&
-            addr < C6_PERIPH_BASE + 0x3040u)
-            fprintf(stderr, "DBG: spi1w %03x=%08x pc=0x%08x\n", off & 0xFFFu,
-                    val, rv->PC);
         if ((addr == C6_PERIPH_BASE + 0x2000u ||
              addr == C6_PERIPH_BASE + 0x3000u) && (val & SPI_CMD_USR_BIT)) {
             /* SPI_USR command trigger: service the command into W0.. */
@@ -697,11 +698,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             uint32_t miso =
                 (mmio32[(base + SPI_MISO_DLEN) >> 2] & 0x3FFu) + 1u;
             uint32_t nbytes = (miso + 7u) / 8u;
-            if (0) fprintf(stderr,
-                    "DBG: spicmd pc=0x%08x cmd=0x%02x misolen=%u addr=0x%08x "
-                    "ra=0x%08x sp=0x%08x\n",
-                    rv->PC, cmd, miso, mmio32[(base + SPI_ADDR_REG) >> 2],
-                    rv->X[1], rv->X[2]);
             if (nbytes > 64u)
                 nbytes = 64u;
             esp32_region_t *fi = esp32_find_region(soc, C6_FLASH_I_BASE);
@@ -754,7 +750,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 if (faddr < C6_FLASH_SIZE)
                     memcpy(w, fi->data + faddr, nbytes);
             }
-            if (0) fprintf(stderr, "DBG: spiw0 cmd=0x%02x w0=0x%08x\n", cmd, w[0]);
             mmio32[off >> 2] = 0; /* CMD self-clears when done */
         }
         return;
@@ -943,11 +938,6 @@ static inline esp32_region_t *esp32_lookup(riscv_t *rv, uint32_t addr)
 static inline uint32_t esp32_flash_window_off(esp32c6_t *soc, uint32_t addr)
 {
     if (addr >= C6_FLASH_I_BASE && addr < C6_FLASH_I_BASE + C6_FLASH_WINDOW_SIZE) {
-        {
-            static unsigned long n;
-            if (0 && (n++ & 0x3Fu) == 0)
-                fprintf(stderr, "DBG-WIN %08x pc=%08x\n", addr, -1);
-        }
         uint32_t shift = esp32_mmu_page_shift(soc);
         uint32_t mask = (1u << shift) - 1u;
         uint32_t page = (addr - C6_FLASH_I_BASE) >> shift;
@@ -969,12 +959,6 @@ uint32_t esp32c6_read_w(riscv_t *rv, uint32_t addr)
     if (off == ~0u)
         off = addr - r->base;
     memcpy(&val, r->data + off, 4);
-    if (addr >= C6_FLASH_I_BASE && addr < C6_FLASH_I_BASE + 0x100u) {
-        static unsigned long n;
-        if (0 && (n++ & 0x3Fu) == 0)
-            fprintf(stderr, "DBG-WIN %08x off=%08x val=%08x pc=%08x\n", addr,
-                    off, val, rv->PC);
-    }
     return val;
 }
 
@@ -1227,18 +1211,38 @@ void esp32c6_check_interrupt(riscv_t *rv)
         return;
     /* lowest set bit = CPU interrupt number */
     int idx = __builtin_ctz(pending);
-    if (1) {
-        static unsigned long itr_count;
-        if ((itr_count++ & 0x3FFu) == 0)
-            fprintf(stderr,
-                    "DBG: int-trap idx=%d mstatus=%08x mie=%08x mip=%08x "
-                    "intc_status=%08llx plic=%08x thresh=%u prio[%d]=%u\n",
-                    idx, rv->csr_mstatus, rv->csr_mie, rv->csr_mip,
-                    (unsigned long long) soc->intc_status, soc->plic_enable,
-                    soc->plic_threshold, idx,
-                    idx < 28 ? soc->plic_prio[idx] : 0);
-    }
     SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ((1u << 31) | idx), 0);
+}
+
+/* Drain host-injected UART RX bytes (FIFO file) into the guest RX FIFO. */
+static void esp32c6_uart_rx_poll(esp32c6_t *soc)
+{
+    if (!esp32c6_uart_rx_path)
+        return;
+    if (soc->uart_rx_fd < 0) {
+        soc->uart_rx_fd =
+            open(esp32c6_uart_rx_path, O_RDONLY | O_NONBLOCK);
+        if (soc->uart_rx_fd < 0) {
+            if (errno != ENOENT && errno != EACCES)
+                fprintf(stderr, "esp32c6: uart rx open %s: %s\n",
+                        esp32c6_uart_rx_path, strerror(errno));
+            return;
+        }
+    }
+    for (;;) {
+        unsigned int count = (soc->uart_rx_head - soc->uart_rx_tail) &
+                             (sizeof(soc->uart_rx) - 1u);
+        unsigned int free_slots = sizeof(soc->uart_rx) - 1u - count;
+        unsigned int head = soc->uart_rx_head % sizeof(soc->uart_rx);
+        unsigned int chunk = sizeof(soc->uart_rx) - head;
+        if (chunk > free_slots)
+            chunk = free_slots;
+        ssize_t n = read(soc->uart_rx_fd, soc->uart_rx + head, chunk);
+        if (n <= 0)
+            break; /* EAGAIN/EOF: nothing more right now */
+        soc->uart_rx_head =
+            (soc->uart_rx_head + n) % sizeof(soc->uart_rx);
+    }
 }
 
 void esp32c6_periodic(riscv_t *rv)
@@ -1247,81 +1251,13 @@ void esp32c6_periodic(riscv_t *rv)
     if (!soc)
         return;
 
+    /* feed host-injected bytes into the UART RX FIFO (throttled) */
+    if ((rv->csr_cycle & 0x1FFu) == 0)
+        esp32c6_uart_rx_poll(soc);
+
     /* advance SYSTIMER counters (both units free-run on the C6) */
     uint64_t elapsed = rv->csr_cycle - soc->last_cycle;
     soc->last_cycle = rv->csr_cycle;
-    {
-        static unsigned long dbg_n;
-        static uint32_t pc_hist[256];
-        static int pc_hi;
-        pc_hist[pc_hi++ & 0xFFu] = rv->PC;
-        if (0 && (dbg_n++ & 0xFFu) == 0 && dbg_n < 200000)
-            fprintf(stderr, "DBG-PC %08x cyc=%lu\n", rv->PC,
-                    (unsigned long) rv->csr_cycle);
-        if (rv->PC == 0) {
-            fprintf(stderr, "DBG-HIST: ");
-            for (int h = 0; h < 256; h++)
-                fprintf(stderr, "%08x ", pc_hist[(pc_hi + h) & 0xFFu]);
-            fprintf(stderr, "\n");
-        }
-        if (rv->PC == 0x408091ceu) {
-            static unsigned long fn;
-            if (fn++ < 8u) {
-                uint32_t cp = rv->X[9];
-                fprintf(stderr,
-                        "DBG-PLLMHZ a0=%u cfg@%08x=[%u %u %u %u] ra=%08x\n",
-                        rv->X[10], cp, esp32c6_read_w(rv, cp),
-                        esp32c6_read_w(rv, cp + 4), esp32c6_read_w(rv, cp + 8),
-                        esp32c6_read_w(rv, cp + 12), rv->X[1]);
-            }
-        }
-        if (rv->PC == 0x40811b7au) { /* esp_flash_init_main: get_physical_size ret */
-            static unsigned long gn;
-            if (gn++ < 4u)
-                fprintf(stderr, "DBG-GSIZE ret=%u ra=%08x\n", rv->X[10],
-                        rv->X[1]);
-        }
-        if (rv->PC == 0x40811bbeu) { /* esp_flash_init_main epilogue */
-            static unsigned long en;
-            if (en++ < 4u)
-                fprintf(stderr, "DBG-FINIT ret=%u s1=%08x ra=%08x\n", rv->X[10],
-                        rv->X[9], rv->X[1]);
-        }
-        if (rv->PC == 0x40811c1au) { /* esp_flash_init_main call #2 */
-            static unsigned long cn;
-            if (cn++ < 4u)
-                fprintf(stderr, "DBG-CALL2 tgt=%08x a0=%08x a1=%08x ra=%08x\n",
-                        rv->X[15], rv->X[10], rv->X[11], rv->X[1]);
-        }
-        if (rv->PC == 0x40811c1cu) { /* esp_flash_init_main ret of call #2 */
-            static unsigned long rn;
-            if (rn++ < 4u)
-                fprintf(stderr, "DBG-RET2 a0=%08x\n", rv->X[10]);
-        }
-        if (rv->PC == 0x40812246u) { /* spiflash_end_default jalr */
-            static unsigned long dn;
-            if (dn++ < 4u)
-                fprintf(stderr, "DBG-ENDJ tgt=%08x drv=%08x\n", rv->X[15],
-                        rv->X[10]);
-        }
-        if (rv->PC == 0x4080b74au) {
-            static unsigned long pn;
-            if (pn++ < 4u) {
-                uint32_t p = rv->X[10];
-                char buf[256];
-                int i;
-                for (i = 0; i < 255; i++) {
-                    buf[i] = (char) esp32c6_read_b(rv, p++);
-                    if (!buf[i])
-                        break;
-                }
-                buf[i] = 0;
-                fprintf(stderr,
-                        "DBG-PANIC a0=\"%s\" ra=0x%08x sp=0x%08x a1=0x%08x\n",
-                        buf, rv->X[1], rv->X[2], rv->X[11]);
-            }
-        }
-    }
     soc->systimer_counter += elapsed;
     soc->systimer_unit1_counter += elapsed;
     soc->clint_mtime += elapsed;

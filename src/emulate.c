@@ -405,8 +405,6 @@ static uint32_t *csr_get_ptr(riscv_t *rv, uint32_t csr)
     case 0x802: /* ESP32-C3 ROM uses custom CSR 0x802 as cycle counter */
         return (uint32_t *) &rv->csr_cycle;
     case 0x7E2: /* ESP32-C3 bootloader cycle counter (CSR 0x7E2) */
-        if (0) fprintf(stderr, "DBG: csr7e2 pc=0x%08x cycle=%llu\n", rv->PC,
-                (unsigned long long) rv->csr_cycle);
         return (uint32_t *) &rv->csr_cycle;
 #if RV32_HAS(EXT_F)
     case CSR_FFLAGS:
@@ -1477,10 +1475,6 @@ retranslate:
 
         /* decode the instruction */
         if (!rv_decode(ir, insn)) {
-            static unsigned long dfl_count;
-            if (dfl_count++ < 40u)
-                fprintf(stderr, "DBG: rv_decode fail insn=%08x pc=%08x\n", insn,
-                        block->pc_end);
             rv->compressed = is_compressed(insn);
             /* Set the trap state WITHOUT invoking on_trap: the handler would
              * run to completion (e.g., mret) and clear is_trapped while we
@@ -2444,11 +2438,6 @@ void rv_step(void *arg)
         /* lookup the next block in block map or translate a new block,
          * and move onto the next block.
          */
-        if (rv->PC == 0x42006114u)
-            fprintf(stderr, "DBG: init_flash assert check a0=0x%08x\n",
-                    rv->X[10]);
-        if (rv->PC == 0x4038bd78u)
-            fprintf(stderr, "DBG: read_id check a5=0x%08x\n", rv->X[15]);
         block_t *block = block_find_or_translate(rv);
         /* by now, a block should be available */
         if (unlikely(!block)) {
@@ -2725,12 +2714,6 @@ static void __trap_handler(riscv_t *rv)
     /* set to false by sret implementation */
     while (rv->is_trapped && !rv_has_halted(rv)) {
         uint32_t insn;
-        {
-            static unsigned long tc;
-            if ((tc++ & 0x3FFFFu) == 0)
-                fprintf(stderr, "DBG: trap mcause=%08x mepc=%08x mtvec=%08x pc=%08x\n",
-                        rv->csr_mcause, rv->csr_mepc, rv->csr_mtvec, rv->PC);
-        }
     retry_fetch:
         insn = rv->io.mem_ifetch(rv, rv->PC);
         if (rv->csr_mcause == 4)
