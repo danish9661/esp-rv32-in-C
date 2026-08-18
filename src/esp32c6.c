@@ -213,6 +213,11 @@ struct esp32c6_soc {
     char uart_line[256];
     int uart_line_len;
 
+    /* I2C_EXT (0x60004000): register bank + SCL_RST_SLV_EN auto-clear */
+    uint32_t i2c_reg[128]; /* 0x200 bytes, mirrors i2c_dev_t */
+    int i2c_scl_rst_cnt;   /* reads left with SCL_RST_SLV_EN asserted */
+    int i2c_transfer_pending; /* a trans_start was written; bus has no slave */
+
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
     unsigned int uart_rx_head;
@@ -467,6 +472,20 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     uint32_t off = addr - C6_PERIPH_BASE;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
 
+    /* I2C_EXT (0x60004000-0x60004200) */
+    if (addr >= C6_PERIPH_BASE + 0x4000u &&
+        addr < C6_PERIPH_BASE + 0x4200u) {
+        uint32_t *r = soc->i2c_reg + ((addr - C6_PERIPH_BASE - 0x4000u) >> 2);
+        if (addr == C6_PERIPH_BASE + 0x4080u && soc->i2c_scl_rst_cnt > 0 &&
+            --soc->i2c_scl_rst_cnt == 0)
+            *r &= ~1u; /* SCL_RST_SLV_EN self-clears after the pulses */
+        if (addr == C6_PERIPH_BASE + 0x402cu) {
+            uint32_t v = soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2];
+            return v;
+        }
+        return *r;
+    }
+
     /* UART0 */
     if (addr < C6_PERIPH_BASE + 0x1000u) {
         switch (off) {
@@ -660,6 +679,29 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         return; /* unmapped: writes are discarded */
     uint32_t off = addr - C6_PERIPH_BASE;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
+
+    /* I2C_EXT (0x60004000-0x60004200) */
+    if (addr >= C6_PERIPH_BASE + 0x4000u &&
+        addr < C6_PERIPH_BASE + 0x4200u) {
+        uint32_t *r = soc->i2c_reg + ((addr - C6_PERIPH_BASE - 0x4000u) >> 2);
+        if (addr == C6_PERIPH_BASE + 0x4024u) { /* int_clr */
+            soc->i2c_reg[0x20 >> 2] &= ~val; /* clear raw status bits */
+            soc->intc_status &= ~(1ull << 50); /* drop the pending IRQ */
+        } else if (addr == C6_PERIPH_BASE + 0x4004u) { /* ctr */
+            *r = val;
+            if (val & (1u << 5)) /* trans_start (WT): transfer begins */
+                soc->i2c_transfer_pending = 1;
+        } else {
+            *r = val;
+        }
+        if (addr == C6_PERIPH_BASE + 0x4080u) {
+            if (val & 1u) /* SCL_RST_SLV_EN: start the reset pulses */
+                soc->i2c_scl_rst_cnt = 64; /* held high ~64 reads */
+            else
+                soc->i2c_scl_rst_cnt = 0;
+        }
+        return;
+    }
 
     /* UART0 */
     if (addr < C6_PERIPH_BASE + 0x1000u) {
@@ -951,9 +993,8 @@ static inline uint32_t esp32_flash_window_off(esp32c6_t *soc, uint32_t addr)
 uint32_t esp32c6_read_w(riscv_t *rv, uint32_t addr)
 {
     esp32_region_t *r = esp32_lookup(rv, addr);
-    if (!r || r->type != ESP32_REG_RAM) {
+    if (!r || r->type != ESP32_REG_RAM)
         return esp32_mmio_read(PRIV(rv)->esp32c6, addr);
-    }
     uint32_t val;
     uint32_t off = esp32_flash_window_off(PRIV(rv)->esp32c6, addr);
     if (off == ~0u)
@@ -1250,6 +1291,15 @@ void esp32c6_periodic(riscv_t *rv)
     esp32c6_t *soc = PRIV(rv)->esp32c6;
     if (!soc)
         return;
+
+    /* I2C transfer completion: a trans_start was issued on an empty bus.
+     * The address byte is never ACKed -> NACK + trans-complete, which the
+     * ISR maps to I2C_INTR_EVENT_NACK (I2C_EXT0 = INTMTX source 50). */
+    if (soc->i2c_transfer_pending) {
+        soc->i2c_transfer_pending = 0;
+        soc->i2c_reg[0x20 >> 2] |= (1u << 10) | (1u << 7); /* nack + complete */
+        soc->intc_status |= 1ull << 50;
+    }
 
     /* feed host-injected bytes into the UART RX FIFO (throttled) */
     if ((rv->csr_cycle & 0x1FFu) == 0)
