@@ -218,6 +218,10 @@ struct esp32c6_soc {
     int i2c_scl_rst_cnt;   /* reads left with SCL_RST_SLV_EN asserted */
     int i2c_transfer_pending; /* a trans_start was written; bus has no slave */
 
+    /* SPI2 (GPSPI2, 0x60081000): register bank + transfer completion */
+    uint32_t spi2_reg[64]; /* 0x100 bytes, mirrors spi_dev_t */
+    int spi2_transfer_pending; /* a cmd.usr was written; bus has no slave */
+
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
     unsigned int uart_rx_head;
@@ -472,6 +476,12 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     uint32_t off = addr - C6_PERIPH_BASE;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
 
+    /* SPI2 (GPSPI2, 0x60081000-0x60081100) */
+    if (addr >= C6_PERIPH_BASE + 0x81000u &&
+        addr < C6_PERIPH_BASE + 0x81100u) {
+        return soc->spi2_reg[(addr - C6_PERIPH_BASE - 0x81000u) >> 2];
+    }
+
     /* I2C_EXT (0x60004000-0x60004200) */
     if (addr >= C6_PERIPH_BASE + 0x4000u &&
         addr < C6_PERIPH_BASE + 0x4200u) {
@@ -699,6 +709,22 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->i2c_scl_rst_cnt = 64; /* held high ~64 reads */
             else
                 soc->i2c_scl_rst_cnt = 0;
+        }
+        return;
+    }
+
+    /* SPI2 (GPSPI2, 0x60081000-0x60081100) */
+    if (addr >= C6_PERIPH_BASE + 0x81000u &&
+        addr < C6_PERIPH_BASE + 0x81100u) {
+        uint32_t *r = soc->spi2_reg + ((addr - C6_PERIPH_BASE - 0x81000u) >> 2);
+        if (addr == C6_PERIPH_BASE + 0x81000u) { /* cmd */
+            *r = val & ~(1u << 23); /* update self-clears: config applied */
+            if (val & (1u << 24))   /* usr: transfer begins */
+                soc->spi2_transfer_pending = 1;
+        } else if (addr == C6_PERIPH_BASE + 0x81038u) { /* dma_int_clr */
+            soc->spi2_reg[0x3c >> 2] &= ~val; /* clear raw interrupt bits */
+        } else {
+            *r = val;
         }
         return;
     }
@@ -1299,6 +1325,17 @@ void esp32c6_periodic(riscv_t *rv)
         soc->i2c_transfer_pending = 0;
         soc->i2c_reg[0x20 >> 2] |= (1u << 10) | (1u << 7); /* nack + complete */
         soc->intc_status |= 1ull << 50;
+    }
+
+    /* SPI2 transfer completion: cmd.usr was set on an empty bus. MISO
+     * floats high (no slave) so all received words come back 0xFF, and
+     * cmd.usr self-clears for the firmware's poll. */
+    if (soc->spi2_transfer_pending) {
+        soc->spi2_transfer_pending = 0;
+        for (int i = 0; i < 16; i++)
+            soc->spi2_reg[(0x98u + 4u * i) >> 2] = 0xFFFFFFFFu;
+        soc->spi2_reg[0x00 >> 2] &= ~(1u << 24); /* usr cleared */
+        soc->spi2_reg[0x3c >> 2] |= 1u << 12;    /* trans_done raw */
     }
 
     /* feed host-injected bytes into the UART RX FIFO (throttled) */
