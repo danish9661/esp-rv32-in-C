@@ -208,6 +208,9 @@ struct esp32c6_soc {
     /* GPIO */
     uint32_t gpio_out;
     uint32_t gpio_enable;
+    uint32_t gpio_in;    /* input pad levels (host-injected) */
+    uint32_t gpio_status; /* pending interrupt bits (W1TC) */
+    uint32_t gpio_vbtn;  /* virtual button phase (toggles input pin 7) */
 
     /* UART output buffering */
     char uart_line[256];
@@ -356,6 +359,7 @@ esp32c6_t *esp32c6_new(void)
 #define TWAI0_INTR_TI 0x2u
 #define TWAI0_INTR_RI 0x1u
 #define C6_TWAI0_INTR_SOURCE 46u
+#define C6_GPIO_INTR_SOURCE 30u
 
 static void esp32_uart_putc(esp32c6_t *soc, char c)
 {
@@ -383,6 +387,10 @@ static void esp32_uart_putc(esp32c6_t *soc, char c)
 #define GPIO_ENABLE_W1TC 0x28u
 #define GPIO_STRAP_REG 0x38u
 #define GPIO_IN_REG 0x3Cu
+#define GPIO_STATUS_REG 0x44u
+#define GPIO_STATUS_W1TS_REG 0x48u
+#define GPIO_STATUS_W1TC_REG 0x4Cu
+#define GPIO_PCPU_INT_REG 0x5Cu
 
 /* ------------------------------------------------------------------ */
 /* SYSTIMER (0x6000A000; offsets identical to ESP32-C3)                */
@@ -615,7 +623,13 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         case GPIO_ENABLE_REG:
             return soc->gpio_enable;
         case GPIO_IN_REG:
-            return 0; /* all inputs low */
+            /* inputs injected by the model, plus readback of driven
+             * outputs (the pad follows the output driver) */
+            return soc->gpio_in | (soc->gpio_out & soc->gpio_enable);
+        case GPIO_STATUS_REG:
+            return soc->gpio_status;
+        case GPIO_PCPU_INT_REG:
+            return soc->gpio_status;
         case GPIO_STRAP_REG:
             /* strapping: GPIO9 high -> SPI flash boot (boot mode 1xxx) */
             return 0x8u;
@@ -965,6 +979,15 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         case GPIO_ENABLE_W1TC:
             soc->gpio_enable &= ~val;
             break;
+        case GPIO_STATUS_W1TS_REG:
+            soc->gpio_status |= val;
+            soc->intc_status |= 1ull << C6_GPIO_INTR_SOURCE;
+            return;
+        case GPIO_STATUS_W1TC_REG:
+            soc->gpio_status &= ~val;
+            if (!soc->gpio_status)
+                soc->intc_status &= ~(1ull << C6_GPIO_INTR_SOURCE);
+            return;
         default:
             mmio32[off >> 2] = val;
             return;
@@ -1440,6 +1463,56 @@ void esp32c6_periodic(riscv_t *rv)
     if (!soc)
         return;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
+
+    /* Virtual button: input pin 7 toggles every ~2^18 cycles. The change
+     * is fed into the pad state, and pins with a matching interrupt type
+     * raise the GPIO interrupt (INTMTX source 30). */
+    {
+        uint32_t phase = (rv->csr_cycle >> 18) & 1u;
+        if (phase != soc->gpio_vbtn) {
+            soc->gpio_vbtn = phase;
+            uint32_t mask = 1u << 7;
+            uint32_t changed = (soc->gpio_in ^ ((phase ? mask : 0))) & mask;
+            if (changed) {
+                uint32_t new_levels =
+                    (soc->gpio_in & ~mask) | (phase ? mask : 0);
+                soc->gpio_in = new_levels;
+                for (int pin = 0; pin < 31; pin++) {
+                    if (!(changed & (1u << pin)))
+                        continue;
+                    uint32_t pr = mmio32[(0x91074u + 4u * pin) >> 2];
+                    int type = (pr >> 7) & 0x7u;
+                    int ena = (pr >> 13) & 0x1Fu;
+                    int level = (new_levels >> pin) & 1;
+                    int prev = (new_levels ^ changed) >> pin & 1;
+                    int fire = 0;
+                    switch (type) {
+                    case 1: fire = level && !prev; break; /* posedge */
+                    case 2: fire = !level && prev; break; /* negedge */
+                    case 3: fire = level != prev; break;  /* any edge */
+                    case 4: fire = !level; break;         /* low level */
+                    case 5: fire = level; break;          /* high level */
+                    default: break;
+                    }
+                    if (fire && ena) {
+                        soc->gpio_status |= 1u << pin;
+                        soc->intc_status |= 1ull << C6_GPIO_INTR_SOURCE;
+                    }
+                }
+            }
+        }
+        /* level-triggered pins: re-assert while the level matches */
+        for (int pin = 0; pin < 31; pin++) {
+            uint32_t pr = mmio32[(0x91074u + 4u * pin) >> 2];
+            int type = (pr >> 7) & 0x7u;
+            int ena = (pr >> 13) & 0x1Fu;
+            int level = (soc->gpio_in >> pin) & 1;
+            if (ena && ((type == 4 && !level) || (type == 5 && level))) {
+                soc->gpio_status |= 1u << pin;
+                soc->intc_status |= 1ull << C6_GPIO_INTR_SOURCE;
+            }
+        }
+    }
 
     /* I2C transfer completion: a trans_start was issued on an empty bus.
      * The address byte is never ACKed -> NACK + trans-complete, which the
