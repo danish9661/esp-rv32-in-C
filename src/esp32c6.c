@@ -231,6 +231,9 @@ struct esp32c6_soc {
     int twai_tx_pending; /* a cmd.tx_request was written */
     uint64_t twai_tx_done_cycle; /* cycle at which the TX completes */
 
+    /* RMT (0x60006000): TX completion model */
+    uint64_t rmt_tx_done_cycle; /* cycle at which the TX completes */
+
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
     unsigned int uart_rx_head;
@@ -360,6 +363,7 @@ esp32c6_t *esp32c6_new(void)
 #define TWAI0_INTR_RI 0x1u
 #define C6_TWAI0_INTR_SOURCE 46u
 #define C6_GPIO_INTR_SOURCE 30u
+#define C6_RMT_INTR_SOURCE 49u
 
 static void esp32_uart_putc(esp32c6_t *soc, char c)
 {
@@ -615,6 +619,9 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         }
         return mmio32[off >> 2];
     }
+    /* RMT: INT_ST (0x3C) is the raw status masked by INT_ENA */
+    if (addr == C6_PERIPH_BASE + 0x603Cu)
+        return mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2];
     /* GPIO */
     if (addr >= C6_PERIPH_BASE + 0x91000u && addr < C6_PERIPH_BASE + 0x92000u) {
         switch (off - 0x91000u) {
@@ -805,6 +812,42 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             soc->spi2_reg[0x3c >> 2] &= ~val; /* clear raw interrupt bits */
         } else {
             *r = val;
+        }
+        return;
+    }
+
+    /* RMT (0x60006000-0x60006B00): registers + 4x48-word channel memory
+     * at 0x400. TX completes (TX_DONE interrupt, source 49) a while after
+     * conf0.tx_start is written; the driver's ISR clears INT_CLR. */
+    if (addr >= C6_PERIPH_BASE + 0x6000u &&
+        addr < C6_PERIPH_BASE + 0x6B00u) {
+        uint32_t roff = addr - C6_PERIPH_BASE - 0x6000u;
+        mmio32[off >> 2] = val;
+        if (roff == 0x10u || roff == 0x14u) { /* CH0/CH1 CONF0 */
+            uint32_t ch = (roff - 0x10u) >> 2;
+            if (val & 0x1u) { /* tx_start */
+                uint32_t div = (val >> 8) & 0xFFu;
+                uint32_t mem_words =
+                    (((val >> 16) & 0x7u) ?: 1u) * 48u;
+                uint32_t *mem = mmio32 + (0x6400u >> 2) + ch * 48u;
+                uint64_t ticks = 0;
+                for (uint32_t i = 0; i < mem_words; i++) {
+                    uint32_t w = mem[i];
+                    if ((w & 0x7FFFu) == 0u) /* end marker */
+                        break;
+                    ticks += (w & 0x7FFFu) + ((w >> 16) & 0x7FFFu);
+                }
+                soc->rmt_tx_done_cycle =
+                    rv->csr_cycle + (ticks * (div ? div : 1u)) / 8u + 1024u;
+            }
+            if (val & 0x80u) /* tx_stop */
+                soc->rmt_tx_done_cycle = 0;
+        }
+        if (roff == 0x44u) { /* INT_CLR: clear raw status */
+            mmio32[0x6038u >> 2] &= ~val;
+            soc->intc_status &= ~(1ull << C6_RMT_INTR_SOURCE);
+            if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
+                soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
         }
         return;
     }
@@ -1548,6 +1591,16 @@ void esp32c6_periodic(riscv_t *rv)
         soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_TCS;
         soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_TI;
         soc->intc_status |= 1ull << C6_TWAI0_INTR_SOURCE;
+    }
+
+    /* RMT TX completion: set TX_DONE (raw bit 0) and raise the source
+     * (INTMTX source 49); the driver ISR clears it via INT_CLR. */
+    if (soc->rmt_tx_done_cycle &&
+        rv->csr_cycle >= soc->rmt_tx_done_cycle) {
+        soc->rmt_tx_done_cycle = 0;
+        mmio32[0x6038u >> 2] |= 0x1u;
+        if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
+            soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
     }
 
     /* feed host-injected bytes into the UART RX FIFO (throttled) */
