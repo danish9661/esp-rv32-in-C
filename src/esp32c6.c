@@ -326,8 +326,17 @@ esp32c6_t *esp32c6_new(void)
 /* ------------------------------------------------------------------ */
 
 #define UART_FIFO_REG 0x00u
+#define UART_INT_RAW_REG 0x04u
+#define UART_INT_ST_REG 0x08u
+#define UART_INT_ENA_REG 0x0cu
+#define UART_INT_CLR_REG 0x10u
 #define UART_STATUS_REG 0x1Cu
 #define UART_CLKDIV_CONF_REG 0x98u
+
+/* INTMTX source for UART0 (interrupts.h enum, counted from 0) */
+#define C6_UART0_INTR_SOURCE 43u
+/* UART_RXFIFO_TOUT_INT_RAW */
+#define UART_RXFIFO_TOUT_BIT 0x100u
 
 static void esp32_uart_putc(esp32c6_t *soc, char c)
 {
@@ -511,6 +520,8 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
             /* RXFIFO_CNT [5:0]; TX side left at 0 (always room) */
             return (soc->uart_rx_head - soc->uart_rx_tail) &
                    (sizeof(soc->uart_rx) - 1u);
+        case UART_INT_ST_REG:
+            return mmio32[UART_INT_RAW_REG >> 2] & mmio32[UART_INT_ENA_REG >> 2];
         case UART_CLKDIV_CONF_REG:
             /* the divider sync completes instantly in the model */
             return mmio32[off >> 2] & ~0x1u;
@@ -733,6 +744,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
     if (addr < C6_PERIPH_BASE + 0x1000u) {
         if (off == UART_FIFO_REG) {
             esp32_uart_putc(soc, (char) (val & 0xFFu));
+        } else if (off == UART_INT_CLR_REG) { /* W1C */
+            mmio32[UART_INT_RAW_REG >> 2] &= ~val;
+            if (!(mmio32[UART_INT_RAW_REG >> 2] &
+                  (UART_RXFIFO_TOUT_BIT | 0x1u)))
+                soc->intc_status &= ~(1ull << C6_UART0_INTR_SOURCE);
         } else
             mmio32[off >> 2] = val;
         return;
@@ -1317,6 +1333,7 @@ void esp32c6_periodic(riscv_t *rv)
     esp32c6_t *soc = PRIV(rv)->esp32c6;
     if (!soc)
         return;
+    uint32_t *mmio32 = (uint32_t *) soc->mmio;
 
     /* I2C transfer completion: a trans_start was issued on an empty bus.
      * The address byte is never ACKed -> NACK + trans-complete, which the
@@ -1341,6 +1358,18 @@ void esp32c6_periodic(riscv_t *rv)
     /* feed host-injected bytes into the UART RX FIFO (throttled) */
     if ((rv->csr_cycle & 0x1FFu) == 0)
         esp32c6_uart_rx_poll(soc);
+
+    /* UART RX interrupt: bytes are waiting and the driver armed
+     * RXFIFO_TOUT (real HW fires it after rx_tout_thrhd idle bit times;
+     * the model fires it immediately, the ISR then drains the FIFO). */
+    if (soc->uart_rx_head != soc->uart_rx_tail) {
+        uint32_t *raw = &mmio32[UART_INT_RAW_REG >> 2];
+        if ((mmio32[UART_INT_ENA_REG >> 2] & UART_RXFIFO_TOUT_BIT) &&
+            !(*raw & UART_RXFIFO_TOUT_BIT)) {
+            *raw |= UART_RXFIFO_TOUT_BIT;
+            soc->intc_status |= 1ull << C6_UART0_INTR_SOURCE;
+        }
+    }
 
     /* advance SYSTIMER counters (both units free-run on the C6) */
     uint64_t elapsed = rv->csr_cycle - soc->last_cycle;
