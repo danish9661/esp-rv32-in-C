@@ -56,13 +56,16 @@ LDFLAGS += -pthread
 # Note: Emscripten 4.x inlines worker code into the main JS file
 endif
 
+LDFLAGS += --js-library $(WEB_JS_RESOURCES)/emruntime-library.js
+
 # Emscripten build flags
 CFLAGS_emcc += -sALLOW_MEMORY_GROWTH \
+               \
                -s"EXPORTED_FUNCTIONS=$(EXPORTED_FUNCS)" \
                -sSTACK_SIZE=4MB \
-               -DCYCLE_PER_STEP=2000000 \
-               -DWASM_BLOCK_LIMIT=5000 \
-               -DWASM_BLOCK_HARD_LIMIT=10000 \
+               -DCYCLE_PER_STEP=32000000 \
+               -DWASM_BLOCK_LIMIT=20000 \
+               -DWASM_BLOCK_HARD_LIMIT=40000 \
                -O3 \
                -w
 
