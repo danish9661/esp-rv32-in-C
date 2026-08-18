@@ -222,6 +222,11 @@ struct esp32c6_soc {
     uint32_t spi2_reg[64]; /* 0x100 bytes, mirrors spi_dev_t */
     int spi2_transfer_pending; /* a cmd.usr was written; bus has no slave */
 
+    /* TWAI0 (CAN, 0x6000B000): register bank + TX completion */
+    uint32_t twai_reg[64]; /* 0x100 bytes, mirrors twai_dev_t */
+    int twai_tx_pending; /* a cmd.tx_request was written */
+    uint64_t twai_tx_done_cycle; /* cycle at which the TX completes */
+
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
     unsigned int uart_rx_head;
@@ -337,6 +342,19 @@ esp32c6_t *esp32c6_new(void)
 #define C6_UART0_INTR_SOURCE 43u
 /* UART_RXFIFO_TOUT_INT_RAW */
 #define UART_RXFIFO_TOUT_BIT 0x100u
+
+/* TWAI0 (CAN) register bits */
+#define TWAI0_CMD_TX_REQUEST 0x1u
+#define TWAI0_CMD_RELEASE_BUFFER 0x4u
+#define TWAI0_CMD_CLEAR_DOVERRUN 0x8u
+#define TWAI0_STATUS_RBS 0x1u
+#define TWAI0_STATUS_DOS 0x2u
+#define TWAI0_STATUS_TBS 0x4u
+#define TWAI0_STATUS_TCS 0x8u
+#define TWAI0_STATUS_RS 0x10u
+#define TWAI0_INTR_TI 0x2u
+#define TWAI0_INTR_RI 0x1u
+#define C6_TWAI0_INTR_SOURCE 46u
 
 static void esp32_uart_putc(esp32c6_t *soc, char c)
 {
@@ -489,6 +507,26 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     if (addr >= C6_PERIPH_BASE + 0x81000u &&
         addr < C6_PERIPH_BASE + 0x81100u) {
         return soc->spi2_reg[(addr - C6_PERIPH_BASE - 0x81000u) >> 2];
+    }
+
+    /* TWAI0 (CAN, 0x6000B000-0x6000B100) */
+    if (addr >= C6_PERIPH_BASE + 0xB000u &&
+        addr < C6_PERIPH_BASE + 0xB100u) {
+        uint32_t off = addr - C6_PERIPH_BASE - 0xB000u;
+        if (off == 0x08u) { /* status: TBS + TCS + RS(=reset mode) */
+            uint32_t v = TWAI0_STATUS_TBS |
+                         ((soc->twai_reg[0] & 1u) ? TWAI0_STATUS_RS : 0u);
+            v |= soc->twai_reg[0x08 >> 2] & TWAI0_STATUS_TCS;
+            return v;
+        }
+        if (off == 0x0Cu) { /* interrupt: read-to-clear (RI stays) */
+            uint32_t v = soc->twai_reg[0x0c >> 2];
+            soc->twai_reg[0x0c >> 2] &= TWAI0_INTR_RI;
+            if (!(soc->twai_reg[0x0c >> 2] & ~TWAI0_INTR_RI))
+                soc->intc_status &= ~(1ull << C6_TWAI0_INTR_SOURCE);
+            return v;
+        }
+        return soc->twai_reg[off >> 2];
     }
 
     /* I2C_EXT (0x60004000-0x60004200) */
@@ -656,6 +694,7 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
 static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
 {
     esp32c6_t *soc = PRIV(rv)->esp32c6;
+
     /* PLIC / CLINT */
     if (addr >= C6_PLIC_BASE && addr < C6_PLIC_BASE + C6_PLIC_SIZE) {
         uint32_t off = addr - C6_PLIC_BASE;
@@ -734,6 +773,28 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->spi2_transfer_pending = 1;
         } else if (addr == C6_PERIPH_BASE + 0x81038u) { /* dma_int_clr */
             soc->spi2_reg[0x3c >> 2] &= ~val; /* clear raw interrupt bits */
+        } else {
+            *r = val;
+        }
+        return;
+    }
+
+    /* TWAI0 (CAN, 0x6000B000-0x6000B100) */
+    if (addr >= C6_PERIPH_BASE + 0xB000u &&
+        addr < C6_PERIPH_BASE + 0xB100u) {
+        uint32_t off = addr - C6_PERIPH_BASE - 0xB000u;
+        uint32_t *r = soc->twai_reg + (off >> 2);
+        if (off == 0x04u) { /* cmd: commands are latched and self-clear */
+            *r = val;
+            if (val & TWAI0_CMD_TX_REQUEST) {
+                soc->twai_tx_pending = 1;
+                soc->twai_tx_done_cycle =
+                    rv->csr_cycle + 20000; /* ~200us @ 100MHz host clock */
+            }
+            if (val & TWAI0_CMD_RELEASE_BUFFER)
+                soc->twai_reg[0x08 >> 2] &= ~TWAI0_STATUS_RBS;
+            if (val & TWAI0_CMD_CLEAR_DOVERRUN)
+                soc->twai_reg[0x08 >> 2] &= ~TWAI0_STATUS_DOS;
         } else {
             *r = val;
         }
@@ -1353,6 +1414,22 @@ void esp32c6_periodic(riscv_t *rv)
             soc->spi2_reg[(0x98u + 4u * i) >> 2] = 0xFFFFFFFFu;
         soc->spi2_reg[0x00 >> 2] &= ~(1u << 24); /* usr cleared */
         soc->spi2_reg[0x3c >> 2] |= 1u << 12;    /* trans_done raw */
+    }
+
+    /* TWAI0 TX completion: a tx_request was issued. No other node on the
+     * bus, but the frame goes out and the controller reports TCS + TI
+     * (transmit interrupt), which the ISR maps to TX_BUFF_FREE|TX_SUCCESS.
+     * The completion is delayed to a later cycle so the interrupt is not
+     * delivered while the firmware is still inside twai_transmit_v2 (real
+     * hardware takes ~200us for a frame); delivering it instantly made the
+     * ISR run before the driver's own tx_msg_count++ and assert on it. */
+    if (soc->twai_tx_pending &&
+        rv->csr_cycle >= soc->twai_tx_done_cycle) {
+        soc->twai_tx_pending = 0;
+        soc->twai_reg[0x04 >> 2] &= ~TWAI0_CMD_TX_REQUEST;
+        soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_TCS;
+        soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_TI;
+        soc->intc_status |= 1ull << C6_TWAI0_INTR_SOURCE;
     }
 
     /* feed host-injected bytes into the UART RX FIFO (throttled) */
