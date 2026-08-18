@@ -224,6 +224,7 @@ struct esp32c6_soc {
 
     /* TWAI0 (CAN, 0x6000B000): register bank + TX completion */
     uint32_t twai_reg[64]; /* 0x100 bytes, mirrors twai_dev_t */
+    uint32_t adc_reg[257]; /* SARADC 0x400 bytes + version reg */
     int twai_tx_pending; /* a cmd.tx_request was written */
     uint64_t twai_tx_done_cycle; /* cycle at which the TX completes */
 
@@ -529,6 +530,21 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         return soc->twai_reg[off >> 2];
     }
 
+    /* SARADC (0x6000E000-0x6000E404): oneshot conversion state */
+    if (addr >= C6_PERIPH_BASE + 0xE000u &&
+        addr < C6_PERIPH_BASE + 0xE404u) {
+        uint32_t o = off - 0xE000u;
+        if (o == 0x2Cu) /* sar1data_status: raw result */
+            return soc->adc_reg[o >> 2];
+        if (o == 0x44u) /* int_raw */
+            return soc->adc_reg[o >> 2];
+        if (o == 0x48u) /* int_st = raw & ena */
+            return soc->adc_reg[0x44 >> 2] & soc->adc_reg[0x40 >> 2];
+        if (o == 0x400u) /* version */
+            return 0x02206840u;
+        return soc->adc_reg[o >> 2];
+    }
+
     /* I2C_EXT (0x60004000-0x60004200) */
     if (addr >= C6_PERIPH_BASE + 0x4000u &&
         addr < C6_PERIPH_BASE + 0x4200u) {
@@ -797,6 +813,35 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->twai_reg[0x08 >> 2] &= ~TWAI0_STATUS_DOS;
         } else {
             *r = val;
+        }
+        return;
+    }
+
+    /* SARADC (0x6000E000-0x6000E404) */
+    if (addr >= C6_PERIPH_BASE + 0xE000u &&
+        addr < C6_PERIPH_BASE + 0xE404u) {
+        uint32_t o = off - 0xE000u;
+        if (o == 0x4Cu) { /* int_clr: write-to-clear */
+            soc->adc_reg[0x44 >> 2] &= ~val;
+        } else {
+            soc->adc_reg[o >> 2] = val;
+            if (o == 0x20u && (val & (1u << 29))) {
+                /* onetime start: the conversion completes instantly. The
+                 * selected converter (bit31=ADC1, bit30=ADC2) produces a
+                 * done event; pin channels 0-7 read 1024 + ch*128, the
+                 * internal-reference channels read mid-scale. */
+                uint32_t ch = (val >> 25) & 0xFu;
+                if (val & (1u << 31)) { /* sar1 sample */
+                    soc->adc_reg[0x2c >> 2] =
+                        (ch < 8) ? 1024u + ch * 128u : 2048u;
+                    soc->adc_reg[0x44 >> 2] |= 1u << 31; /* ADC1 done */
+                }
+                if (val & (1u << 30)) { /* sar2 sample */
+                    soc->adc_reg[0x30 >> 2] =
+                        (ch < 8) ? 1024u + ch * 128u : 2048u;
+                    soc->adc_reg[0x44 >> 2] |= 1u << 30; /* ADC2 done */
+                }
+            }
         }
         return;
     }
