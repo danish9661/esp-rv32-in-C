@@ -234,6 +234,19 @@ struct esp32c6_soc {
     /* RMT (0x60006000): TX completion model */
     uint64_t rmt_tx_done_cycle; /* cycle at which the TX completes */
 
+    /* LEDC (0x60007000): register bank + running duty + timer anchors */
+    uint32_t ledc_reg[128];  /* 0x200 bytes, mirrors ledc_dev_t */
+    uint32_t ledc_duty_r[6]; /* running duty per channel (latched on start) */
+    uint64_t ledc_timer_anchor[4]; /* cycle anchor per timer (phase origin) */
+    uint64_t ledc_timer_frac[4];   /* fractional cycle remainder per timer */
+
+    /* TIMG0/1 (0x60008000/0x60009000): one timer per group */
+    uint32_t timg_reg[2][64]; /* 0x100 bytes, mirrors timer_group_dev_t */
+    uint64_t timg_counter[2]; /* live counter value */
+    uint64_t timg_anchor[2];  /* cycle at which the counter base applies */
+    uint64_t timg_frac[2];    /* fractional cycle remainder per group */
+    uint64_t systimer_frac;   /* fractional cycle remainder (16 MHz sysclk) */
+
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
     unsigned int uart_rx_head;
@@ -364,6 +377,62 @@ esp32c6_t *esp32c6_new(void)
 #define C6_TWAI0_INTR_SOURCE 46u
 #define C6_GPIO_INTR_SOURCE 30u
 #define C6_RMT_INTR_SOURCE 49u
+/* TIMG0/TIMG1 timer interrupt sources (interrupts.h enum) */
+#define C6_TG0_T0_INTR_SOURCE 51u
+#define C6_TG1_T0_INTR_SOURCE 54u
+
+/* ------------------------------------------------------------------ */
+/* LEDC (0x60007000): 6 channels x (CONF0/HPOINT/DUTY/CONF1/DUTY_R),  */
+/* 4 timers x (CONF/VALUE), INT_RAW/ST/ENA/CLR, CONF.                  */
+/* ------------------------------------------------------------------ */
+
+#define LEDC_CH_CONF0(c) (0x14u * (c))
+#define LEDC_CH_HPOINT(c) (0x14u * (c) + 0x4u)
+#define LEDC_CH_DUTY(c) (0x14u * (c) + 0x8u)
+#define LEDC_CH_CONF1(c) (0x14u * (c) + 0xcu)
+#define LEDC_CH_DUTY_R(c) (0x14u * (c) + 0x10u)
+#define LEDC_TIMER_CONF(t) (0xa0u + 8u * (t))
+#define LEDC_TIMER_VALUE(t) (0xa4u + 8u * (t))
+#define LEDC_INT_RAW_OFF 0xc0u
+#define LEDC_INT_ST_OFF 0xc4u
+#define LEDC_INT_ENA_OFF 0xc8u
+#define LEDC_INT_CLR_OFF 0xccu
+#define LEDC_CONF_OFF 0x1f0u
+#define LEDC_SIG_OUT_EN (1u << 2)
+#define LEDC_IDLE_LV (1u << 3)
+#define LEDC_DUTY_START (1u << 31)
+#define LEDC_TIMER_RST (1u << 24)
+#define LEDC_TIMER_PAUSE (1u << 23)
+#define LEDC_TICK_SEL (1u << 25)
+
+/* ------------------------------------------------------------------ */
+/* TIMG0/1 (0x60008000/0x60009000): one timer + WDT per group.         */
+/* ------------------------------------------------------------------ */
+
+#define TIMG_T0CONFIG 0x00u
+#define TIMG_T0LO 0x04u
+#define TIMG_T0HI 0x08u
+#define TIMG_T0UPDATE 0x0cu
+#define TIMG_T0ALARMLO 0x10u
+#define TIMG_T0ALARMHI 0x14u
+#define TIMG_T0LOADLO 0x18u
+#define TIMG_T0LOADHI 0x1cu
+#define TIMG_T0LOAD 0x20u
+#define TIMG_INT_ENA 0x70u
+#define TIMG_INT_RAW 0x74u
+#define TIMG_INT_ST 0x78u
+#define TIMG_INT_CLR 0x7cu
+#define TIMG_RTCCALICFG 0x68u
+#define TIMG_RTCCALICFG1 0x6cu
+#define TIMG_REGCLK 0xfcu
+#define TIMG_T0_EN (1u << 31)
+#define TIMG_T0_INCREASE (1u << 30)
+#define TIMG_T0_AUTORELOAD (1u << 29)
+#define TIMG_T0_DIVIDER (0xFFFFu << 13)
+#define TIMG_T0_DIVCNT_RST (1u << 12)
+#define TIMG_T0_ALARM_EN (1u << 10)
+#define TIMG_T0_USE_XTAL (1u << 9)
+#define TIMG_INT_T0_ALARM (1u << 0)
 
 static void esp32_uart_putc(esp32c6_t *soc, char c)
 {
@@ -622,6 +691,50 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     /* RMT: INT_ST (0x3C) is the raw status masked by INT_ENA */
     if (addr == C6_PERIPH_BASE + 0x603Cu)
         return mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2];
+    /* LEDC (0x60007000-0x60007200) */
+    if (addr >= C6_PERIPH_BASE + 0x7000u &&
+        addr < C6_PERIPH_BASE + 0x7200u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0x7000u;
+        for (int c = 0; c < 6; c++)
+            if (o == LEDC_CH_DUTY_R(c))
+                return soc->ledc_duty_r[c];
+        for (int t = 0; t < 4; t++)
+            if (o == LEDC_TIMER_VALUE(t))
+                return soc->ledc_reg[o >> 2];
+        if (o == LEDC_INT_ST_OFF)
+            return soc->ledc_reg[LEDC_INT_RAW_OFF >> 2] &
+                   soc->ledc_reg[LEDC_INT_ENA_OFF >> 2];
+        if (o == LEDC_INT_RAW_OFF) {
+            /* raw reflects the running duty changes (model: always done) */
+            return soc->ledc_reg[o >> 2];
+        }
+        return soc->ledc_reg[o >> 2];
+    }
+    /* TIMG0/1 (0x60008000-0x60008100, 0x60009000-0x60009100) */
+    if (addr >= C6_PERIPH_BASE + 0x8000u &&
+        addr < C6_PERIPH_BASE + 0x8100u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0x8000u;
+        if (o == TIMG_T0LO)
+            return (uint32_t) soc->timg_counter[0];
+        if (o == TIMG_T0HI)
+            return (uint32_t) (soc->timg_counter[0] >> 32);
+        if (o == TIMG_INT_ST)
+            return soc->timg_reg[0][TIMG_INT_RAW >> 2] &
+                   soc->timg_reg[0][TIMG_INT_ENA >> 2];
+        return soc->timg_reg[0][o >> 2];
+    }
+    if (addr >= C6_PERIPH_BASE + 0x9000u &&
+        addr < C6_PERIPH_BASE + 0x9100u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0x9000u;
+        if (o == TIMG_T0LO)
+            return (uint32_t) soc->timg_counter[1];
+        if (o == TIMG_T0HI)
+            return (uint32_t) (soc->timg_counter[1] >> 32);
+        if (o == TIMG_INT_ST)
+            return soc->timg_reg[1][TIMG_INT_RAW >> 2] &
+                   soc->timg_reg[1][TIMG_INT_ENA >> 2];
+        return soc->timg_reg[1][o >> 2];
+    }
     /* GPIO */
     if (addr >= C6_PERIPH_BASE + 0x91000u && addr < C6_PERIPH_BASE + 0x92000u) {
         switch (off - 0x91000u) {
@@ -630,8 +743,6 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         case GPIO_ENABLE_REG:
             return soc->gpio_enable;
         case GPIO_IN_REG:
-            /* inputs injected by the model, plus readback of driven
-             * outputs (the pad follows the output driver) */
             return soc->gpio_in | (soc->gpio_out & soc->gpio_enable);
         case GPIO_STATUS_REG:
             return soc->gpio_status;
@@ -848,6 +959,124 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             soc->intc_status &= ~(1ull << C6_RMT_INTR_SOURCE);
             if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
                 soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
+        }
+        return;
+    }
+
+    /* LEDC (0x60007000-0x60007200) */
+    if (addr >= C6_PERIPH_BASE + 0x7000u &&
+        addr < C6_PERIPH_BASE + 0x7200u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0x7000u;
+        for (int c = 0; c < 6; c++) {
+            if (o == LEDC_CH_CONF1(c)) {
+                soc->ledc_reg[o >> 2] = val;
+                if (val & LEDC_DUTY_START) {
+                    /* duty update starts: the running duty becomes DUTY */
+                    soc->ledc_duty_r[c] = soc->ledc_reg[LEDC_CH_DUTY(c) >> 2];
+                    soc->ledc_reg[LEDC_CH_CONF1(c) >> 2] &= ~LEDC_DUTY_START;
+                }
+                return;
+            }
+        }
+        for (int t = 0; t < 4; t++) {
+            if (o == LEDC_TIMER_CONF(t)) {
+                if (val & LEDC_TIMER_RST) {
+                    soc->ledc_timer_anchor[t] = rv->csr_cycle;
+                    soc->ledc_timer_frac[t] = 0;
+                }
+                soc->ledc_reg[o >> 2] = val & ~(LEDC_TIMER_RST);
+                return;
+            }
+        }
+        if (o == LEDC_INT_CLR_OFF) {
+            soc->ledc_reg[LEDC_INT_RAW_OFF >> 2] &= ~val;
+            return;
+        }
+        soc->ledc_reg[o >> 2] = val;
+        return;
+    }
+
+    /* TIMG0/1 (0x60008000-0x60008100, 0x60009000-0x60009100) */
+    if (addr >= C6_PERIPH_BASE + 0x8000u &&
+        addr < C6_PERIPH_BASE + 0x8100u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0x8000u;
+        uint32_t *r = soc->timg_reg[0];
+        if (o == TIMG_T0CONFIG) {
+            /* counter (re)anchors on enable/divider/clock changes */
+            soc->timg_anchor[0] = rv->csr_cycle;
+            soc->timg_frac[0] = 0;
+            r[o >> 2] = val & ~TIMG_T0_DIVCNT_RST;
+        } else if (o == TIMG_T0LOAD) {
+            soc->timg_counter[0] = ((uint64_t) r[TIMG_T0LOADHI >> 2] << 32) |
+                                   r[TIMG_T0LOADLO >> 2];
+            soc->timg_anchor[0] = rv->csr_cycle;
+            soc->timg_frac[0] = 0;
+            r[o >> 2] = 0;
+        } else if (o == TIMG_T0UPDATE) {
+            r[o >> 2] = 0; /* reads use the live counter; nothing to latch */
+        } else if (o == TIMG_INT_CLR) {
+            r[TIMG_INT_RAW >> 2] &= ~val;
+            if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
+                soc->intc_status &= ~(1ull << C6_TG0_T0_INTR_SOURCE);
+            r[o >> 2] = 0;
+        } else if (o == TIMG_RTCCALICFG) {
+            /* RTC slow-clock calibration (preserved from the pre-TIMG
+             * model): on START the hardware counts XTAL cycles over
+             * RTC_CALI_MAX cycles of the selected clock, then sets
+             * RTC_CALI_RDY and latches the count into RTCCALICFG1. */
+            r[o >> 2] = val;
+            if (val & 0x80000000u) { /* TIMG_RTC_CALI_START */
+                uint32_t clk_hz, max = (val >> 16) & 0x7FFFu;
+                switch ((val >> 13) & 3u) { /* TIMG_RTC_CALI_CLK_SEL */
+                case 0: clk_hz = 150000u; break;    /* RC_SLOW */
+                case 1: clk_hz = 20000000u; break;  /* RC_FAST */
+                default: clk_hz = 32768u; break;    /* XTAL32K/RC32K/OSC_SLOW */
+                }
+                r[TIMG_RTCCALICFG1 >> 2] =
+                    (uint32_t) ((uint64_t) max * 40000000u / clk_hz);
+                r[o >> 2] |= 0x8000u; /* TIMG_RTC_CALI_RDY */
+            }
+        } else {
+            r[o >> 2] = val;
+        }
+        return;
+    }
+    if (addr >= C6_PERIPH_BASE + 0x9000u &&
+        addr < C6_PERIPH_BASE + 0x9100u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0x9000u;
+        uint32_t *r = soc->timg_reg[1];
+        if (o == TIMG_T0CONFIG) {
+            soc->timg_anchor[1] = rv->csr_cycle;
+            soc->timg_frac[1] = 0;
+            r[o >> 2] = val & ~TIMG_T0_DIVCNT_RST;
+        } else if (o == TIMG_T0LOAD) {
+            soc->timg_counter[1] = ((uint64_t) r[TIMG_T0LOADHI >> 2] << 32) |
+                                   r[TIMG_T0LOADLO >> 2];
+            soc->timg_anchor[1] = rv->csr_cycle;
+            soc->timg_frac[1] = 0;
+            r[o >> 2] = 0;
+        } else if (o == TIMG_T0UPDATE) {
+            r[o >> 2] = 0;
+        } else if (o == TIMG_INT_CLR) {
+            r[TIMG_INT_RAW >> 2] &= ~val;
+            if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
+                soc->intc_status &= ~(1ull << C6_TG1_T0_INTR_SOURCE);
+            r[o >> 2] = 0;
+        } else if (o == TIMG_RTCCALICFG) {
+            r[o >> 2] = val;
+            if (val & 0x80000000u) {
+                uint32_t clk_hz, max = (val >> 16) & 0x7FFFu;
+                switch ((val >> 13) & 3u) {
+                case 0: clk_hz = 150000u; break;
+                case 1: clk_hz = 20000000u; break;
+                default: clk_hz = 32768u; break;
+                }
+                r[TIMG_RTCCALICFG1 >> 2] =
+                    (uint32_t) ((uint64_t) max * 40000000u / clk_hz);
+                r[o >> 2] |= 0x8000u;
+            }
+        } else {
+            r[o >> 2] = val;
         }
         return;
     }
@@ -1206,6 +1435,7 @@ static inline uint32_t esp32_flash_window_off(esp32c6_t *soc, uint32_t addr)
 
 uint32_t esp32c6_read_w(riscv_t *rv, uint32_t addr)
 {
+
     esp32_region_t *r = esp32_lookup(rv, addr);
     if (!r || r->type != ESP32_REG_RAM)
         return esp32_mmio_read(PRIV(rv)->esp32c6, addr);
@@ -1619,13 +1849,119 @@ void esp32c6_periodic(riscv_t *rv)
         }
     }
 
+    /* LEDC output drive: enabled channels drive their routed pads. The
+     * GPIO matrix FUNCx_OUT_SEL (0x60091554 + 4*pin) picks the signal
+     * index; LEDC channels 0-5 are signals 0-5. The pad level follows
+     * the PWM phase (high for DUTY_R ticks starting at HPOINT within
+     * the 2^DUTY_RES period). */
+    for (int c = 0; c < 6; c++) {
+        uint32_t conf0 = soc->ledc_reg[LEDC_CH_CONF0(c) >> 2];
+        int level;
+        if (conf0 & LEDC_SIG_OUT_EN) {
+            uint32_t t = conf0 & 0x3u;
+            uint32_t conf = soc->ledc_reg[LEDC_TIMER_CONF(t) >> 2];
+            uint32_t res = conf & 0x1Fu;
+            /* CLK_DIV holds the divider in units of 1/256 source clock
+             * cycles; the C6 feeds the LEDC timers from the 40MHz XTAL,
+             * i.e. one source cycle per two emulated cycles. */
+            uint32_t f = (conf >> 5) & 0x3FFFFu;
+            uint32_t ratio = (conf & LEDC_TICK_SEL) ? 10u : 1u;
+            uint32_t period = 1u << (res < 25 ? res : 25);
+            if (f == 0) {
+                level = (conf0 & LEDC_IDLE_LV) ? 1 : 0;
+            } else {
+                /* accumulate the elapsed time in source-cycle/256 units
+                 * (one emulated cycle = two source cycles) so the phase
+                 * advances exactly one tick per f/256 source cycles,
+                 * wrapping at the full PWM period */
+                uint64_t span = (uint64_t) f * (uint64_t) period * ratio;
+                soc->ledc_timer_frac[t] +=
+                    (rv->csr_cycle - soc->ledc_timer_anchor[t]) * 512ull;
+                soc->ledc_timer_anchor[t] = rv->csr_cycle;
+                soc->ledc_timer_frac[t] %= span;
+                uint64_t ticks = soc->ledc_timer_frac[t] / f;
+                uint32_t pos = (uint32_t)(ticks % period);
+                uint32_t hpoint = soc->ledc_reg[LEDC_CH_HPOINT(c) >> 2] &
+                                  0xFFFFFu;
+                uint32_t duty = (soc->ledc_duty_r[c] & 0x1FFFFFFu) >> 4u;
+                level = ((pos + period - hpoint) % period) < duty;
+            }
+        } else {
+            level = (conf0 & LEDC_IDLE_LV) ? 1 : 0;
+        }
+        for (int p = 0; p < 30; p++) {
+            uint32_t sel = mmio32[(0x554u + 4u * p) >> 2] & 0xFFu;
+            if (sel == (uint32_t) c) {
+                if (level)
+                    soc->gpio_in |= 1u << p;
+                else
+                    soc->gpio_in &= ~(1u << p);
+
+            }
+        }
+    }
+
+    /* TIMG0/1 alarms: the counter ticks at the selected clock (PLL 80MHz
+     * or XTAL 40MHz, ratio vs the 1:1 cycle clock) divided by DIVIDER+1.
+     * On alarm: raw bit 0 set and the source raised (level semantics:
+     * re-asserted while the counter is past the alarm). With AUTORELOAD
+     * the counter reloads from T0LOADLO/HI. */
+    for (int g = 0; g < 2; g++) {
+        uint32_t cfg = soc->timg_reg[g][TIMG_T0CONFIG >> 2];
+        if (!(cfg & TIMG_T0_EN))
+            continue;
+        uint32_t div = ((cfg & TIMG_T0_DIVIDER) >> 13) + 1u;
+        uint32_t ratio = (cfg & TIMG_T0_USE_XTAL) ? 2u : 1u;
+        /* accumulate fractional cycles so the counter advances exactly
+         * one tick per div*ratio cycles regardless of block granularity */
+        uint64_t step = (uint64_t) div * (uint64_t) ratio;
+        soc->timg_frac[g] += rv->csr_cycle - soc->timg_anchor[g];
+        soc->timg_anchor[g] = rv->csr_cycle;
+        uint64_t elapsed = soc->timg_frac[g] / step;
+        soc->timg_frac[g] %= step;
+        uint64_t cnt;
+        if (cfg & TIMG_T0_INCREASE)
+            cnt = soc->timg_counter[g] + elapsed;
+        else
+            cnt = (elapsed > soc->timg_counter[g]) ? 0
+                                                   : soc->timg_counter[g] - elapsed;
+        soc->timg_counter[g] = cnt;
+        uint64_t alarm =
+            ((uint64_t) soc->timg_reg[g][TIMG_T0ALARMHI >> 2] << 32) |
+            soc->timg_reg[g][TIMG_T0ALARMLO >> 2];
+        uint32_t src = (g == 0) ? C6_TG0_T0_INTR_SOURCE
+                                : C6_TG1_T0_INTR_SOURCE;
+        int past = (cfg & TIMG_T0_ALARM_EN) && alarm &&
+                   ((cfg & TIMG_T0_INCREASE) ? cnt >= alarm : cnt <= alarm);
+        if (past) {
+            soc->timg_reg[g][TIMG_INT_RAW >> 2] |= TIMG_INT_T0_ALARM;
+            if (soc->timg_reg[g][TIMG_INT_RAW >> 2] &
+                soc->timg_reg[g][TIMG_INT_ENA >> 2])
+                soc->intc_status |= 1ull << src;
+            if (cfg & TIMG_T0_AUTORELOAD) {
+                uint64_t reload =
+                    ((uint64_t) soc->timg_reg[g][TIMG_T0LOADHI >> 2] << 32) |
+                    soc->timg_reg[g][TIMG_T0LOADLO >> 2];
+                soc->timg_counter[g] = reload;
+                soc->timg_anchor[g] = rv->csr_cycle;
+                soc->timg_frac[g] = 0;
+            }
+        }
+    }
+
     /* advance SYSTIMER counters (both units free-run on the C6) */
     uint64_t elapsed = rv->csr_cycle - soc->last_cycle;
     soc->last_cycle = rv->csr_cycle;
-    soc->systimer_counter += elapsed;
-    soc->systimer_unit1_counter += elapsed;
+
+    /* The C6 system timer is clocked by XTAL/2.5 = 16 MHz and the RTC
+     * slow clock is ~150 kHz; both derive from the 80 MHz cycle clock. */
+    soc->systimer_frac += elapsed;
+    uint64_t syst = soc->systimer_frac / 5u;
+    soc->systimer_frac %= 5u;
+    soc->systimer_counter += syst;
+    soc->systimer_unit1_counter += syst;
     soc->clint_mtime += elapsed;
-    soc->lp_timer = rv->csr_cycle / 1067u; /* RC_SLOW ~150 kHz vs ~160 MHz */
+    soc->lp_timer = rv->csr_cycle / 533u; /* RC_SLOW ~150 kHz */
 
 /* SYSTIMER alarms. The C6: alarm enables are SYSTIMER_CONF bits
  * (TARGET0_WORK_EN=24, TARGET2_WORK_EN=22); TIMER_UNIT_SEL (bit31 of the
