@@ -161,6 +161,13 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     the driver ISR copies the symbols straight from channel memory. Measured high pulse
     = 819 ticks exactly at 1 MHz resolution (80 MHz PLL_F80M source, div 80: step =
     2*div emulated cycles). Full regression: 13/13 tests pass headless in wasm.
+  - Browser demo upgrade 2026-08-19: the C6 demo firmware is now `demotest` — a single
+    sketch exercising GPIO/PCNT (15 pulses on the virtual button), LEDC + MCPWM PWM
+    (50% duty measured via digitalRead), RMT RX (819-tick pulse on pin 6), I2C scan
+    (finds the virtual 0x50 device), SPI (JEDEC ID), TWAI (virtual frame 0x123 DE AD),
+    TSENS (temperature) and ADC — prints a full report ending with DEMO_DONE.
+    demo/system/esp32c6/ + demo/system/rv32emu.{js,wasm} refreshed (wasm now includes
+    the RMT RX model).
 
 ## Known issues / gotchas
 
