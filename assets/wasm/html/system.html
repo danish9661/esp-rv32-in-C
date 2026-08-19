@@ -504,6 +504,7 @@
     <div class="controls-panel progressive-load">
       <button class="btn btn-primary" id="runSysButton" disabled>Boot Linux</button>
       <button class="btn btn-secondary" id="runEsp32c3Button" disabled>Run ESP32-C3 App</button>
+      <button class="btn btn-secondary" id="runEsp32c6Button" disabled>Run ESP32-C6 App</button>
     </div>
 
     <div class="canvas-panel progressive-load">
@@ -761,6 +762,47 @@
       }
     });
 
+    // ESP32-C6 app mode: same flow as C3, through the esp32c6 machine.
+    // Firmware: pcnttest (pulse-counter demo using the virtual button on pin 7).
+    const ESP32C6_ELF = 'esp32c6/pcnttest.ino.elf';
+    const ESP32C6_FLASH = 'esp32c6/pcnttest.ino.merged.bin';
+
+    const runEsp32c6Button = document.getElementById('runEsp32c6Button');
+
+    runEsp32c6Button?.addEventListener('click', async () => {
+      runEsp32c6Button.disabled = true;
+      statusText.textContent = 'Downloading ESP32-C6 firmware...';
+      statusBadge.classList.add('loading');
+      if (term) term.write('\x1b[33mDownloading ESP32-C6 firmware...\x1b[0m\r\n');
+
+      try {
+        const [elfData, flashData] = await Promise.all([
+          fetchWithProgress(ESP32C6_ELF, 'App ELF'),
+          fetchWithProgress(ESP32C6_FLASH, 'Flash image'),
+        ]);
+
+        if (term) term.write('\x1b[33mWriting firmware to VFS...\x1b[0m\r\n');
+        try {
+          Module.FS.mkdir('/esp32c6');
+        } catch (e) { /* already exists */ }
+        Module.FS.writeFile('/' + ESP32C6_ELF, elfData);
+        Module.FS.writeFile('/' + ESP32C6_FLASH, flashData);
+
+        statusText.textContent = 'Booting ESP32-C6 app...';
+        statusBadge.classList.remove('loading');
+        if (term) term.write('\x1b[33mBooting ESP32-C6 app...\x1b[0m\r\n');
+
+        Module._indirect_rv_halt();
+        Module['run_esp32c6'](ESP32C6_ELF, ESP32C6_FLASH);
+      } catch (err) {
+        console.error('ESP32-C6 boot failed:', err);
+        statusText.textContent = 'Download failed';
+        statusBadge.classList.add('loading');
+        if (term) term.write(`\x1b[31mError: ${err.message}\x1b[0m\r\n`);
+        runEsp32c6Button.disabled = false;
+      }
+    });
+
     // Fullscreen handler with fallback
     function requestCanvasFullscreen() {
       const canvas = document.getElementById('canvas');
@@ -997,6 +1039,7 @@
         // Enable boot button now that emulator is ready
         if (runSysButton) runSysButton.disabled = false;
         if (runEsp32c3Button) runEsp32c3Button.disabled = false;
+        if (runEsp32c6Button) runEsp32c6Button.disabled = false;
         setTimeout(() => ProgressiveLoader.hide(), 300);
       }
     };

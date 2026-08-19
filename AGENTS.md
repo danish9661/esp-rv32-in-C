@@ -135,7 +135,17 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     open http://127.0.0.1:8000/system/system.html.
   - Note: rebuilding wasm after native and vice versa needs `rm -rf build/softfloat build/devices` (archive/objects
     are toolchain-specific; make does not detect the toolchain switch).
-- [ ] Phase 3: Port SoC layer to C6 (adds 802.15.4, USB-serial-JTAG, TWAI) — next.
+- [x] Phase 3: Port SoC layer to C6 (adds 802.15.4, USB-serial-JTAG, TWAI).
+  - Peripheral work done via arduino-cli-built test sketches (fqbn esp32:esp32:esp32c6),
+    each verified against the model: I2C, SPI, UART RX (host `-U` injection), GPIO
+    (virtual button pin 7), GPTIMER, ADC (adc_oneshot), RMT TX, LEDC, TSENS, CAN (TWAI RX),
+    PCNT (pulse counting from the virtual button via GPIO matrix FUNC_IN_SEL).
+  - WASM build (`make CC=emcc wasmc6_defconfig` + `make CC=emcc`) verified headless in
+    node: C6 firmware boots to setup()/loop() and produces identical peripheral test
+    output (e.g. pcnttest `PCNT_GET 0 count=8`). 2026-08-19.
+  - Browser demo for C6: added "Run ESP32-C6 App" button (pcnttest firmware) to
+    demo/system/ via assets/wasm/js/system-pre.js `run_esp32c6` + system.html;
+    firmware at demo/system/esp32c6/. 2026-08-19.
 
 ## Known issues / gotchas
 
