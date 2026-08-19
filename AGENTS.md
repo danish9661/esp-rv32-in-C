@@ -139,13 +139,20 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - Peripheral work done via arduino-cli-built test sketches (fqbn esp32:esp32:esp32c6),
     each verified against the model: I2C, SPI, UART RX (host `-U` injection), GPIO
     (virtual button pin 7), GPTIMER, ADC (adc_oneshot), RMT TX, LEDC, TSENS, CAN (TWAI RX),
-    PCNT (pulse counting from the virtual button via GPIO matrix FUNC_IN_SEL).
+    PCNT (pulse counting from the virtual button via GPIO matrix FUNC_IN_SEL),
+    MCPWM (timers 0..peak with up/down/updown modes, generator events utez/utep/ucmp/
+    dtep/dtez/dcmp, continuous + one-shot force levels; pins routed via FUNC_OUT_SEL
+    to PWM0_OUT{0,1,2}{A,B} = signals 87..92).
   - WASM build (`make CC=emcc wasmc6_defconfig` + `make CC=emcc`) verified headless in
     node: C6 firmware boots to setup()/loop() and produces identical peripheral test
     output (e.g. pcnttest `PCNT_GET 0 count=8`). 2026-08-19.
   - Browser demo for C6: added "Run ESP32-C6 App" button (pcnttest firmware) to
     demo/system/ via assets/wasm/js/system-pre.js `run_esp32c6` + system.html;
     firmware at demo/system/esp32c6/. 2026-08-19.
+  - MCPWM model verified 2026-08-19: mcpwmtest measures lo% via digitalRead over 10 ms
+    — 50/25/75% duty at 1 kHz, continuous force pins to 100%, release restores PWM.
+    Also fixed LEDC pad routing: FUNCx_OUT_SEL index read was 0x554 instead of 0x91554
+    (tests passed by coincidence), pins now reset to SIG_GPIO_OUT (0x80) like real HW.
 
 ## Known issues / gotchas
 

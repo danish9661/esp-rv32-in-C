@@ -266,6 +266,20 @@ struct esp32c6_soc {
      * input signal is routed to pin 7 via the GPIO matrix. */
     uint32_t pcnt_reg[64];
 
+    /* MCPWM (0x60014000): 0x130 bytes, mirrors mcpwm_dev_t. Timers count
+     * 0..period at (timer_prescale+1)*(clk_prescale+1) 40 MHz source
+     * cycles; generator events (zero/period/compare A/B) update the
+     * levels that drive pads routed to signals 87..92
+     * (PWM0_OUT{0,1,2}{A,B}). */
+    uint32_t mcpwm_reg[76];
+    uint64_t mcpwm_anchor[3];   /* cycle anchor per timer */
+    uint64_t mcpwm_frac[3];     /* fractional cycle remainder per timer */
+    uint32_t mcpwm_phase[3];    /* live timer value */
+    int mcpwm_dir[3];           /* 0 counting up, 1 counting down */
+    int mcpwm_running[3];       /* timer started */
+    int mcpwm_stopat[3];        /* one-shot: 0 never, 1 at zero, 2 at peak */
+    uint32_t mcpwm_level[3][2]; /* generator output levels */
+
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
     unsigned int uart_rx_head;
@@ -356,6 +370,11 @@ esp32c6_t *esp32c6_new(void)
      * fixed at 3, never written by software; required for freq round-trip) */
     ((uint32_t *) soc->mmio)[(0x60096110u - C6_PERIPH_BASE) >> 2] = 0x200u;
 
+    /* GPIO matrix output select resets to 0x80 (SIG_GPIO_OUT): every pad
+     * is a plain GPIO output until a peripheral signal is routed to it */
+    for (int p = 0; p < 30; p++)
+        ((uint32_t *) soc->mmio)[(0x91554u + 4u * p) >> 2] = 0x80u;
+
     /* flash cache MMU defaults to identity mapping (page i -> flash page i) */
     for (int i = 0; i < 256; i++)
         soc->mmu[i] = i;
@@ -396,6 +415,8 @@ esp32c6_t *esp32c6_new(void)
 #define C6_TG1_T0_INTR_SOURCE 54u
 /* PCNT interrupt source (interrupts.h enum) */
 #define C6_PCNT_INTR_SOURCE 62u
+/* MCPWM0 interrupt source (interrupts.h enum) */
+#define C6_MCPWM_INTR_SOURCE 61u
 
 /* Virtual I2C device: a 16-byte EEPROM at 0x50 that ACKs transfers */
 #define C6_I2C_DEV_ADDR 0x50u
@@ -675,6 +696,20 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         if (o == 0x44u) /* int_st = raw & ena */
             return soc->pcnt_reg[0x40 >> 2] & soc->pcnt_reg[0x48 >> 2];
         return soc->pcnt_reg[o >> 2];
+    }
+
+    /* MCPWM (0x60014000-0x60014130) */
+    if (addr >= C6_PERIPH_BASE + 0x14000u &&
+        addr < C6_PERIPH_BASE + 0x14130u) {
+        uint32_t o = off - 0x14000u;
+        if ((o & 0xFu) == 0x10u && o <= 0x30u) { /* timer_status: live */
+            int t = o >> 4;
+            return ((uint32_t) soc->mcpwm_dir[t] << 16) |
+                   soc->mcpwm_phase[t];
+        }
+        if (o == 0x19Cu) /* int_st = raw & ena */
+            return soc->mcpwm_reg[0x198u >> 2] & soc->mcpwm_reg[0x194u >> 2];
+        return soc->mcpwm_reg[o >> 2];
     }
 
     /* I2C_EXT (0x60004000-0x60004200) */
@@ -1242,6 +1277,36 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         return;
     }
 
+    /* MCPWM (0x60014000-0x60014130) */
+    if (addr >= C6_PERIPH_BASE + 0x14000u &&
+        addr < C6_PERIPH_BASE + 0x14130u) {
+        uint32_t o = off - 0x14000u;
+        if (o == 0x1A0u) { /* int_clr: W1C */
+            soc->mcpwm_reg[0x198u >> 2] &= ~val;
+            if (!(soc->mcpwm_reg[0x198u >> 2] & soc->mcpwm_reg[0x194u >> 2]))
+                soc->intc_status &= ~(1ull << C6_MCPWM_INTR_SOURCE);
+            return;
+        }
+        if ((o & 0xFu) == 0x08u && o <= 0x28u) { /* timer_cfg1 */
+            int t = o >> 4;
+            uint32_t cmd = val & 0x7u;
+            /* start/stop field is self-clearing on write */
+            soc->mcpwm_reg[o >> 2] = val & ~0x7u;
+            if (cmd <= 1u) { /* STOP_EMPTY / STOP_FULL */
+                soc->mcpwm_running[t] = 0;
+                soc->mcpwm_stopat[t] = 0;
+            } else if (cmd <= 4u) { /* START_NO_STOP / _STOP_EMPTY / _STOP_FULL */
+                soc->mcpwm_running[t] = 1;
+                soc->mcpwm_stopat[t] = (cmd == 3u) ? 1 : (cmd == 4u) ? 2 : 0;
+            }
+            return;
+        }
+        if ((o & 0xFu) == 0x10u && o <= 0x30u) /* timer_status: RO */
+            return;
+        soc->mcpwm_reg[o >> 2] = val;
+        return;
+    }
+
     /* UART0 */
     if (addr < C6_PERIPH_BASE + 0x1000u) {
         if (off == UART_FIFO_REG) {
@@ -1371,7 +1436,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->intc_status &= ~(1ull << C6_GPIO_INTR_SOURCE);
             return;
         default:
-            fprintf(stderr, "[GPIOW] off=%03x val=%08x\n", off - 0x91000u, val);
             mmio32[off >> 2] = val;
             return;
         }
@@ -1841,13 +1905,66 @@ static void esp32c6_uart_rx_poll(esp32c6_t *soc)
     }
 }
 
+/* Apply the MCPWM generator events that coincide with the timer reaching
+ * `phase`: for each operator connected to timer t, the compare values and
+ * the action fields of both generators decide the new output levels.
+ * Event codes: 0 utez, 1 utep, 2 ucmp0, 3 ucmp1, 4 dtep, 5 dtez,
+ * 6 dcmp1, 7 dcmp0; action fields are 2 bits, up events in [0:8),
+ * down events in [12:20). */
+static void esp32c6_mcpwm_fire(esp32c6_t *soc, int t, int dir,
+                               uint32_t phase, uint32_t period)
+{
+    for (int op = 0; op < 3; op++) {
+        uint32_t os = soc->mcpwm_reg[0x38u >> 2];
+        if (((os >> (2 * op)) & 0x3u) != (uint32_t) t)
+            continue;
+        uint32_t gb = 0x3cu + 0x38u * op;
+        uint32_t c0 = soc->mcpwm_reg[(gb + 0x04u) >> 2] & 0xFFFFu;
+        uint32_t c1 = soc->mcpwm_reg[(gb + 0x08u) >> 2] & 0xFFFFu;
+        int ev;
+        if (dir == 0) {
+            if (phase == 0) ev = 0;
+            else if (phase == period) ev = 1;
+            else if (phase == c0) ev = 2;
+            else if (phase == c1) ev = 3;
+            else continue;
+        } else {
+            if (phase == period) ev = 4;
+            else if (phase == 0) ev = 5;
+            else if (phase == c1) ev = 6;
+            else if (phase == c0) ev = 7;
+            else continue;
+        }
+        for (int g = 0; g < 2; g++) {
+            uint32_t gr = soc->mcpwm_reg[(gb + 0x14u + 4u * g) >> 2];
+            static const uint8_t ev_shift[8] = { 0, 2, 4, 6, 14, 12, 18, 16 };
+            uint32_t act = (gr >> ev_shift[ev]) & 0x3u;
+            if (act == 1u)
+                soc->mcpwm_level[op][g] = 0;
+            else if (act == 2u)
+                soc->mcpwm_level[op][g] = 1;
+            else if (act == 3u)
+                soc->mcpwm_level[op][g] ^= 1;
+        }
+        /* one-shot (non-continue) force is consumed by the next event */
+        uint32_t *gf = &soc->mcpwm_reg[(gb + 0x10u) >> 2];
+        if ((*gf >> 10) & 1u) {
+            *gf &= ~(1u << 10);
+            *gf &= ~(0x3u << 11);
+        }
+        if ((*gf >> 13) & 1u) {
+            *gf &= ~(1u << 13);
+            *gf &= ~(0x3u << 14);
+        }
+    }
+}
+
 void esp32c6_periodic(riscv_t *rv)
 {
     esp32c6_t *soc = PRIV(rv)->esp32c6;
     if (!soc)
         return;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
-
     /* Virtual button: input pin 7 toggles every ~2^18 cycles. The change
      * is fed into the pad state, and pins with a matching interrupt type
      * raise the GPIO interrupt (INTMTX source 30). */
@@ -2140,7 +2257,7 @@ void esp32c6_periodic(riscv_t *rv)
             level = (conf0 & LEDC_IDLE_LV) ? 1 : 0;
         }
         for (int p = 0; p < 30; p++) {
-            uint32_t sel = mmio32[(0x554u + 4u * p) >> 2] & 0xFFu;
+            uint32_t sel = mmio32[(0x91554u + 4u * p) >> 2] & 0xFFu;
             if (sel == (uint32_t) c) {
                 if (level)
                     soc->gpio_in |= 1u << p;
@@ -2148,6 +2265,89 @@ void esp32c6_periodic(riscv_t *rv)
                     soc->gpio_in &= ~(1u << p);
 
             }
+        }
+    }
+
+    /* MCPWM (0x60014000): timers count 0..period, one tick per
+     * (timer_prescale+1)*(clk_prescale+1) source cycles (40 MHz, i.e. two
+     * emulated cycles each). timer_mod: 0 paused, 1 up (register period is
+     * peak-1), 2 down, 3 up/down (register period is the peak). Generator
+     * events (zero, period, compare A/B) apply the action fields; the
+     * resulting level drives any pad whose matrix output select is the
+     * MCPWM signal (87..92 = PWM0_OUT{0,1,2}{A,B}). */
+    {
+        uint32_t clkps = (soc->mcpwm_reg[0x00 >> 2] & 0xFFu) + 1u;
+        for (int t = 0; t < 3; t++) {
+            if (!soc->mcpwm_running[t])
+                continue;
+            uint32_t base = 0x04u + 0x10u * t;
+            uint32_t cfg0 = soc->mcpwm_reg[base >> 2];
+            uint32_t mod = (soc->mcpwm_reg[(base + 0x04u) >> 2] >> 3) & 0x3u;
+            uint32_t period = (cfg0 >> 8) & 0xFFFFu;
+            if (mod == 0u || period == 0)
+                continue;
+            uint64_t step = (uint64_t) ((cfg0 & 0xFFu) + 1u) * clkps * 2ull;
+            soc->mcpwm_frac[t] += rv->csr_cycle - soc->mcpwm_anchor[t];
+            soc->mcpwm_anchor[t] = rv->csr_cycle;
+            uint64_t elapsed = soc->mcpwm_frac[t] / step;
+            soc->mcpwm_frac[t] %= step;
+            uint32_t phase = soc->mcpwm_phase[t];
+            for (uint64_t i = 0; i < elapsed; i++) {
+                /* one-shot stop commands take effect on reaching the value */
+                if ((soc->mcpwm_stopat[t] == 1 && phase == 0) ||
+                    (soc->mcpwm_stopat[t] == 2 && phase == period)) {
+                    soc->mcpwm_running[t] = 0;
+                    soc->mcpwm_stopat[t] = 0;
+                    break;
+                }
+                esp32c6_mcpwm_fire(soc, t, soc->mcpwm_dir[t], phase, period);
+                if (mod == 1u) { /* up */
+                    soc->mcpwm_dir[t] = 0;
+                    phase = (phase == period) ? 0 : phase + 1;
+                } else if (mod == 2u) { /* down */
+                    soc->mcpwm_dir[t] = 1;
+                    phase = (phase == 0) ? period : phase - 1;
+                } else if (soc->mcpwm_dir[t] == 0) { /* up/down rising */
+                    if (phase == period) {
+                        phase = period - 1;
+                        soc->mcpwm_dir[t] = 1;
+                    } else {
+                        phase++;
+                    }
+                } else { /* up/down falling */
+                    if (phase == 0) {
+                        phase = 1;
+                        soc->mcpwm_dir[t] = 0;
+                    } else {
+                        phase--;
+                    }
+                }
+                soc->mcpwm_phase[t] = phase;
+            }
+        }
+        /* drive pads routed to MCPWM signals; continuous force (cntuforce
+         * mode) pins the level, one-shot force (nciforce) lasts one event */
+        for (int p = 0; p < 30; p++) {
+            uint32_t sel = mmio32[(0x91554u + 4u * p) >> 2] & 0xFFu;
+            if (sel < 87u || sel > 92u)
+                continue;
+            int op = (int) (sel - 87u) >> 1;
+            int g = (int) (sel - 87u) & 1;
+            uint32_t gf = soc->mcpwm_reg[(0x3cu + 0x38u * op + 0x10u) >> 2];
+            uint32_t cmode = (g == 0) ? ((gf >> 6) & 0x3u) : ((gf >> 8) & 0x3u);
+            uint32_t nmode = (g == 0) ? ((gf >> 11) & 0x3u) : ((gf >> 14) & 0x3u);
+            uint32_t ntrig = (g == 0) ? ((gf >> 10) & 1u) : ((gf >> 13) & 1u);
+            int level;
+            if (cmode)
+                level = (cmode == 2u);
+            else if (ntrig && nmode)
+                level = (nmode == 2u);
+            else
+                level = (soc->mcpwm_level[op][g] != 0);
+            if (level)
+                soc->gpio_in |= 1u << p;
+            else
+                soc->gpio_in &= ~(1u << p);
         }
     }
 
