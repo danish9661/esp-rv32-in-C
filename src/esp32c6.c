@@ -649,6 +649,9 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         uint32_t o = off - 0xE000u;
         if (o == 0x2Cu) /* sar1data_status: raw result */
             return soc->adc_reg[o >> 2];
+        if (o == 0x58u) /* tsens ctrl: the 8-bit sensor output field is RO;
+                          raw 120 reads 32 C (0.4386*raw - 20.52) */
+            return (soc->adc_reg[o >> 2] & ~0xFFu) | 0x78u;
         if (o == 0x44u) /* int_raw */
             return soc->adc_reg[o >> 2];
         if (o == 0x48u) /* int_st = raw & ena */
