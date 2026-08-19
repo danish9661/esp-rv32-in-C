@@ -234,6 +234,8 @@ struct esp32c6_soc {
     /* SPI2 (GPSPI2, 0x60081000): register bank + transfer completion */
     uint32_t spi2_reg[64]; /* 0x100 bytes, mirrors spi_dev_t */
     int spi2_transfer_pending; /* a cmd.usr was written; bus has no slave */
+    uint8_t spi2_dev_mem[16];  /* virtual SRAM contents */
+    int spi2_jedec;            /* JEDEC ID read in progress (bytes left) */
 
     /* TWAI0 (CAN, 0x6000B000): register bank + TX completion */
     uint32_t twai_reg[64]; /* 0x100 bytes, mirrors twai_dev_t */
@@ -322,6 +324,9 @@ esp32c6_t *esp32c6_new(void)
     /* virtual I2C device: 16-byte EEPROM with a known pattern */
     for (int i = 0; i < 16; i++)
         soc->i2c_dev_mem[i] = 0x40 + i;
+    /* virtual SPI device: 16-byte SRAM with the same known pattern */
+    for (int i = 0; i < 16; i++)
+        soc->spi2_dev_mem[i] = 0x40 + i;
 
     /* flash backing shared by the i/d-cache window */
     uint8_t *flash = calloc(1, C6_FLASH_SIZE);
@@ -1866,13 +1871,56 @@ void esp32c6_periodic(riscv_t *rv)
             soc->intc_status |= 1ull << C6_I2C_EXT0_INTR_SOURCE;
     }
 
-    /* SPI2 transfer completion: cmd.usr was set on an empty bus. MISO
-     * floats high (no slave) so all received words come back 0xFF, and
-     * cmd.usr self-clears for the firmware's poll. */
+    /* SPI2 transfer completion: cmd.usr was set. The virtual device (a
+     * 16-byte SRAM, JEDEC ID 0xEF4015, echo fallback) decodes the TX bytes
+     * from the data buffer (little-endian byte order as the HAL packs it)
+     * and shifts its response back MSB-first; with no device selected the
+     * MISO line floats high so every received byte is 0xFF. */
     if (soc->spi2_transfer_pending) {
         soc->spi2_transfer_pending = 0;
-        for (int i = 0; i < 16; i++)
+        uint32_t dlen = soc->spi2_reg[0x1c >> 2] & 0x3Fu; /* usr_mosi_dbitlen */
+        int n = (dlen + 8) / 8; /* transferred bytes, byte-aligned */
+        if (n > 16)
+            n = 16;
+        uint8_t tx[16], rx[16];
+        for (int i = 0; i < n; i++) {
+            int w = i >> 2;
+            int sh = 8 * (i & 3); /* HAL packs/reads buffer bytes LE */
+            tx[i] = (soc->spi2_reg[(0x98u + 4u * w) >> 2] >> sh) & 0xFFu;
+        }
+        if (n >= 1 && tx[0] == 0x9Fu) { /* READ JEDEC ID */
+            soc->spi2_jedec = 4;
+            for (int i = 0; i < n; i++)
+                rx[i] = 0xFFu; /* first byte is don't-care */
+        } else if (soc->spi2_jedec > 0) { /* continue JEDEC ID response */
+            static const uint8_t jedec_id[4] = { 0xEFu, 0x40u, 0x15u, 0xFFu };
+            for (int i = 0; i < n; i++)
+                rx[i] = jedec_id[(4 - soc->spi2_jedec + i) & 3];
+            soc->spi2_jedec -= n;
+            if (soc->spi2_jedec < 0)
+                soc->spi2_jedec = 0;
+        } else if (n >= 3 && tx[0] == 0x03u) { /* READ SRAM */
+            int addr = (tx[1] << 8) | tx[2];
+            for (int i = 0; i < n; i++)
+                rx[i] = soc->spi2_dev_mem[(addr + i) & 15];
+        } else if (n >= 3 && tx[0] == 0x02u) { /* WRITE SRAM */
+            int addr = (tx[1] << 8) | tx[2];
+            for (int i = 3; i < n; i++)
+                soc->spi2_dev_mem[(addr + i - 3) & 15] = tx[i];
+            for (int i = 0; i < n; i++)
+                rx[i] = tx[i];
+        } else { /* loopback echo */
+            for (int i = 0; i < n; i++)
+                rx[i] = tx[i];
+        }
+        for (int i = 0; i < 4; i++) /* MISO floats high for unused bits */
             soc->spi2_reg[(0x98u + 4u * i) >> 2] = 0xFFFFFFFFu;
+        for (int i = 0; i < n; i++) { /* response packed LE like the HAL reads */
+            int w = i >> 2;
+            int sh = 8 * (i & 3);
+            uint32_t *reg = &soc->spi2_reg[(0x98u + 4u * w) >> 2];
+            *reg = (*reg & ~(0xFFu << sh)) | ((uint32_t)rx[i] << sh);
+        }
         soc->spi2_reg[0x00 >> 2] &= ~(1u << 24); /* usr cleared */
         soc->spi2_reg[0x3c >> 2] |= 1u << 12;    /* trans_done raw */
     }
