@@ -261,6 +261,11 @@ struct esp32c6_soc {
     uint64_t timg_frac[2];    /* fractional cycle remainder per group */
     uint64_t systimer_frac;   /* fractional cycle remainder (16 MHz sysclk) */
 
+    /* PCNT (0x60012000): 0x100 bytes, mirrors pcnt_dev_t. The virtual
+     * button (pin 7) is the pulse source: edges count whenever a channel's
+     * input signal is routed to pin 7 via the GPIO matrix. */
+    uint32_t pcnt_reg[64];
+
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
     unsigned int uart_rx_head;
@@ -389,6 +394,8 @@ esp32c6_t *esp32c6_new(void)
 /* TIMG0/TIMG1 timer interrupt sources (interrupts.h enum) */
 #define C6_TG0_T0_INTR_SOURCE 51u
 #define C6_TG1_T0_INTR_SOURCE 54u
+/* PCNT interrupt source (interrupts.h enum) */
+#define C6_PCNT_INTR_SOURCE 62u
 
 /* Virtual I2C device: a 16-byte EEPROM at 0x50 that ACKs transfers */
 #define C6_I2C_DEV_ADDR 0x50u
@@ -659,6 +666,15 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         if (o == 0x400u) /* version */
             return 0x02206840u;
         return soc->adc_reg[o >> 2];
+    }
+
+    /* PCNT (0x60012000-0x60012100) */
+    if (addr >= C6_PERIPH_BASE + 0x12000u &&
+        addr < C6_PERIPH_BASE + 0x12100u) {
+        uint32_t o = off - 0x12000u;
+        if (o == 0x44u) /* int_st = raw & ena */
+            return soc->pcnt_reg[0x40 >> 2] & soc->pcnt_reg[0x48 >> 2];
+        return soc->pcnt_reg[o >> 2];
     }
 
     /* I2C_EXT (0x60004000-0x60004200) */
@@ -1205,6 +1221,27 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         return;
     }
 
+    /* PCNT (0x60012000-0x60012100) */
+    if (addr >= C6_PERIPH_BASE + 0x12000u &&
+        addr < C6_PERIPH_BASE + 0x12100u) {
+        uint32_t o = off - 0x12000u;
+        if (o == 0x4cu) { /* int_clr: W1C */
+            soc->pcnt_reg[0x40 >> 2] &= ~val;
+            if (!(soc->pcnt_reg[0x40 >> 2] & soc->pcnt_reg[0x48 >> 2]))
+                soc->intc_status &= ~(1ull << C6_PCNT_INTR_SOURCE);
+            return;
+        }
+        if (o == 0x60u) { /* ctrl: pulse_cnt_rst_uN clears the counter */
+            for (int u = 0; u < 4; u++)
+                if (val & (1u << (2 * u)))
+                    soc->pcnt_reg[(0x30u + 4u * u) >> 2] = 0;
+            soc->pcnt_reg[o >> 2] = val;
+            return;
+        }
+        soc->pcnt_reg[o >> 2] = val;
+        return;
+    }
+
     /* UART0 */
     if (addr < C6_PERIPH_BASE + 0x1000u) {
         if (off == UART_FIFO_REG) {
@@ -1334,6 +1371,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->intc_status &= ~(1ull << C6_GPIO_INTR_SOURCE);
             return;
         default:
+            fprintf(stderr, "[GPIOW] off=%03x val=%08x\n", off - 0x91000u, val);
             mmio32[off >> 2] = val;
             return;
         }
@@ -1843,6 +1881,56 @@ void esp32c6_periodic(riscv_t *rv)
                     if (fire && ena) {
                         soc->gpio_status |= 1u << pin;
                         soc->intc_status |= 1ull << C6_GPIO_INTR_SOURCE;
+                    }
+                }
+                /* PCNT: feed the edge to any unit/channel wired to this pin
+                 * via the GPIO matrix input select: FUNC<signal>_IN_SEL
+                 * (0x60091000 + 0x154 + 4*signal) selects which GPIO feeds
+                 * that signal (field sig_in_sel = pin number). Signal for
+                 * unit u channel ch = 101 + 4u + ch. */
+                for (int u = 0; u < 4; u++) {
+                    if (soc->pcnt_reg[0x60 >> 2] & (1u << (2 * u + 1)))
+                        continue; /* counter paused */
+                    uint32_t conf0 = soc->pcnt_reg[(0x0c * u) >> 2];
+                    uint32_t conf1 = soc->pcnt_reg[(0x04 + 0x0c * u) >> 2];
+                    uint32_t conf2 = soc->pcnt_reg[(0x08 + 0x0c * u) >> 2];
+                    for (int ch = 0; ch < 2; ch++) {
+                        uint32_t sig = 101u + 4u * u + ch;
+                        uint32_t insel =
+                            mmio32[(0x91000u + 0x154u + 4u * sig) >> 2];
+                        if ((insel & 0x3Fu) != 7u)
+                            continue;
+                        int act = phase
+                            ? (ch ? (conf0 >> 26) & 0x3u : (conf0 >> 18) & 0x3u)
+                            : (ch ? (conf0 >> 24) & 0x3u : (conf0 >> 16) & 0x3u);
+                        int16_t cnt = (int16_t) soc->pcnt_reg[(0x30u + 4u * u) >> 2];
+                        if (act == 1u)
+                            cnt++;
+                        else if (act == 2u)
+                            cnt--;
+                        soc->pcnt_reg[(0x30u + 4u * u) >> 2] = (uint16_t) cnt;
+                        uint32_t status = 0;
+                        if ((conf0 >> 15) & 1u && /* thr_thres1_en */
+                            cnt == (int16_t) (conf1 >> 16))
+                            status |= 1u << 2;
+                        if ((conf0 >> 14) & 1u && /* thr_thres0_en */
+                            cnt == (int16_t) (conf1 & 0xFFFFu))
+                            status |= 1u << 3;
+                        if ((conf0 >> 13) & 1u && /* thr_l_lim_en */
+                            cnt == (int16_t) (conf2 >> 16))
+                            status |= 1u << 4;
+                        if ((conf0 >> 12) & 1u && /* thr_h_lim_en */
+                            cnt == (int16_t) (conf2 & 0xFFFFu))
+                            status |= 1u << 5;
+                        if ((conf0 >> 11) & 1u && cnt == 0) /* thr_zero_en */
+                            status |= 1u << 6;
+                        soc->pcnt_reg[(0x50 + 4 * u) >> 2] = status;
+                        if (status) {
+                            soc->pcnt_reg[0x40 >> 2] |= 1u << u;
+                            if (soc->pcnt_reg[0x40 >> 2] &
+                                soc->pcnt_reg[0x48 >> 2])
+                                soc->intc_status |= 1ull << C6_PCNT_INTR_SOURCE;
+                        }
                     }
                 }
             }
