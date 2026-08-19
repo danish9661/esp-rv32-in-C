@@ -153,6 +153,14 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     — 50/25/75% duty at 1 kHz, continuous force pins to 100%, release restores PWM.
     Also fixed LEDC pad routing: FUNCx_OUT_SEL index read was 0x554 instead of 0x91554
     (tests passed by coincidence), pins now reset to SIG_GPIO_OUT (0x80) like real HW.
+  - RMT RX model verified 2026-08-19 (commit 78fbe54): rmtrxtest receives the virtual
+    pulse source on pin 6 (high 2^17 cycles, low rest of a 3*2^20-cycle period) via
+    GPIO matrix FUNC71_IN_SEL; per-transition symbols {level,duration} are written into
+    the channel memory (0x6580/0x6640 for HW channels 2/3), the chmstatus writer offset
+    is maintained, and RX_END (raw bit 2+c) frames the message after idle_thres ticks;
+    the driver ISR copies the symbols straight from channel memory. Measured high pulse
+    = 819 ticks exactly at 1 MHz resolution (80 MHz PLL_F80M source, div 80: step =
+    2*div emulated cycles). Full regression: 13/13 tests pass headless in wasm.
 
 ## Known issues / gotchas
 
