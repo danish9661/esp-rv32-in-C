@@ -242,6 +242,8 @@ struct esp32c6_soc {
     uint32_t adc_reg[257]; /* SARADC 0x400 bytes + version reg */
     int twai_tx_pending; /* a cmd.tx_request was written */
     uint64_t twai_tx_done_cycle; /* cycle at which the TX completes */
+    uint64_t twai_rx_deliver_cycle; /* cycle at which the virtual node's frame arrives */
+    int twai_rx_delivered;          /* RX delivery is one-shot */
 
     /* RMT (0x60006000): TX completion model */
     uint64_t rmt_tx_done_cycle; /* cycle at which the TX completes */
@@ -619,16 +621,22 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     if (addr >= C6_PERIPH_BASE + 0xB000u &&
         addr < C6_PERIPH_BASE + 0xB100u) {
         uint32_t off = addr - C6_PERIPH_BASE - 0xB000u;
-        if (off == 0x08u) { /* status: TBS + TCS + RS(=reset mode) */
+        if (off == 0x08u) { /* status: TBS + TCS + RBS + RS(=reset mode) */
             uint32_t v = TWAI0_STATUS_TBS |
                          ((soc->twai_reg[0] & 1u) ? TWAI0_STATUS_RS : 0u);
-            v |= soc->twai_reg[0x08 >> 2] & TWAI0_STATUS_TCS;
+            v |= soc->twai_reg[0x08 >> 2] &
+                 (TWAI0_STATUS_RBS | TWAI0_STATUS_TCS);
             return v;
         }
-        if (off == 0x0Cu) { /* interrupt: read-to-clear (RI stays) */
+        if (off == 0x0Cu) { /* interrupt: read-to-clear, RI is a level */
             uint32_t v = soc->twai_reg[0x0c >> 2];
-            soc->twai_reg[0x0c >> 2] &= TWAI0_INTR_RI;
-            if (!(soc->twai_reg[0x0c >> 2] & ~TWAI0_INTR_RI))
+            soc->twai_reg[0x0c >> 2] = 0;
+            /* RI re-asserts while the receive buffer is full and the
+             * receive interrupt is enabled */
+            if ((soc->twai_reg[0x08 >> 2] & TWAI0_STATUS_RBS) &&
+                (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI))
+                soc->twai_reg[0x0c >> 2] = TWAI0_INTR_RI;
+            if (!soc->twai_reg[0x0c >> 2])
                 soc->intc_status &= ~(1ull << C6_TWAI0_INTR_SOURCE);
             return v;
         }
@@ -1140,15 +1148,23 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         addr < C6_PERIPH_BASE + 0xB100u) {
         uint32_t off = addr - C6_PERIPH_BASE - 0xB000u;
         uint32_t *r = soc->twai_reg + (off >> 2);
-        if (off == 0x04u) { /* cmd: commands are latched and self-clear */
+        if (off == 0x00u) { /* mode: leaving reset mode starts the bus */
+            *r = val;
+            if (!(val & 1u) && !soc->twai_rx_delivered)
+                soc->twai_rx_deliver_cycle =
+                    rv->csr_cycle + 150000; /* ~1.5ms @ 100MHz host clock */
+        } else if (off == 0x04u) { /* cmd: commands are latched and self-clear */
             *r = val;
             if (val & TWAI0_CMD_TX_REQUEST) {
                 soc->twai_tx_pending = 1;
                 soc->twai_tx_done_cycle =
                     rv->csr_cycle + 20000; /* ~200us @ 100MHz host clock */
             }
-            if (val & TWAI0_CMD_RELEASE_BUFFER)
+            if (val & TWAI0_CMD_RELEASE_BUFFER) {
                 soc->twai_reg[0x08 >> 2] &= ~TWAI0_STATUS_RBS;
+                if (soc->twai_reg[0x74 >> 2])
+                    soc->twai_reg[0x74 >> 2]--;
+            }
             if (val & TWAI0_CMD_CLEAR_DOVERRUN)
                 soc->twai_reg[0x08 >> 2] &= ~TWAI0_STATUS_DOS;
         } else {
@@ -1939,6 +1955,31 @@ void esp32c6_periodic(riscv_t *rv)
         soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_TCS;
         soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_TI;
         soc->intc_status |= 1ull << C6_TWAI0_INTR_SOURCE;
+    }
+
+    /* TWAI0 RX delivery: a virtual node on the bus sends one frame
+     * (~1.5ms after the controller left reset mode): std ID 0x123, DLC 2,
+     * data DE AD. The frame buffer words hold one byte each (bits 7-0);
+     * bytes 1-2 are the ID left-aligned big-endian ((id << 5) >> 8,
+     * (id << 5) & 0xFF). RX delivery sets RBS + rx_message_counter and
+     * raises RI, gated on the receive interrupt being enabled, so the
+     * driver ISR sees RX_BUFF_FRAME and drains one frame. */
+    if (!soc->twai_rx_delivered && soc->twai_rx_deliver_cycle &&
+        rv->csr_cycle >= soc->twai_rx_deliver_cycle) {
+        soc->twai_rx_delivered = 1;
+        soc->twai_reg[0x40 >> 2] = 0x02u; /* dlc=2, standard format */
+        soc->twai_reg[0x44 >> 2] = 0x24u; /* id 0x123, high byte */
+        soc->twai_reg[0x48 >> 2] = 0x60u; /* id 0x123, low byte */
+        soc->twai_reg[0x4c >> 2] = 0xDEu; /* data[0] */
+        soc->twai_reg[0x50 >> 2] = 0xADu; /* data[1] */
+        for (int i = 5; i < 13; i++)
+            soc->twai_reg[(0x40u + 4u * i) >> 2] = 0;
+        soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_RBS;
+        soc->twai_reg[0x74 >> 2]++;
+        if (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI) {
+            soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_RI;
+            soc->intc_status |= 1ull << C6_TWAI0_INTR_SOURCE;
+        }
     }
 
     /* RMT TX completion: set TX_DONE (raw bit 0) and raise the source
