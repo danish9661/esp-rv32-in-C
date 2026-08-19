@@ -219,7 +219,17 @@ struct esp32c6_soc {
     /* I2C_EXT (0x60004000): register bank + SCL_RST_SLV_EN auto-clear */
     uint32_t i2c_reg[128]; /* 0x200 bytes, mirrors i2c_dev_t */
     int i2c_scl_rst_cnt;   /* reads left with SCL_RST_SLV_EN asserted */
-    int i2c_transfer_pending; /* a trans_start was written; bus has no slave */
+    int i2c_transfer_pending; /* a trans_start was written */
+    uint8_t i2c_tx_fifo[32];  /* bytes pushed to I2C_DATA before trans_start */
+    int i2c_tx_len;
+    uint8_t i2c_rx_fifo[32];  /* bytes the virtual device sent on a read */
+    int i2c_rx_len;
+    int i2c_rx_pos;
+    int i2c_slave_active;     /* transfer targets the virtual device */
+    int i2c_slave_rw;         /* 1 = read from the device, 0 = write */
+    uint8_t i2c_dev_mem[16];  /* virtual EEPROM contents (address 0x50) */
+    int i2c_dev_wptr;         /* next write offset into i2c_dev_mem */
+    int i2c_dev_rptr;         /* next read offset into i2c_dev_mem */
 
     /* SPI2 (GPSPI2, 0x60081000): register bank + transfer completion */
     uint32_t spi2_reg[64]; /* 0x100 bytes, mirrors spi_dev_t */
@@ -309,6 +319,10 @@ esp32c6_t *esp32c6_new(void)
     soc->systimer_conf = 0x40000000u; /* TIMER_UNIT0_WORK_EN default 1 */
     soc->uart_rx_fd = -1;
 
+    /* virtual I2C device: 16-byte EEPROM with a known pattern */
+    for (int i = 0; i < 16; i++)
+        soc->i2c_dev_mem[i] = 0x40 + i;
+
     /* flash backing shared by the i/d-cache window */
     uint8_t *flash = calloc(1, C6_FLASH_SIZE);
     assert(flash);
@@ -360,6 +374,17 @@ esp32c6_t *esp32c6_new(void)
 
 /* INTMTX source for UART0 (interrupts.h enum, counted from 0) */
 #define C6_UART0_INTR_SOURCE 43u
+#define C6_TWAI0_INTR_SOURCE 46u
+#define C6_GPIO_INTR_SOURCE 30u
+#define C6_RMT_INTR_SOURCE 49u
+/* I2C_EXT0 interrupt source (intmatrix.h enum) */
+#define C6_I2C_EXT0_INTR_SOURCE 50u
+/* TIMG0/TIMG1 timer interrupt sources (interrupts.h enum) */
+#define C6_TG0_T0_INTR_SOURCE 51u
+#define C6_TG1_T0_INTR_SOURCE 54u
+
+/* Virtual I2C device: a 16-byte EEPROM at 0x50 that ACKs transfers */
+#define C6_I2C_DEV_ADDR 0x50u
 /* UART_RXFIFO_TOUT_INT_RAW */
 #define UART_RXFIFO_TOUT_BIT 0x100u
 
@@ -374,12 +399,6 @@ esp32c6_t *esp32c6_new(void)
 #define TWAI0_STATUS_RS 0x10u
 #define TWAI0_INTR_TI 0x2u
 #define TWAI0_INTR_RI 0x1u
-#define C6_TWAI0_INTR_SOURCE 46u
-#define C6_GPIO_INTR_SOURCE 30u
-#define C6_RMT_INTR_SOURCE 49u
-/* TIMG0/TIMG1 timer interrupt sources (interrupts.h enum) */
-#define C6_TG0_T0_INTR_SOURCE 51u
-#define C6_TG1_T0_INTR_SOURCE 54u
 
 /* ------------------------------------------------------------------ */
 /* LEDC (0x60007000): 6 channels x (CONF0/HPOINT/DUTY/CONF1/DUTY_R),  */
@@ -636,6 +655,12 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         if (addr == C6_PERIPH_BASE + 0x402cu) {
             uint32_t v = soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2];
             return v;
+        }
+        if (addr == C6_PERIPH_BASE + 0x401cu) { /* data: RX fifo pop */
+            if (soc->i2c_rx_pos < soc->i2c_rx_len) {
+                uint32_t v = soc->i2c_rx_fifo[soc->i2c_rx_pos++];
+                soc->i2c_reg[0x1c >> 2] = v;
+            }
         }
         return *r;
     }
@@ -894,11 +919,35 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         uint32_t *r = soc->i2c_reg + ((addr - C6_PERIPH_BASE - 0x4000u) >> 2);
         if (addr == C6_PERIPH_BASE + 0x4024u) { /* int_clr */
             soc->i2c_reg[0x20 >> 2] &= ~val; /* clear raw status bits */
-            soc->intc_status &= ~(1ull << 50); /* drop the pending IRQ */
+            soc->intc_status &= ~(1ull << C6_I2C_EXT0_INTR_SOURCE); /* drop the pending IRQ */
+        } else if (addr == C6_PERIPH_BASE + 0x4018u) { /* fifo_conf */
+            soc->i2c_reg[0x18 >> 2] = val;
+            if (val & (1u << 13)) { /* tx_fifo_rst */
+                soc->i2c_tx_len = 0;
+            }
+            if (val & (1u << 12)) { /* rx_fifo_rst */
+                soc->i2c_rx_len = 0;
+                soc->i2c_rx_pos = 0;
+            }
+        } else if (addr == C6_PERIPH_BASE + 0x401cu) { /* data: TX fifo push */
+            soc->i2c_reg[0x1c >> 2] = val;
+            if (soc->i2c_tx_len < 32)
+                soc->i2c_tx_fifo[soc->i2c_tx_len++] = val & 0xFFu;
         } else if (addr == C6_PERIPH_BASE + 0x4004u) { /* ctr */
             *r = val;
-            if (val & (1u << 5)) /* trans_start (WT): transfer begins */
+            if (val & (1u << 5)) { /* trans_start (WT): transfer begins */
+                uint32_t addr_byte = soc->i2c_tx_len > 0 ?
+                                     soc->i2c_tx_fifo[0] : 0xFFu;
                 soc->i2c_transfer_pending = 1;
+                if ((addr_byte >> 1) == C6_I2C_DEV_ADDR) {
+                    soc->i2c_slave_active = 1;
+                    soc->i2c_slave_rw = addr_byte & 1u;
+                    soc->i2c_dev_wptr = 0;
+                    soc->i2c_dev_rptr = 0;
+                } else {
+                    soc->i2c_slave_active = 0;
+                }
+            }
         } else {
             *r = val;
         }
@@ -1787,13 +1836,34 @@ void esp32c6_periodic(riscv_t *rv)
         }
     }
 
-    /* I2C transfer completion: a trans_start was issued on an empty bus.
-     * The address byte is never ACKed -> NACK + trans-complete, which the
-     * ISR maps to I2C_INTR_EVENT_NACK (I2C_EXT0 = INTMTX source 50). */
+    /* I2C transfer completion: a trans_start was issued. Without a slave
+     * the address byte is never ACKed -> NACK + trans-complete, which the
+     * ISR maps to I2C_INTR_EVENT_NACK (I2C_EXT0 = INTMTX source 50). With
+     * the virtual device (0x50) the transfer is ACKed: writes are stored
+     * into its memory, reads return the memory contents via the RX fifo. */
     if (soc->i2c_transfer_pending) {
         soc->i2c_transfer_pending = 0;
-        soc->i2c_reg[0x20 >> 2] |= (1u << 10) | (1u << 7); /* nack + complete */
-        soc->intc_status |= 1ull << 50;
+        if (soc->i2c_slave_active) {
+            if (soc->i2c_slave_rw) {
+                soc->i2c_rx_len = 0;
+                soc->i2c_rx_pos = 0;
+                for (int i = 0; i < 8; i++)
+                    soc->i2c_rx_fifo[i] =
+                        soc->i2c_dev_mem[(soc->i2c_dev_rptr + i) & 15];
+                soc->i2c_rx_len = 8;
+            } else {
+                for (int i = 1; i < soc->i2c_tx_len; i++)
+                    soc->i2c_dev_mem[(soc->i2c_dev_wptr++) & 15] =
+                        soc->i2c_tx_fifo[i];
+            }
+            soc->i2c_reg[0x20 >> 2] |= 1u << 7; /* trans complete, no nack */
+        } else {
+            soc->i2c_reg[0x20 >> 2] |= (1u << 10) | (1u << 7); /* nack */
+        }
+        soc->i2c_reg[0x4 >> 2] &= ~(1u << 5); /* trans_start self-clears */
+        soc->i2c_tx_len = 0;
+        if (soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2])
+            soc->intc_status |= 1ull << C6_I2C_EXT0_INTR_SOURCE;
     }
 
     /* SPI2 transfer completion: cmd.usr was set on an empty bus. MISO
