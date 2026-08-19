@@ -247,6 +247,14 @@ struct esp32c6_soc {
 
     /* RMT (0x60006000): TX completion model */
     uint64_t rmt_tx_done_cycle; /* cycle at which the TX completes */
+    /* RMT RX (HW channels 2/3, input signals 71/72): pulse-width capture.
+     * The channel memory holds symbols {level, duration}; the driver's ISR
+     * copies them straight out of the channel memory after RX_END. */
+    uint64_t rmt_rx_last_cycle[2]; /* cycle of the last periodic pass */
+    uint64_t rmt_rx_trans_cycle[2]; /* cycle of the last input transition */
+    uint32_t rmt_rx_wptr[2];     /* symbols written into the channel memory */
+    uint32_t rmt_rx_last_level[2]; /* last input level seen */
+    int rmt_rx_en[2];            /* rx_en armed by the driver */
 
     /* LEDC (0x60007000): register bank + running duty + timer anchors */
     uint32_t ledc_reg[128];  /* 0x200 bytes, mirrors ledc_dev_t */
@@ -1070,11 +1078,35 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             if (val & 0x80u) /* tx_stop */
                 soc->rmt_tx_done_cycle = 0;
         }
-        if (roff == 0x44u) { /* INT_CLR: clear raw status */
+        if (roff == 0x1cu || roff == 0x24u) { /* CH0/CH1 RX CONF1 */
+            uint32_t ch = (roff - 0x1cu) >> 2;
+            /* WT bits (mem_wr_rst bit1, apb_mem_rst bit2) self-clear and
+             * reset the channel memory write pointer */
+            if (val & 0x6u) {
+                soc->rmt_rx_wptr[ch] = 0;
+                mmio32[((0x6030u + 4u * ch) >> 2)] = (ch + 2u) * 48u;
+                uint32_t *mem = mmio32 + (0x6400u >> 2) + (ch + 2u) * 48u;
+                for (int i = 0; i < 48; i++)
+                    mem[i] = 0;
+            }
+            mmio32[off >> 2] = val & ~0x6u;
+            soc->rmt_rx_en[ch] = (val & 0x1u) ? 1 : 0;
+            if (soc->rmt_rx_en[ch]) {
+                /* arm at the current input level so the first duration is
+                 * measured from the next transition */
+                uint32_t insel = mmio32[(0x91270u + 4u * ch) >> 2] & 0x3Fu;
+                soc->rmt_rx_last_level[ch] =
+                    (soc->gpio_in >> insel) & 1u;
+                soc->rmt_rx_trans_cycle[ch] = rv->csr_cycle;
+                soc->rmt_rx_last_cycle[ch] = rv->csr_cycle;
+            }
+        } else if (roff == 0x44u) { /* INT_CLR: clear raw status */
             mmio32[0x6038u >> 2] &= ~val;
             soc->intc_status &= ~(1ull << C6_RMT_INTR_SOURCE);
             if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
                 soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
+        } else {
+            mmio32[off >> 2] = val;
         }
         return;
     }
@@ -2065,6 +2097,21 @@ void esp32c6_periodic(riscv_t *rv)
         }
     }
 
+    /* Virtual pulse source: input pin 6 goes high for 2^17 cycles then low
+     * for the rest of a 3*2^20-cycle period (a ~1.3ms pulse every ~30ms at
+     * 40 MHz). The RMT RX test measures the pulse; the long low gap lets
+     * the RX channel idle out (RX_END) between pulses. */
+    {
+        uint32_t level = ((rv->csr_cycle % (3u << 20)) < (1u << 17)) ? 1u : 0u;
+        uint32_t cur = (soc->gpio_in >> 6) & 1u;
+        if (level != cur) {
+            if (level)
+                soc->gpio_in |= 1u << 6;
+            else
+                soc->gpio_in &= ~(1u << 6);
+        }
+    }
+
     /* I2C transfer completion: a trans_start was issued. Without a slave
      * the address byte is never ACKed -> NACK + trans-complete, which the
      * ISR maps to I2C_INTR_EVENT_NACK (I2C_EXT0 = INTMTX source 50). With
@@ -2198,6 +2245,55 @@ void esp32c6_periodic(riscv_t *rv)
         mmio32[0x6038u >> 2] |= 0x1u;
         if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
             soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
+    }
+
+    /* RMT RX: pulse capture on the channel input (GPIO matrix FUNC71/72_
+     * IN_SEL routes a pin to the RMT input signals). Each input transition
+     * writes a symbol {level, duration} into the channel memory at 0x6400 +
+     * (ch+2)*48 words and advances the chmstatus writer offset; when the
+     * signal stays constant for idle_thres RMT ticks after the first
+     * transition, RX_END (raw bit 2+c) frames the message and the channel
+     * stops itself until the driver re-arms it. */
+    for (int c = 0; c < 2; c++) {
+        if (!soc->rmt_rx_en[c])
+            continue;
+        uint32_t conf0 = mmio32[(0x6018u + 8u * c) >> 2];
+        uint32_t div = (conf0 & 0xFFu) ? (conf0 & 0xFFu) : 256u;
+        uint32_t idle = (conf0 >> 8) & 0x7FFFu;
+        uint32_t insel = mmio32[(0x91270u + 4u * c) >> 2] & 0x3Fu;
+        uint32_t level = (insel < 31u) ? ((soc->gpio_in >> insel) & 1u) : 0u;
+        uint64_t now = rv->csr_cycle;
+        uint64_t delta = now - soc->rmt_rx_last_cycle[c];
+        soc->rmt_rx_last_cycle[c] = now;
+        if (level != soc->rmt_rx_last_level[c]) {
+            /* one RMT tick = div source cycles = 2*div emulated cycles */
+            uint32_t dur = (uint32_t) ((now - soc->rmt_rx_trans_cycle[c]) /
+                                       (2ull * div));
+            if (soc->rmt_rx_wptr[c] < 48u) {
+                uint32_t *mem =
+                    mmio32 + (0x6400u >> 2) + (c + 2u) * 48u;
+                mem[soc->rmt_rx_wptr[c]++] =
+                    (soc->rmt_rx_last_level[c] << 15) | (dur & 0x7FFFu);
+                mmio32[((0x6030u + 4u * c) >> 2)] =
+                    (c + 2u) * 48u + soc->rmt_rx_wptr[c];
+            } else { /* channel memory exhausted: raise the error bit */
+                mmio32[0x6038u >> 2] |= 1u << (6 + c);
+                soc->rmt_rx_en[c] = 0;
+            }
+            soc->rmt_rx_last_level[c] = level;
+            soc->rmt_rx_trans_cycle[c] = now;
+        } else {
+            /* the idle time since the last transition grows monotonically;
+             * when it exceeds idle_thres the message is complete */
+            if ((now - soc->rmt_rx_trans_cycle[c]) / (2ull * div) >
+                    (uint64_t) idle &&
+                soc->rmt_rx_wptr[c] > 0) {
+                mmio32[0x6038u >> 2] |= 1u << (2 + c); /* rx end raw */
+                if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
+                    soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
+                soc->rmt_rx_en[c] = 0; /* HW stops itself after idle */
+            }
+        }
     }
 
     /* feed host-injected bytes into the UART RX FIFO (throttled) */
