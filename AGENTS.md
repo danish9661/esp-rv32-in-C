@@ -313,7 +313,34 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
         into DUTY_R on CONF1.start, DUTY==DUTY_R OK. Model @0x60007000.
       Sketches built under `/tmp/opencode/{aestest,uart1test,uart1regtest,
       uart1e2e,i2srxtest,wdtlintest,i2ctest,spitest,twaitest,gpiotest,adctest,ledctest}`.
-      All run clean (~65-70 KB/run, no interrupt storms).
+       All run clean (~65-70 KB/run, no interrupt storms).
+       - **I2C multi-byte register addressing** (`i2cregtest`, new sketch): the
+         model changed from naive loopback to a register-addressed EEPROM. Write
+         txns use tx_fifo[1] as the register address and auto-increment; reads
+         return from the current pointer. The Arduino Wire `endTransmission
+         (false)`+`requestFrom` emits a combined repeated-start `[WADDR,REG,
+         RADDR]` which the pump now decodes as set-pointer-then-read. `i2ctest`
+         (reg0 = 0x11..0x88) and `i2cregtest` (reg0x05 = AA BB CC) read back OK.
+       - **SPI JEDEC ID** (`spijedectest`, new sketch): the SPI2 virtual device
+         now returns the 3-byte ID (0xEF 0x40 0x15) within the same transfer
+         (manufacturer byte clocks out during 0x9F; later clocks return
+         type/capacity; stateful continuation handles the one-byte-per-xfer path
+         the Arduino SPI lib uses). `spijedectest: manuf=ef type=40 cap=15 OK`.
+       - **GPIO interrupt** (`gpiointtest`, new sketch): edge detection now runs
+         on the *live* input (gpio_in | gpio_out&gpio_enable), so a pin driven
+         as output and toggled raises its own pad-input edge. 5 rising edges on a
+         self-loopback pin fire 5 ISR calls (`gpiointtest: ints=5 OK`). The old
+         virtual-button→GPIO_PINn type/enable edge path is now shared via
+         `esp32c6_gpio_edge_check`.
+       - **ADC2 / SAR2** (`adc2test`, new sketch): C6 exposes only ADC_UNIT_1 via
+         the driver (SOC_ADC_PERIPH_NUM==1), so a unit-2 `adc_oneshot` is invalid;
+         the SARADC peripheral still has a 2nd converter (SAR2, bit30 of 0x20).
+         Exercised directly: onetime start with bit30 sets 0x30 to 1024+ch*128
+         and int_raw bit30 → `adc2test: raw=1024 OK`.
+       NOTE: full `esp_light_sleep_start()` (PMU power-down) is NOT yet emulated —
+       the firmware busy-waits on an unmodeled PMU FSM status register and hangs.
+       The GPIO *interrupt* path (the actual wake mechanism) is verified above;
+       PMU/RTC sleep + WFI resume is a separate, larger feature.
 
 ## Known issues / gotchas
 

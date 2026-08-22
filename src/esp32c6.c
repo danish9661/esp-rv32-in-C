@@ -213,6 +213,7 @@ struct esp32c6_soc {
     uint32_t gpio_out;
     uint32_t gpio_enable;
     uint32_t gpio_in;    /* input pad levels (host-injected) */
+    uint32_t gpio_in_prev; /* last live input seen (edge detection) */
     uint32_t gpio_status; /* pending interrupt bits (W1TC) */
     uint32_t gpio_vbtn;  /* virtual button phase (toggles input pin 7) */
 
@@ -232,14 +233,13 @@ struct esp32c6_soc {
     int i2c_slave_active;     /* transfer targets the virtual device */
     int i2c_slave_rw;         /* 1 = read from the device, 0 = write */
     uint8_t i2c_dev_mem[16];  /* virtual EEPROM contents (address 0x50) */
-    int i2c_dev_wptr;         /* next write offset into i2c_dev_mem */
-    int i2c_dev_rptr;         /* next read offset into i2c_dev_mem */
+    int i2c_dev_ptr;          /* current register/memory address pointer */
 
     /* SPI2 (GPSPI2, 0x60081000): register bank + transfer completion */
     uint32_t spi2_reg[64]; /* 0x100 bytes, mirrors spi_dev_t */
     int spi2_transfer_pending; /* a cmd.usr was written; bus has no slave */
     uint8_t spi2_dev_mem[16];  /* virtual SRAM contents */
-    int spi2_jedec;            /* JEDEC ID read in progress (bytes left) */
+    int spi2_jedec;            /* next JEDEC ID byte index (4 == idle) */
 
     /* TWAI0 (CAN, 0x6000B000): register bank + TX completion */
     uint32_t twai_reg[64]; /* 0x100 bytes, mirrors twai_dev_t */
@@ -471,9 +471,12 @@ esp32c6_t *esp32c6_new(void)
     /* virtual I2C device: 16-byte EEPROM with a known pattern */
     for (int i = 0; i < 16; i++)
         soc->i2c_dev_mem[i] = 0x40 + i;
+    soc->i2c_dev_ptr = 0;
     /* virtual SPI device: 16-byte SRAM with the same known pattern */
     for (int i = 0; i < 16; i++)
         soc->spi2_dev_mem[i] = 0x40 + i;
+    soc->spi2_jedec = 4;
+    soc->gpio_in_prev = 0;
 
     /* flash backing shared by the i/d-cache window */
     uint8_t *flash = calloc(1, C6_FLASH_SIZE);
@@ -1530,6 +1533,9 @@ done:
     }
 }
 
+static void esp32c6_gpio_edge_check(esp32c6_t *soc, uint32_t *mmio32,
+                                    uint32_t new_live);
+
 static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
 {
     esp32c6_t *soc = PRIV(rv)->esp32c6;
@@ -1697,8 +1703,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 if ((addr_byte >> 1) == C6_I2C_DEV_ADDR) {
                     soc->i2c_slave_active = 1;
                     soc->i2c_slave_rw = addr_byte & 1u;
-                    soc->i2c_dev_wptr = 0;
-                    soc->i2c_dev_rptr = 0;
                 } else {
                     soc->i2c_slave_active = 0;
                 }
@@ -2415,6 +2419,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             mmio32[off >> 2] = val;
             return;
         }
+        /* a firmware GPIO write may toggle an output pin; its own pad input
+         * tracks the output, so detect edges on the live input here. */
+        esp32c6_gpio_edge_check(soc, mmio32,
+            soc->gpio_in | (soc->gpio_out & soc->gpio_enable));
         if (esp32c6_gpio_output) {
             for (int pin = 0; pin < 30; pin++) {
                 if (soc->gpio_enable & (1u << pin))
@@ -2954,6 +2962,42 @@ static void esp32c6_mcpwm_fire(esp32c6_t *soc, int t, int dir,
     }
 }
 
+/* Detect edges on the live GPIO input (host-injected gpio_in ORed with the
+ * output levels of enabled output pins) and raise the GPIO interrupt
+ * (INTMTX source 30) for pins whose PIN register interrupt type/enable match.
+ * Called whenever the live input may have changed (firmware GPIO writes and
+ * the periodic virtual-button/pulse injection). */
+static void esp32c6_gpio_edge_check(esp32c6_t *soc, uint32_t *mmio32,
+                                    uint32_t new_live)
+{
+    uint32_t changed = new_live ^ soc->gpio_in_prev;
+    if (!changed)
+        return;
+    for (int pin = 0; pin < 31; pin++) {
+        if (!(changed & (1u << pin)))
+            continue;
+        uint32_t pr = mmio32[(0x91074u + 4u * pin) >> 2];
+        int type = (pr >> 7) & 0x7u;
+        int ena = (pr >> 13) & 0x1Fu;
+        int level = (new_live >> pin) & 1;
+        int prev = (soc->gpio_in_prev >> pin) & 1;
+        int fire = 0;
+        switch (type) {
+        case 1: fire = level && !prev; break; /* posedge */
+        case 2: fire = !level && prev; break; /* negedge */
+        case 3: fire = level != prev; break;  /* any edge */
+        case 4: fire = !level; break;         /* low level */
+        case 5: fire = level; break;          /* high level */
+        default: break;
+        }
+        if (fire && ena) {
+            soc->gpio_status |= 1u << pin;
+            soc->intc_status |= ((__uint128_t)1) << C6_GPIO_INTR_SOURCE;
+        }
+    }
+    soc->gpio_in_prev = new_live;
+}
+
 void esp32c6_periodic(riscv_t *rv)
 {
     esp32c6_t *soc = PRIV(rv)->esp32c6;
@@ -2973,28 +3017,8 @@ void esp32c6_periodic(riscv_t *rv)
                 uint32_t new_levels =
                     (soc->gpio_in & ~mask) | (phase ? mask : 0);
                 soc->gpio_in = new_levels;
-                for (int pin = 0; pin < 31; pin++) {
-                    if (!(changed & (1u << pin)))
-                        continue;
-                    uint32_t pr = mmio32[(0x91074u + 4u * pin) >> 2];
-                    int type = (pr >> 7) & 0x7u;
-                    int ena = (pr >> 13) & 0x1Fu;
-                    int level = (new_levels >> pin) & 1;
-                    int prev = (new_levels ^ changed) >> pin & 1;
-                    int fire = 0;
-                    switch (type) {
-                    case 1: fire = level && !prev; break; /* posedge */
-                    case 2: fire = !level && prev; break; /* negedge */
-                    case 3: fire = level != prev; break;  /* any edge */
-                    case 4: fire = !level; break;         /* low level */
-                    case 5: fire = level; break;          /* high level */
-                    default: break;
-                    }
-                    if (fire && ena) {
-                        soc->gpio_status |= 1u << pin;
-                        soc->intc_status |= ((__uint128_t)1) << C6_GPIO_INTR_SOURCE;
-                    }
-                }
+                esp32c6_gpio_edge_check(soc, mmio32,
+                    new_levels | (soc->gpio_out & soc->gpio_enable));
                 /* PCNT: feed the edge to any unit/channel wired to this pin
                  * via the GPIO matrix input select: FUNC<signal>_IN_SEL
                  * (0x60091000 + 0x154 + 4*signal) selects which GPIO feeds
@@ -3083,17 +3107,48 @@ void esp32c6_periodic(riscv_t *rv)
     if (soc->i2c_transfer_pending) {
         soc->i2c_transfer_pending = 0;
         if (soc->i2c_slave_active) {
-            if (soc->i2c_slave_rw) {
+            uint8_t *t = soc->i2c_tx_fifo;
+            int tl = soc->i2c_tx_len;
+            /* Combined write-register-address + read (repeated start), as the
+             * Arduino Wire library emits for endTransmission(false)+requestFrom:
+             * tx_fifo = [WADDR, REG, RADDR]. Set the pointer from REG, then
+             * return dev_mem from there (the read phase of the same op). */
+            if (!soc->i2c_slave_rw && tl >= 3 &&
+                (t[0] & 1u) == 0u && (t[2] & 1u) == 1u &&
+                (t[0] >> 1) == (t[2] >> 1)) {
+                int p = t[1];
+                soc->i2c_dev_ptr = p;
                 soc->i2c_rx_len = 0;
                 soc->i2c_rx_pos = 0;
-                for (int i = 0; i < 8; i++)
-                    soc->i2c_rx_fifo[i] =
-                        soc->i2c_dev_mem[(soc->i2c_dev_rptr + i) & 15];
-                soc->i2c_rx_len = 8;
+                for (int i = 0; i < 8; i++) {
+                    soc->i2c_rx_fifo[i] = soc->i2c_dev_mem[(p++) & 15];
+                    soc->i2c_rx_len = 8;
+                }
+                soc->i2c_dev_ptr = p & 15;
+            } else if (soc->i2c_slave_rw) {
+                /* READ: return dev_mem from the current pointer, then
+                 * auto-increment (standard EEPROM sequential read). */
+                soc->i2c_rx_len = 0;
+                soc->i2c_rx_pos = 0;
+                int p = soc->i2c_dev_ptr;
+                for (int i = 0; i < 8; i++) {
+                    soc->i2c_rx_fifo[i] = soc->i2c_dev_mem[(p++) & 15];
+                    soc->i2c_rx_len = 8;
+                }
+                soc->i2c_dev_ptr = p & 15;
             } else {
-                for (int i = 1; i < soc->i2c_tx_len; i++)
-                    soc->i2c_dev_mem[(soc->i2c_dev_wptr++) & 15] =
-                        soc->i2c_tx_fifo[i];
+                /* WRITE: tx_fifo[1] is the register/memory address; the
+                 * following bytes are stored there and auto-increment. */
+                int p = soc->i2c_dev_ptr;
+                for (int i = 1; i < soc->i2c_tx_len; i++) {
+                    if (i == 1) {
+                        soc->i2c_dev_ptr = soc->i2c_tx_fifo[i];
+                        p = soc->i2c_dev_ptr;
+                    } else {
+                        soc->i2c_dev_mem[(p++) & 15] = soc->i2c_tx_fifo[i];
+                    }
+                }
+                soc->i2c_dev_ptr = p & 15;
             }
             soc->i2c_reg[0x20 >> 2] |= 1u << 7; /* trans complete, no nack */
         } else {
@@ -3122,17 +3177,20 @@ void esp32c6_periodic(riscv_t *rv)
             int sh = 8 * (i & 3); /* HAL packs/reads buffer bytes LE */
             tx[i] = (soc->spi2_reg[(0x98u + 4u * w) >> 2] >> sh) & 0xFFu;
         }
-        if (n >= 1 && tx[0] == 0x9Fu) { /* READ JEDEC ID */
-            soc->spi2_jedec = 4;
-            for (int i = 0; i < n; i++)
-                rx[i] = 0xFFu; /* first byte is don't-care */
-        } else if (soc->spi2_jedec > 0) { /* continue JEDEC ID response */
+        if (soc->spi2_jedec < 4) { /* mid JEDEC read: clock out next ID bytes */
             static const uint8_t jedec_id[4] = { 0xEFu, 0x40u, 0x15u, 0xFFu };
+            int idx = soc->spi2_jedec;
+            for (int i = 0; i < n; i++) {
+                rx[i] = (idx < 4) ? jedec_id[idx] : 0xFFu;
+                idx++;
+            }
+            soc->spi2_jedec = (idx >= 4) ? 4 : idx;
+        } else if (n >= 1 && tx[0] == 0x9Fu) { /* READ JEDEC ID */
+            static const uint8_t jedec_id[4] = { 0xEFu, 0x40u, 0x15u, 0xFFu };
+            /* the first ID byte (0xEF) clocks out during the 0x9F command */
             for (int i = 0; i < n; i++)
-                rx[i] = jedec_id[(4 - soc->spi2_jedec + i) & 3];
-            soc->spi2_jedec -= n;
-            if (soc->spi2_jedec < 0)
-                soc->spi2_jedec = 0;
+                rx[i] = (i < 4) ? jedec_id[i] : 0xFFu;
+            soc->spi2_jedec = (n >= 4) ? 4 : n;
         } else if (n >= 3 && tx[0] == 0x03u) { /* READ SRAM */
             int addr = (tx[1] << 8) | tx[2];
             for (int i = 0; i < n; i++)
