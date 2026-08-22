@@ -166,8 +166,38 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     (50% duty measured via digitalRead), RMT RX (819-tick pulse on pin 6), I2C scan
     (finds the virtual 0x50 device), SPI (JEDEC ID), TWAI (virtual frame 0x123 DE AD),
     TSENS (temperature) and ADC — prints a full report ending with DEMO_DONE.
-    demo/system/esp32c6/ + demo/system/rv32emu.{js,wasm} refreshed (wasm now includes
-    the RMT RX model).
+     demo/system/esp32c6/ + demo/system/rv32emu.{js,wasm} refreshed (wasm now includes
+     the RMT RX model).
+  - **CRITICAL FIX 2026-08-22: interrupt controller UB miscompile + bit-69 (I2S DMA TX)**.
+    `intc_status` was declared `uint64_t` but `esp32_intc_raise` loops `s < 72` and does
+    `soc->intc_status |= (1ULL << s)`. Shifts by 64..71 on a 64-bit type are UB, which
+    `-O3` (plus `-mtail-call`) exploited to miscompile `esp32_intc_raise` into a
+    void/noreturn stub, so `esp32c6_check_interrupt` became `call esp32_intc_raise;
+    unreachable` → `RuntimeError: unreachable` on the first check with MIE=1 (the boot
+    crash). Worse, a 64-bit status **cannot represent source 69** (`C6_DMA_OUT_CH0_INTR_-
+    SOURCE`), so the I2S DMA TX interrupt could never be set/delivered → i2stest timed out
+    with err=263. Fixes in src/esp32c6.c:
+      1. `uint64_t intc_status` → `__uint128_t intc_status` (sources 0..127).
+      2. All pending/set/test shifts made 128-bit-safe (`((__uint128_t)1) << s`, incl. the
+         EMIP read path) via replaceAll of `1ull << ` / `1ULL << `.
+      3. `mcpwm_reg[76]` → `mcpwm_reg[128]` (was indexed at 101/102 → OOB UB).
+      4. Tautological `(o & 0xFu) == 0x10u` → `(o & 0xFu) == 0x0u` (always-false compare).
+      5. Debug counters: `dbg_trap_deliv` was a set-but-unused static redeclared at use
+         site (made a single global); removed unused `delta` in RMT RX.
+    After fix, `-O3` esp32c6.o disassembles with a *full* `esp32c6_check_interrupt` body
+    (no `unreachable` in the interrupt path; remaining `unreachable`s are only in
+    esp32c6_new/esp32c6_boot assert paths).
+  - **i2stest PASSES end-to-end (headless node) 2026-08-22.** Run method that actually
+    executes the guest: the bundle sets `Module["noInitialRun"]=true`, so bare
+    `node build/rv32emu.js -C esp32c6 -F x` does NOT run main. Instead mount the firmware
+    into MEMFS and call the exported harness:
+    `Module.FS.writeFile('/flash.bin', bin); Module.run_system('-C esp32c6 -F /flash.bin')`
+    (inside `onRuntimeInitialized`; stub `globalThis.document = {getElementById:()=>({disabled:false})}`
+    to satisfy the browser UI helpers `_disable/_enable_run_button`). Captured output:
+    `i2stest: starting` → four `write N: err=0 written=960` → `i2stest: OK` → `DEMO_DONE`.
+    This confirms bit-69 DMA-out interrupt delivery works (4 sequential writes cycle the
+    descriptor ring twice). Headless does not self-exit (guest idles after DEMO_DONE);
+    wrap in `timeout` and capture console.log to a file.
 
 ## Known issues / gotchas
 

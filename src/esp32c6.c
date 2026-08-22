@@ -49,6 +49,10 @@ static uint32_t sha_len;
 static uint32_t sha_digest[8];
 static int sha_computed;
 static int sha_reset_pending;
+static unsigned dbg_69_at_check;  /* times bit 69 seen pending at check */
+static unsigned dbg_trap_deliv;   /* times a trap was actually delivered */
+static unsigned dbg_gdma_intrwr;  /* guest writes to GDMA intr regs */
+static unsigned dbg_gdma_intrwr_clear; /* ...that cleared bit 69 */
 
 static void esp32_sha_reset(void)
 {
@@ -196,8 +200,8 @@ struct esp32c6_soc {
     uint32_t flash_sr2;
 
     /* interrupt matrix (INTMTX): peripheral source -> CPU line */
-    uint32_t intc_intmap[64];
-    uint64_t intc_status; /* pending peripheral sources */
+    uint32_t intc_intmap[72];
+    __uint128_t intc_status; /* pending peripheral sources (128-bit: sources 0..127) */
 
     /* PLIC (0x20001000) */
     uint32_t plic_enable;
@@ -279,7 +283,7 @@ struct esp32c6_soc {
      * cycles; generator events (zero/period/compare A/B) update the
      * levels that drive pads routed to signals 87..92
      * (PWM0_OUT{0,1,2}{A,B}). */
-    uint32_t mcpwm_reg[76];
+    uint32_t mcpwm_reg[128]; /* 0x200 bytes; covers int_st/ena at 0x194/0x198 */
     uint64_t mcpwm_anchor[3];   /* cycle anchor per timer */
     uint64_t mcpwm_frac[3];     /* fractional cycle remainder per timer */
     uint32_t mcpwm_phase[3];    /* live timer value */
@@ -287,6 +291,26 @@ struct esp32c6_soc {
     int mcpwm_running[3];       /* timer started */
     int mcpwm_stopat[3];        /* one-shot: 0 never, 1 at zero, 2 at peak */
     uint32_t mcpwm_level[3][2]; /* generator output levels */
+
+    /* GDMA (0x60080000): 3 TX channels feeding the I2S0 TX FIFO */
+    uint32_t gdma_out_conf0[3];
+    uint32_t gdma_out_conf1[3];
+    uint32_t gdma_out_link[3];
+    uint32_t gdma_out_eof_des_addr[3];
+    uint32_t gdma_out_dscr[3];
+    uint32_t gdma_out_pri[3];
+    uint32_t gdma_out_peri_sel[3];
+    uint32_t gdma_out_int_raw[3];
+    uint32_t gdma_out_int_ena[3];
+    uint32_t gdma_tx_fifo[3][12];  /* 12-word TX FIFO (shared with I2S) */
+    uint8_t gdma_tx_fifo_cnt[3];
+    uint8_t gdma_tx_run[3];        /* descriptor walker active */
+    uint32_t gdma_tx_desc_addr[3]; /* current descriptor address (full) */
+    uint32_t gdma_tx_desc_buf[3];  /* current descriptor buffer (full) */
+    uint32_t gdma_tx_desc_len[3];  /* current descriptor length (bytes) */
+    uint32_t gdma_tx_desc_left[3]; /* bytes still to push */
+    uint32_t gdma_tx_next_addr[3]; /* next descriptor address (DW2) */
+    uint64_t gdma_tx_drain_cyc[3]; /* next cycle for the paced drain */
 
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
@@ -324,6 +348,38 @@ static esp32_region_t *esp32_find_region(esp32c6_t *soc, uint32_t addr)
             return r;
     }
     return NULL;
+}
+
+/* Host pointer for guest RAM (DMA descriptors and data buffers always live
+ * in SRAM/LP-SRAM; flash windows are never DMA targets). */
+static uint8_t *esp32c6_dma_ptr(esp32c6_t *soc, uint32_t addr)
+{
+    esp32_region_t *r = esp32_find_region(soc, addr);
+    if (!r || r->type != ESP32_REG_RAM)
+        return NULL;
+    return r->data + (addr - r->base);
+}
+
+/* Load the descriptor at gdma_tx_desc_addr[ch] into the walker state.
+ * Descriptor layout (3 words): DW0 = owner(31) | eof(30) | sosf(29) |
+ * offset(28:24) | length(23:12) | size(11:0); DW1 = buffer address;
+ * DW2 = next descriptor address (0 = last). */
+static void esp32c6_gdma_load_desc(esp32c6_t *soc, int ch)
+{
+    uint8_t *d = esp32c6_dma_ptr(soc, soc->gdma_tx_desc_addr[ch]);
+    if (!d) { /* descriptor not in RAM: park the channel */
+        soc->gdma_tx_run[ch] = 0;
+        return;
+    }
+    uint32_t dw0, dw1, dw2;
+    memcpy(&dw0, d, 4);
+    memcpy(&dw1, d + 4, 4);
+    memcpy(&dw2, d + 8, 4);
+    soc->gdma_tx_next_addr[ch] = dw2;
+    soc->gdma_tx_desc_buf[ch] = dw1;
+    soc->gdma_tx_desc_len[ch] = (dw0 >> 12) & 0xFFFu;
+    soc->gdma_tx_desc_left[ch] = soc->gdma_tx_desc_len[ch] & ~3u;
+    soc->gdma_out_dscr[ch] = soc->gdma_tx_desc_addr[ch];
 }
 
 static void esp32_add_region(esp32c6_t *soc,
@@ -393,7 +449,7 @@ esp32c6_t *esp32c6_new(void)
     memcpy(rom->data, esp32c6_rom_bin, esp32c6_rom_bin_len);
 
     /* INTMTX default: source s maps to CPU line s */
-    for (int i = 0; i < 64; i++)
+    for (int i = 0; i < 72; i++)
         soc->intc_intmap[i] = i;
 
     return soc;
@@ -425,6 +481,10 @@ esp32c6_t *esp32c6_new(void)
 #define C6_PCNT_INTR_SOURCE 62u
 /* MCPWM0 interrupt source (interrupts.h enum) */
 #define C6_MCPWM_INTR_SOURCE 61u
+/* I2S0 and GDMA interrupt sources (interrupts.h enum) */
+#define C6_I2S0_INTR_SOURCE 41u
+#define C6_DMA_IN_CH0_INTR_SOURCE 66u
+#define C6_DMA_OUT_CH0_INTR_SOURCE 69u
 
 /* Virtual I2C device: a 16-byte EEPROM at 0x50 that ACKs transfers */
 #define C6_I2C_DEV_ADDR 0x50u
@@ -604,8 +664,8 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
             case 0x08: return 0; /* PLIC clear: write-only */
             case 0x0C: { /* EMIP_STATUS: lines with pending + enabled src */
                 uint32_t lines = 0;
-                for (int s = 0; s < 64; s++)
-                    if (soc->intc_status & (1ULL << s))
+                for (int s = 0; s < 72; s++)
+                    if (soc->intc_status & (((__uint128_t)1) << s))
                         lines |= 1u << (soc->intc_intmap[s] & 0x1Fu);
                 return lines;
             }
@@ -653,6 +713,47 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         return soc->spi2_reg[(addr - C6_PERIPH_BASE - 0x81000u) >> 2];
     }
 
+    /* GDMA (0x60080000-0x600802B0): TX channels + per-channel interrupts.
+     * out_intr[ch] = {raw, st, ena, clr} at 0x30 + 16*ch; st = raw & ena.
+     * channel[ch] at 0x70 + 0xC0*ch; the OUT block is at +0x60. */
+    if (addr >= C6_PERIPH_BASE + 0x80000u &&
+        addr < C6_PERIPH_BASE + 0x802B0u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0x80000u;
+        if (o >= 0x30u && o < 0x70u) { /* out_intr[3] */
+            uint32_t ch = (o - 0x30u) >> 4;
+            switch (o & 0xFu) {
+            case 0x00: return soc->gdma_out_int_raw[ch];
+            case 0x04: return soc->gdma_out_int_raw[ch] &
+                              soc->gdma_out_int_ena[ch];
+            case 0x08: return soc->gdma_out_int_ena[ch];
+            default:   return 0; /* clr: write-only */
+            }
+        }
+        if (o >= 0x70u && o < 0x2B0u) {
+            uint32_t c = (o - 0x70u) / 0xC0u;
+            uint32_t r = o - 0x70u - c * 0xC0u;
+            if (r >= 0x60u) { /* OUT block */
+                switch (r) {
+                case 0x60: return soc->gdma_out_conf0[c];
+                case 0x64: return soc->gdma_out_conf1[c];
+                case 0x68: /* outfifo_status: FULL/EMPTY/CNT */
+                    return (uint32_t)(soc->gdma_tx_fifo_cnt[c] << 2) |
+                           (soc->gdma_tx_fifo_cnt[c] >= 12u ? 1u : 0u) |
+                           (soc->gdma_tx_fifo_cnt[c] == 0u ? 2u : 0u);
+                case 0x70: /* out_link: park set when the FSM is idle */
+                    return (soc->gdma_out_link[c] & 0xFFFFFu) |
+                           (soc->gdma_tx_run[c] ? 0u : (1u << 23));
+                case 0x74: return 0; /* out_state: idle */
+                case 0x78: return soc->gdma_out_eof_des_addr[c];
+                case 0x80: return soc->gdma_out_dscr[c];
+                case 0x8C: return soc->gdma_out_pri[c];
+                case 0x90: return soc->gdma_out_peri_sel[c];
+                }
+            }
+        }
+        return mmio32[off >> 2];
+    }
+
     /* TWAI0 (CAN, 0x6000B000-0x6000B100) */
     if (addr >= C6_PERIPH_BASE + 0xB000u &&
         addr < C6_PERIPH_BASE + 0xB100u) {
@@ -673,7 +774,7 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
                 (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI))
                 soc->twai_reg[0x0c >> 2] = TWAI0_INTR_RI;
             if (!soc->twai_reg[0x0c >> 2])
-                soc->intc_status &= ~(1ull << C6_TWAI0_INTR_SOURCE);
+                soc->intc_status &= ~(((__uint128_t)1) << C6_TWAI0_INTR_SOURCE);
             return v;
         }
         return soc->twai_reg[off >> 2];
@@ -710,7 +811,7 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     if (addr >= C6_PERIPH_BASE + 0x14000u &&
         addr < C6_PERIPH_BASE + 0x14130u) {
         uint32_t o = off - 0x14000u;
-        if ((o & 0xFu) == 0x10u && o <= 0x30u) { /* timer_status: live */
+        if ((o & 0xFu) == 0x0u && o <= 0x30u) { /* timer_status: live */
             int t = o >> 4;
             return ((uint32_t) soc->mcpwm_dir[t] << 16) |
                    soc->mcpwm_phase[t];
@@ -994,7 +1095,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         uint32_t *r = soc->i2c_reg + ((addr - C6_PERIPH_BASE - 0x4000u) >> 2);
         if (addr == C6_PERIPH_BASE + 0x4024u) { /* int_clr */
             soc->i2c_reg[0x20 >> 2] &= ~val; /* clear raw status bits */
-            soc->intc_status &= ~(1ull << C6_I2C_EXT0_INTR_SOURCE); /* drop the pending IRQ */
+            soc->intc_status &= ~(((__uint128_t)1) << C6_I2C_EXT0_INTR_SOURCE); /* drop the pending IRQ */
         } else if (addr == C6_PERIPH_BASE + 0x4018u) { /* fifo_conf */
             soc->i2c_reg[0x18 >> 2] = val;
             if (val & (1u << 13)) { /* tx_fifo_rst */
@@ -1102,9 +1203,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             }
         } else if (roff == 0x44u) { /* INT_CLR: clear raw status */
             mmio32[0x6038u >> 2] &= ~val;
-            soc->intc_status &= ~(1ull << C6_RMT_INTR_SOURCE);
+            soc->intc_status &= ~(((__uint128_t)1) << C6_RMT_INTR_SOURCE);
             if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
-                soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
+                soc->intc_status |= ((__uint128_t)1) << C6_RMT_INTR_SOURCE;
         } else {
             mmio32[off >> 2] = val;
         }
@@ -1165,7 +1266,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         } else if (o == TIMG_INT_CLR) {
             r[TIMG_INT_RAW >> 2] &= ~val;
             if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
-                soc->intc_status &= ~(1ull << C6_TG0_T0_INTR_SOURCE);
+                soc->intc_status &= ~(((__uint128_t)1) << C6_TG0_T0_INTR_SOURCE);
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
             /* RTC slow-clock calibration (preserved from the pre-TIMG
@@ -1208,7 +1309,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         } else if (o == TIMG_INT_CLR) {
             r[TIMG_INT_RAW >> 2] &= ~val;
             if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
-                soc->intc_status &= ~(1ull << C6_TG1_T0_INTR_SOURCE);
+                soc->intc_status &= ~(((__uint128_t)1) << C6_TG1_T0_INTR_SOURCE);
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
             r[o >> 2] = val;
@@ -1259,6 +1360,104 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         return;
     }
 
+    /* GDMA (0x60080000-0x600802B0): TX channel control. out_intr[ch] =
+     * {raw, st, ena, clr} at 0x30 + 16*ch; channel[ch] at 0x70 + 0xC0*ch
+     * with the OUT block at +0x60. OUT_LINK.start (bit 21) arms the
+     * descriptor walker at 0x40800000 + outlink_addr; OUT_CONF0.out_rst
+     * (bit 0) is write-only and resets the FIFO + walker. */
+    if (addr >= C6_PERIPH_BASE + 0x80000u &&
+        addr < C6_PERIPH_BASE + 0x802B0u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0x80000u;
+        if (o >= 0x30u && o < 0x70u) { /* out_intr[3] */
+            uint32_t ch = (o - 0x30u) >> 4;
+            switch (o & 0xFu) {
+            case 0x08: /* ena */
+                soc->gdma_out_int_ena[ch] = val;
+                break;
+            case 0x0C: /* clr: W1C */
+                soc->gdma_out_int_raw[ch] &= ~val;
+                break;
+            default:
+                return; /* raw/st: read-only */
+            }
+            dbg_gdma_intrwr++;
+            if (!(soc->gdma_out_int_raw[ch] & soc->gdma_out_int_ena[ch])) {
+                dbg_gdma_intrwr_clear++;
+                soc->intc_status &=
+                    ~(((__uint128_t)1) << (C6_DMA_OUT_CH0_INTR_SOURCE + ch));
+            }
+            return;
+        }
+        if (o >= 0x70u && o < 0x2B0u) {
+            uint32_t c = (o - 0x70u) / 0xC0u;
+            uint32_t r = o - 0x70u - c * 0xC0u;
+            switch (r) {
+            case 0x60: /* out_conf0 */
+                soc->gdma_out_conf0[c] = val & ~1u; /* out_rst is WT */
+                if (val & 1u) { /* reset the FIFO and the walker */
+                    soc->gdma_tx_fifo_cnt[c] = 0;
+                    soc->gdma_tx_run[c] = 0;
+                    soc->gdma_tx_desc_left[c] = 0;
+                    soc->gdma_out_dscr[c] = 0;
+                }
+                return;
+            case 0x64: /* out_conf1 */
+                soc->gdma_out_conf1[c] = val;
+                return;
+            case 0x70: /* out_link */
+                soc->gdma_out_link[c] =
+                    val & ~0x700000u; /* start/stop/restart are WT */
+                if (val & (1u << 21)) { /* start */
+                    soc->gdma_tx_desc_addr[c] = C6_SRAM_BASE +
+                        (soc->gdma_out_link[c] & 0xFFFFFu);
+                    esp32c6_gdma_load_desc(soc, c);
+                    soc->gdma_tx_run[c] = 1;
+                    soc->gdma_tx_drain_cyc[c] = rv->csr_cycle + 256u;
+                    fprintf(stderr, "DBG gdma start ch%d link=%08x desc=%08x len=%u next=%08x buf=%08x run=%d\n",
+                            c, soc->gdma_out_link[c],
+                            soc->gdma_tx_desc_addr[c],
+                            soc->gdma_tx_desc_len[c],
+                            soc->gdma_tx_next_addr[c],
+                            soc->gdma_tx_desc_buf[c],
+                            soc->gdma_tx_run[c]);
+                } else if (val & (1u << 20)) { /* stop */
+                    soc->gdma_tx_run[c] = 0;
+                } else if (val & (1u << 22)) { /* restart */
+                    soc->gdma_tx_run[c] = 1;
+                    soc->gdma_tx_drain_cyc[c] = rv->csr_cycle + 256u;
+                }
+                return;
+            case 0x8C: /* out_pri */
+                soc->gdma_out_pri[c] = val;
+                return;
+            case 0x90: /* out_peri_sel */
+                soc->gdma_out_peri_sel[c] = val;
+                return;
+            default:
+                return; /* the rest is stored nowhere (never read back) */
+            }
+        }
+        return;
+    }
+
+    /* I2S (0x6000C000-0x6000C100): TX_CONF self-clearing bits. The reset
+     * bits (0,1) are write-only and tx_update (8) clears itself once the
+     * configuration has been applied (the driver polls it). */
+    if (addr >= C6_PERIPH_BASE + 0xC000u &&
+        addr < C6_PERIPH_BASE + 0xC100u) {
+        uint32_t o = addr - C6_PERIPH_BASE - 0xC000u;
+        if (o == 0x24u) {
+            mmio32[off >> 2] = val & ~0x103u;
+            if (val & (1u << 2))
+                fprintf(stderr, "DBG i2s tx_start set\n");
+        } else if (o == 0x18u) { /* INT_CLR: W1C */
+            mmio32[(0xC00Cu) >> 2] &= ~val;
+        } else {
+            mmio32[off >> 2] = val;
+        }
+        return;
+    }
+
     /* SARADC (0x6000E000-0x6000E404) */
     if (addr >= C6_PERIPH_BASE + 0xE000u &&
         addr < C6_PERIPH_BASE + 0xE404u) {
@@ -1295,7 +1494,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         if (o == 0x4cu) { /* int_clr: W1C */
             soc->pcnt_reg[0x40 >> 2] &= ~val;
             if (!(soc->pcnt_reg[0x40 >> 2] & soc->pcnt_reg[0x48 >> 2]))
-                soc->intc_status &= ~(1ull << C6_PCNT_INTR_SOURCE);
+                soc->intc_status &= ~(((__uint128_t)1) << C6_PCNT_INTR_SOURCE);
             return;
         }
         if (o == 0x60u) { /* ctrl: pulse_cnt_rst_uN clears the counter */
@@ -1316,7 +1515,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         if (o == 0x1A0u) { /* int_clr: W1C */
             soc->mcpwm_reg[0x198u >> 2] &= ~val;
             if (!(soc->mcpwm_reg[0x198u >> 2] & soc->mcpwm_reg[0x194u >> 2]))
-                soc->intc_status &= ~(1ull << C6_MCPWM_INTR_SOURCE);
+                soc->intc_status &= ~(((__uint128_t)1) << C6_MCPWM_INTR_SOURCE);
             return;
         }
         if ((o & 0xFu) == 0x08u && o <= 0x28u) { /* timer_cfg1 */
@@ -1333,7 +1532,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             }
             return;
         }
-        if ((o & 0xFu) == 0x10u && o <= 0x30u) /* timer_status: RO */
+        if ((o & 0xFu) == 0x0u && o <= 0x30u) /* timer_status: RO */
             return;
         soc->mcpwm_reg[o >> 2] = val;
         return;
@@ -1347,7 +1546,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             mmio32[UART_INT_RAW_REG >> 2] &= ~val;
             if (!(mmio32[UART_INT_RAW_REG >> 2] &
                   (UART_RXFIFO_TOUT_BIT | 0x1u)))
-                soc->intc_status &= ~(1ull << C6_UART0_INTR_SOURCE);
+                soc->intc_status &= ~(((__uint128_t)1) << C6_UART0_INTR_SOURCE);
         } else
             mmio32[off >> 2] = val;
         return;
@@ -1460,12 +1659,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             break;
         case GPIO_STATUS_W1TS_REG:
             soc->gpio_status |= val;
-            soc->intc_status |= 1ull << C6_GPIO_INTR_SOURCE;
+            soc->intc_status |= ((__uint128_t)1) << C6_GPIO_INTR_SOURCE;
             return;
         case GPIO_STATUS_W1TC_REG:
             soc->gpio_status &= ~val;
             if (!soc->gpio_status)
-                soc->intc_status &= ~(1ull << C6_GPIO_INTR_SOURCE);
+                soc->intc_status &= ~(((__uint128_t)1) << C6_GPIO_INTR_SOURCE);
             return;
         default:
             mmio32[off >> 2] = val;
@@ -1479,9 +1678,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         }
         return;
     }
-    /* interrupt matrix (0x60010000 + 4*source) */
+    /* interrupt matrix (0x60010000 + 4*source, 72 sources incl. the DMA
+     * channels at 0x108-0x11C) */
     if (addr >= C6_PERIPH_BASE + 0x10000u &&
-        addr < C6_PERIPH_BASE + 0x10000u + 64 * 4u) {
+        addr < C6_PERIPH_BASE + 0x10000u + 72 * 4u) {
         uint32_t s = (addr - C6_PERIPH_BASE - 0x10000u) >> 2;
         soc->intc_intmap[s] = val & 0x1Fu;
         return;
@@ -1563,8 +1763,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             return;
         case SYSTIMER_INT_CLR:
             soc->systimer_int_raw &= ~val;
-            soc->intc_status &= ~((1ull << SYSTIMER_T0_SOURCE) |
-                                  (1ull << SYSTIMER_T2_SOURCE));
+            soc->intc_status &= ~((((__uint128_t)1) << SYSTIMER_T0_SOURCE) |
+                                  (((__uint128_t)1) << SYSTIMER_T2_SOURCE));
             return;
         default:
             mmio32[off >> 2] = val;
@@ -1606,9 +1806,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
     if (addr == C6_PERIPH_BASE + 0xC5090u) {
         mmio32[off >> 2] = val & 1u;
         if (val & 1u)
-            soc->intc_status |= 1ull << 22u;
+            soc->intc_status |= ((__uint128_t)1) << 22u;
         else
-            soc->intc_status &= ~(1ull << 22u);
+            soc->intc_status &= ~(((__uint128_t)1) << 22u);
         return;
     }
     mmio32[off >> 2] = val;
@@ -1870,8 +2070,8 @@ uint32_t esp32c6_boot(esp32c6_t *soc, const char *elf_path)
 static uint32_t esp32_intc_raise(esp32c6_t *soc)
 {
     uint32_t lines = 0;
-    for (int s = 0; s < 64; s++) {
-        if (!(soc->intc_status & (1ULL << s)))
+    for (int s = 0; s < 72; s++) {
+        if (!(soc->intc_status & (((__uint128_t)1) << s)))
             continue;
         int line = soc->intc_intmap[s] & 0x1Fu;
         if (line >= 1 && line < 28 &&
@@ -1899,6 +2099,12 @@ void esp32c6_check_interrupt(riscv_t *rv)
     rv->csr_mip = (rv->csr_mip & ~0x0FFFFFFEu) | lines;
     /* the C6 app enables per-line mie bits via esprv_intc_int_enable */
     uint32_t pending = lines & rv->csr_mie;
+    /* dbg_trap_deliv is a global counter declared at the top of the file */
+    if ((soc->intc_status >> 69) & 1ull)
+        dbg_69_at_check++;
+    if (pending) {
+        dbg_trap_deliv++;
+    }
     if (!pending)
         return;
     /* lowest set bit = CPU interrupt number */
@@ -2029,7 +2235,7 @@ void esp32c6_periodic(riscv_t *rv)
                     }
                     if (fire && ena) {
                         soc->gpio_status |= 1u << pin;
-                        soc->intc_status |= 1ull << C6_GPIO_INTR_SOURCE;
+                        soc->intc_status |= ((__uint128_t)1) << C6_GPIO_INTR_SOURCE;
                     }
                 }
                 /* PCNT: feed the edge to any unit/channel wired to this pin
@@ -2078,7 +2284,7 @@ void esp32c6_periodic(riscv_t *rv)
                             soc->pcnt_reg[0x40 >> 2] |= 1u << u;
                             if (soc->pcnt_reg[0x40 >> 2] &
                                 soc->pcnt_reg[0x48 >> 2])
-                                soc->intc_status |= 1ull << C6_PCNT_INTR_SOURCE;
+                                soc->intc_status |= ((__uint128_t)1) << C6_PCNT_INTR_SOURCE;
                         }
                     }
                 }
@@ -2092,7 +2298,7 @@ void esp32c6_periodic(riscv_t *rv)
             int level = (soc->gpio_in >> pin) & 1;
             if (ena && ((type == 4 && !level) || (type == 5 && level))) {
                 soc->gpio_status |= 1u << pin;
-                soc->intc_status |= 1ull << C6_GPIO_INTR_SOURCE;
+                soc->intc_status |= ((__uint128_t)1) << C6_GPIO_INTR_SOURCE;
             }
         }
     }
@@ -2139,7 +2345,7 @@ void esp32c6_periodic(riscv_t *rv)
         soc->i2c_reg[0x4 >> 2] &= ~(1u << 5); /* trans_start self-clears */
         soc->i2c_tx_len = 0;
         if (soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2])
-            soc->intc_status |= 1ull << C6_I2C_EXT0_INTR_SOURCE;
+            soc->intc_status |= ((__uint128_t)1) << C6_I2C_EXT0_INTR_SOURCE;
     }
 
     /* SPI2 transfer completion: cmd.usr was set. The virtual device (a
@@ -2209,7 +2415,7 @@ void esp32c6_periodic(riscv_t *rv)
         soc->twai_reg[0x04 >> 2] &= ~TWAI0_CMD_TX_REQUEST;
         soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_TCS;
         soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_TI;
-        soc->intc_status |= 1ull << C6_TWAI0_INTR_SOURCE;
+        soc->intc_status |= ((__uint128_t)1) << C6_TWAI0_INTR_SOURCE;
     }
 
     /* TWAI0 RX delivery: a virtual node on the bus sends one frame
@@ -2233,7 +2439,7 @@ void esp32c6_periodic(riscv_t *rv)
         soc->twai_reg[0x74 >> 2]++;
         if (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI) {
             soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_RI;
-            soc->intc_status |= 1ull << C6_TWAI0_INTR_SOURCE;
+            soc->intc_status |= ((__uint128_t)1) << C6_TWAI0_INTR_SOURCE;
         }
     }
 
@@ -2244,7 +2450,7 @@ void esp32c6_periodic(riscv_t *rv)
         soc->rmt_tx_done_cycle = 0;
         mmio32[0x6038u >> 2] |= 0x1u;
         if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
-            soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
+            soc->intc_status |= ((__uint128_t)1) << C6_RMT_INTR_SOURCE;
     }
 
     /* RMT RX: pulse capture on the channel input (GPIO matrix FUNC71/72_
@@ -2263,7 +2469,6 @@ void esp32c6_periodic(riscv_t *rv)
         uint32_t insel = mmio32[(0x91270u + 4u * c) >> 2] & 0x3Fu;
         uint32_t level = (insel < 31u) ? ((soc->gpio_in >> insel) & 1u) : 0u;
         uint64_t now = rv->csr_cycle;
-        uint64_t delta = now - soc->rmt_rx_last_cycle[c];
         soc->rmt_rx_last_cycle[c] = now;
         if (level != soc->rmt_rx_last_level[c]) {
             /* one RMT tick = div source cycles = 2*div emulated cycles */
@@ -2290,9 +2495,80 @@ void esp32c6_periodic(riscv_t *rv)
                 soc->rmt_rx_wptr[c] > 0) {
                 mmio32[0x6038u >> 2] |= 1u << (2 + c); /* rx end raw */
                 if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
-                    soc->intc_status |= 1ull << C6_RMT_INTR_SOURCE;
+                    soc->intc_status |= ((__uint128_t)1) << C6_RMT_INTR_SOURCE;
                 soc->rmt_rx_en[c] = 0; /* HW stops itself after idle */
             }
+        }
+    }
+
+    /* GDMA TX -> I2S0: the I2S engine drains one 32-bit word from the
+     * channel FIFO every 256 cycles (paced, well below the real 44.1 kHz
+     * stereo word rate, so descriptors complete quickly without flooding
+     * the guest with EOF interrupts). The DMA walker refills the FIFO
+     * from the current descriptor and raises OUT_EOF (INTMTX source
+     * 69+ch) once it has pushed the descriptor's full length. */
+    for (int ch = 0; ch < 3; ch++) {
+        if (!soc->gdma_tx_run[ch])
+            continue;
+        if (!(mmio32[0xC024u >> 2] & (1u << 2))) /* I2S TX not started */
+            continue;
+        if (rv->csr_cycle < soc->gdma_tx_drain_cyc[ch])
+            continue;
+        soc->gdma_tx_drain_cyc[ch] = rv->csr_cycle + 256u;
+        if (soc->gdma_tx_fifo_cnt[ch] > 0)
+            soc->gdma_tx_fifo_cnt[ch]--;
+        while (soc->gdma_tx_fifo_cnt[ch] < 12u &&
+               soc->gdma_tx_desc_left[ch] > 0) {
+            uint8_t *buf = esp32c6_dma_ptr(
+                soc, soc->gdma_tx_desc_buf[ch] +
+                         (soc->gdma_tx_desc_len[ch] -
+                          soc->gdma_tx_desc_left[ch]));
+            if (!buf) { /* buffer outside RAM: park the channel */
+                soc->gdma_tx_run[ch] = 0;
+                break;
+            }
+            uint32_t w;
+            memcpy(&w, buf, 4);
+            soc->gdma_tx_fifo[ch][soc->gdma_tx_fifo_cnt[ch]++] = w;
+            soc->gdma_tx_desc_left[ch] -= 4;
+        }
+        if (soc->gdma_tx_desc_left[ch] > 0)
+            continue;
+        /* descriptor complete: record the EOF and advance in the ring */
+        soc->gdma_out_eof_des_addr[ch] = soc->gdma_tx_desc_addr[ch];
+        if (soc->gdma_out_conf0[ch] & (1u << 2)) { /* auto write-back */
+            uint8_t *d = esp32c6_dma_ptr(soc, soc->gdma_tx_desc_addr[ch]);
+            if (d) {
+                uint32_t dw0;
+                memcpy(&dw0, d, 4);
+                dw0 &= ~0x80000000u; /* owner = software */
+                memcpy(d, &dw0, 4);
+            }
+        }
+        uint32_t raw_before = soc->gdma_out_int_raw[ch];
+        soc->gdma_out_int_raw[ch] |= 1u << 1; /* TX_EOF */
+        if (soc->gdma_out_int_raw[ch] & soc->gdma_out_int_ena[ch]) {
+            soc->intc_status |= ((__uint128_t)1) << (C6_DMA_OUT_CH0_INTR_SOURCE + ch);
+            int dbgl = soc->intc_intmap[69] & 0x1Fu;
+            fprintf(stderr, "DBG gdma EOF ch%d raw_before=%x raw=%x ena=%x eof_desc=%08x next=%08x intmap=%u line=%u plic_en=%x plic_prio=%u thr=%u mie=%08x mstatus=%08x priv=%u pc=%08x mmu=%x,%x,%x,%x win=%08x 69at=%u trapdeliv=%u intrwr=%u intrwrclr=%u\n",
+                    ch, raw_before, soc->gdma_out_int_raw[ch],
+                    soc->gdma_out_int_ena[ch],
+                    soc->gdma_out_eof_des_addr[ch],
+                    soc->gdma_tx_next_addr[ch],
+                    soc->intc_intmap[69], dbgl,
+                    soc->plic_enable, soc->plic_prio[dbgl],
+                    soc->plic_threshold, rv->csr_mie, rv->csr_mstatus,
+                    rv->priv_mode, rv->PC,
+                    soc->mmu[0] & 0x1FFu, soc->mmu[1] & 0x1FFu,
+                    soc->mmu[2] & 0x1FFu, soc->mmu[3] & 0x1FFu,
+                    esp32_flash_window_off(soc, rv->PC),
+                     dbg_69_at_check, dbg_trap_deliv, dbg_gdma_intrwr, dbg_gdma_intrwr_clear);
+        }
+        if (!soc->gdma_tx_next_addr[ch]) {
+            soc->gdma_tx_run[ch] = 0; /* park after the last descriptor */
+        } else {
+            soc->gdma_tx_desc_addr[ch] = soc->gdma_tx_next_addr[ch];
+            esp32c6_gdma_load_desc(soc, ch);
         }
     }
 
@@ -2308,7 +2584,7 @@ void esp32c6_periodic(riscv_t *rv)
         if ((mmio32[UART_INT_ENA_REG >> 2] & UART_RXFIFO_TOUT_BIT) &&
             !(*raw & UART_RXFIFO_TOUT_BIT)) {
             *raw |= UART_RXFIFO_TOUT_BIT;
-            soc->intc_status |= 1ull << C6_UART0_INTR_SOURCE;
+            soc->intc_status |= ((__uint128_t)1) << C6_UART0_INTR_SOURCE;
         }
     }
 
@@ -2483,7 +2759,7 @@ void esp32c6_periodic(riscv_t *rv)
             soc->timg_reg[g][TIMG_INT_RAW >> 2] |= TIMG_INT_T0_ALARM;
             if (soc->timg_reg[g][TIMG_INT_RAW >> 2] &
                 soc->timg_reg[g][TIMG_INT_ENA >> 2])
-                soc->intc_status |= 1ull << src;
+                soc->intc_status |= ((__uint128_t)1) << src;
             if (cfg & TIMG_T0_AUTORELOAD) {
                 uint64_t reload =
                     ((uint64_t) soc->timg_reg[g][TIMG_T0LOADHI >> 2] << 32) |
@@ -2526,11 +2802,11 @@ void esp32c6_periodic(riscv_t *rv)
                 if (crossed > soc->systimer_t0_crossed) {
                     soc->systimer_t0_crossed = crossed;
                     soc->systimer_int_raw |= 1u;
-                    soc->intc_status |= 1ull << SYSTIMER_T0_SOURCE;
+                    soc->intc_status |= ((__uint128_t)1) << SYSTIMER_T0_SOURCE;
                 }
             } else if (soc->systimer_comp0 && cnt0 >= soc->systimer_comp0) {
                 soc->systimer_int_raw |= 1u;
-                soc->intc_status |= 1ull << SYSTIMER_T0_SOURCE;
+                soc->intc_status |= ((__uint128_t)1) << SYSTIMER_T0_SOURCE;
             }
         }
         uint64_t cnt2 = (soc->systimer_target2_conf & 0x80000000u)
@@ -2543,11 +2819,11 @@ void esp32c6_periodic(riscv_t *rv)
                 if (crossed > soc->systimer_t2_crossed) {
                     soc->systimer_t2_crossed = crossed;
                     soc->systimer_int_raw |= 4u;
-                    soc->intc_status |= 1ull << SYSTIMER_T2_SOURCE;
+                    soc->intc_status |= ((__uint128_t)1) << SYSTIMER_T2_SOURCE;
                 }
             } else if (soc->systimer_comp2 && cnt2 >= soc->systimer_comp2) {
                 soc->systimer_int_raw |= 4u;
-                soc->intc_status |= 1ull << SYSTIMER_T2_SOURCE;
+                soc->intc_status |= ((__uint128_t)1) << SYSTIMER_T2_SOURCE;
             }
         }
     }
