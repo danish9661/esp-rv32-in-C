@@ -340,11 +340,21 @@ struct esp32c6_soc {
     uint64_t gdma_rx_fill_cyc[3];  /* next cycle for the paced fill */
     uint32_t gdma_rx_sample[3];     /* running synthesized sample counter */
 
-    /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
-    uint8_t uart_rx[128];
-    unsigned int uart_rx_head;
-    unsigned int uart_rx_tail;
-    int uart_rx_fd; /* host injection fd, -1 when not open */
+    /* UART0/1 RX FIFOs (128-byte rings). Port 0 is also fed from the
+     * host injection file (-U); port 1 gets data via the TX->RX loopback
+     * bit (CONF0 bit 12) so a sketch can send and receive on Serial1.
+     * (ESP32-C6 has only UART0 and UART1.) */
+    uint8_t uart_rx[2][128];
+    unsigned int uart_rx_head[2];
+    unsigned int uart_rx_tail[2];
+    /* TX FIFO occupancy model: the driver's TX ISR only moves bytes from
+     * its software ring buffer into the HW FIFO when the TXFIFO_EMPTY
+     * interrupt fires. The model reports the TX FIFO as always-empty and
+     * paces the TXFIFO_EMPTY interrupt via uart_tx_cnt/uart_tx_idle so the
+     * esp-idf uart driver actually drains its ring buffer into the FIFO. */
+    unsigned int uart_tx_cnt[2];
+    uint8_t uart_tx_idle[2];
+    int uart_rx_fd; /* host injection fd for port 0, -1 when not open */
 
     /* flash cache MMU page table: 256 x 64KB pages, programmed through
      * SPI_MEM_MMU_ITEM_CONTENT (0x6000237C) with page size
@@ -512,10 +522,14 @@ esp32c6_t *esp32c6_new(void)
 #define UART_INT_ENA_REG 0x0cu
 #define UART_INT_CLR_REG 0x10u
 #define UART_STATUS_REG 0x1Cu
+#define UART_CONF0_REG 0x14u
+#define UART_LOOPBACK_BIT (1u << 12) /* CONF0 bit 12: TX->RX loopback */
 #define UART_CLKDIV_CONF_REG 0x98u
+#define UART_RX_FIFO_SZ 128u
 
 /* INTMTX source for UART0 (interrupts.h enum, counted from 0) */
 #define C6_UART0_INTR_SOURCE 43u
+#define C6_UART1_INTR_SOURCE 44u
 #define C6_TWAI0_INTR_SOURCE 46u
 #define C6_GPIO_INTR_SOURCE 30u
 #define C6_RMT_INTR_SOURCE 49u
@@ -540,6 +554,8 @@ esp32c6_t *esp32c6_new(void)
 #define C6_I2C_DEV_ADDR 0x50u
 /* UART_RXFIFO_TOUT_INT_RAW */
 #define UART_RXFIFO_TOUT_BIT 0x100u
+/* UART_TXFIFO_EMPTY_INT_RAW (bit 1) */
+#define UART_TXFIFO_EMPTY_BIT 0x2u
 
 /* TWAI0 (CAN) register bits */
 #define TWAI0_CMD_TX_REQUEST 0x1u
@@ -947,28 +963,33 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         return *r;
     }
 
-    /* UART0 */
-    if (addr < C6_PERIPH_BASE + 0x1000u) {
-        switch (off) {
-        case UART_FIFO_REG:
-            if (soc->uart_rx_head != soc->uart_rx_tail) {
-                uint8_t b = soc->uart_rx[soc->uart_rx_tail];
-                soc->uart_rx_tail = (soc->uart_rx_tail + 1) %
-                                    sizeof(soc->uart_rx);
-                return b;
+    /* UART0/1/2 (0x60000000 / 0x60010000 / 0x60020000) */
+    for (int p = 0; p < 2; p++) {
+        uint32_t base = C6_PERIPH_BASE + 0x1000u * p;
+        if (addr >= base && addr < base + 0x1000u) {
+            uint32_t o = addr - base;
+            switch (o) {
+            case UART_FIFO_REG:
+                if (soc->uart_rx_head[p] != soc->uart_rx_tail[p]) {
+                    uint8_t b = soc->uart_rx[p][soc->uart_rx_tail[p]];
+                    soc->uart_rx_tail[p] =
+                        (soc->uart_rx_tail[p] + 1) & (UART_RX_FIFO_SZ - 1u);
+                    return b;
+                }
+                return 0; /* empty FIFO reads as zero */
+            case UART_STATUS_REG:
+                /* RXFIFO_CNT [5:0]; TX side left at 0 (always room) */
+                return (soc->uart_rx_head[p] - soc->uart_rx_tail[p]) &
+                       (UART_RX_FIFO_SZ - 1u);
+            case UART_INT_ST_REG:
+                return mmio32[(base + UART_INT_RAW_REG - C6_PERIPH_BASE) >> 2] &
+                       mmio32[(base + UART_INT_ENA_REG - C6_PERIPH_BASE) >> 2];
+            case UART_CLKDIV_CONF_REG:
+                /* the divider sync completes instantly in the model */
+                return mmio32[off >> 2] & ~0x1u;
+            default:
+                return mmio32[off >> 2];
             }
-            return 0; /* empty FIFO reads as zero */
-        case UART_STATUS_REG:
-            /* RXFIFO_CNT [5:0]; TX side left at 0 (always room) */
-            return (soc->uart_rx_head - soc->uart_rx_tail) &
-                   (sizeof(soc->uart_rx) - 1u);
-        case UART_INT_ST_REG:
-            return mmio32[UART_INT_RAW_REG >> 2] & mmio32[UART_INT_ENA_REG >> 2];
-        case UART_CLKDIV_CONF_REG:
-            /* the divider sync completes instantly in the model */
-            return mmio32[off >> 2] & ~0x1u;
-        default:
-            return mmio32[off >> 2];
         }
     }
     /* SPI0/SPI1 (flash) */
@@ -1765,18 +1786,63 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         return;
     }
 
-    /* UART0 */
-    if (addr < C6_PERIPH_BASE + 0x1000u) {
-        if (off == UART_FIFO_REG) {
-            esp32_uart_putc(soc, (char) (val & 0xFFu));
-        } else if (off == UART_INT_CLR_REG) { /* W1C */
-            mmio32[UART_INT_RAW_REG >> 2] &= ~val;
-            if (!(mmio32[UART_INT_RAW_REG >> 2] &
-                  (UART_RXFIFO_TOUT_BIT | 0x1u)))
-                soc->intc_status &= ~(((__uint128_t)1) << C6_UART0_INTR_SOURCE);
-        } else
-            mmio32[off >> 2] = val;
-        return;
+    /* UART0/1/2 (0x60000000 / 0x60010000 / 0x60020000) */
+    for (int p = 0; p < 2; p++) {
+        uint32_t base = C6_PERIPH_BASE + 0x1000u * p;
+        if (addr >= base && addr < base + 0x1000u) {
+            uint32_t o = addr - base;
+            if (o == UART_FIFO_REG) {
+                uint8_t b = (uint8_t) (val & 0xFFu);
+                if (p == 0)
+                    esp32_uart_putc(soc, (char) b);
+                /* model the byte leaving the TX FIFO (instant transmit) */
+                if (soc->uart_tx_cnt[p] < UART_RX_FIFO_SZ)
+                    soc->uart_tx_cnt[p]++;
+                soc->uart_tx_idle[p] = 0;
+                /* TX->RX loopback (CONF0 bit 12) feeds this port's RX FIFO */
+                if (mmio32[(base + UART_CONF0_REG - C6_PERIPH_BASE) >> 2] &
+                    UART_LOOPBACK_BIT) {
+                    unsigned cnt = (soc->uart_rx_head[p] -
+                                    soc->uart_rx_tail[p]) &
+                                   (UART_RX_FIFO_SZ - 1u);
+                    if (cnt < UART_RX_FIFO_SZ - 1u) {
+                        soc->uart_rx[p][soc->uart_rx_head[p]] = b;
+                        soc->uart_rx_head[p] =
+                            (soc->uart_rx_head[p] + 1) &
+                            (UART_RX_FIFO_SZ - 1u);
+                        /* raise the RX interrupt so the driver ISR drains
+                         * the FIFO (esp-idf uart_read_bytes needs it) */
+                        uint32_t *raw =
+                            &mmio32[(base + UART_INT_RAW_REG -
+                                     C6_PERIPH_BASE) >> 2];
+                        uint32_t *ena =
+                            &mmio32[(base + UART_INT_ENA_REG -
+                                     C6_PERIPH_BASE) >> 2];
+                        if (!(*raw & (UART_RXFIFO_TOUT_BIT | 0x1u))) {
+                            *raw |= (UART_RXFIFO_TOUT_BIT | 0x1u);
+                            if (*ena & (UART_RXFIFO_TOUT_BIT | 0x1u)) {
+                                int src = (p == 0) ? C6_UART0_INTR_SOURCE
+                                                   : C6_UART1_INTR_SOURCE;
+                                soc->intc_status |=
+                                    ((__uint128_t)1) << src;
+                            }
+                        }
+                    }
+                }
+            } else if (o == UART_INT_CLR_REG) { /* W1C */
+                uint32_t *raw =
+                    &mmio32[(base + UART_INT_RAW_REG - C6_PERIPH_BASE) >> 2];
+                *raw &= ~val;
+                if (!(*raw & (UART_RXFIFO_TOUT_BIT | 0x1u |
+                              UART_TXFIFO_EMPTY_BIT))) {
+                    int src = (p == 0) ? C6_UART0_INTR_SOURCE
+                                       : C6_UART1_INTR_SOURCE;
+                    soc->intc_status &= ~(((__uint128_t)1) << src);
+                }
+            } else
+                mmio32[off >> 2] = val;
+            return;
+        }
     }
     /* SPI0/SPI1 (flash) */
     if (addr < C6_PERIPH_BASE + 0x4000u) {
@@ -2355,18 +2421,18 @@ static void esp32c6_uart_rx_poll(esp32c6_t *soc)
         }
     }
     for (;;) {
-        unsigned int count = (soc->uart_rx_head - soc->uart_rx_tail) &
-                             (sizeof(soc->uart_rx) - 1u);
-        unsigned int free_slots = sizeof(soc->uart_rx) - 1u - count;
-        unsigned int head = soc->uart_rx_head % sizeof(soc->uart_rx);
-        unsigned int chunk = sizeof(soc->uart_rx) - head;
+        unsigned int count = (soc->uart_rx_head[0] - soc->uart_rx_tail[0]) &
+                             (UART_RX_FIFO_SZ - 1u);
+        unsigned int free_slots = UART_RX_FIFO_SZ - 1u - count;
+        unsigned int head = soc->uart_rx_head[0] % UART_RX_FIFO_SZ;
+        unsigned int chunk = UART_RX_FIFO_SZ - head;
         if (chunk > free_slots)
             chunk = free_slots;
-        ssize_t n = read(soc->uart_rx_fd, soc->uart_rx + head, chunk);
+        ssize_t n = read(soc->uart_rx_fd, soc->uart_rx[0] + head, chunk);
         if (n <= 0)
             break; /* EAGAIN/EOF: nothing more right now */
-        soc->uart_rx_head =
-            (soc->uart_rx_head + n) % sizeof(soc->uart_rx);
+        soc->uart_rx_head[0] =
+            (soc->uart_rx_head[0] + n) % UART_RX_FIFO_SZ;
     }
 }
 
@@ -2861,12 +2927,39 @@ void esp32c6_periodic(riscv_t *rv)
     /* UART RX interrupt: bytes are waiting and the driver armed
      * RXFIFO_TOUT (real HW fires it after rx_tout_thrhd idle bit times;
      * the model fires it immediately, the ISR then drains the FIFO). */
-    if (soc->uart_rx_head != soc->uart_rx_tail) {
+    if (soc->uart_rx_head[0] != soc->uart_rx_tail[0]) {
         uint32_t *raw = &mmio32[UART_INT_RAW_REG >> 2];
         if ((mmio32[UART_INT_ENA_REG >> 2] & UART_RXFIFO_TOUT_BIT) &&
             !(*raw & UART_RXFIFO_TOUT_BIT)) {
             *raw |= UART_RXFIFO_TOUT_BIT;
             soc->intc_status |= ((__uint128_t)1) << C6_UART0_INTR_SOURCE;
+        }
+    }
+
+    /* UART TXFIFO_EMPTY interrupt: the esp-idf uart driver only moves bytes
+     * from its software ring buffer into the HW FIFO inside the TX ISR, which
+     * fires on TXFIFO_EMPTY. We report the TX FIFO as always-empty and pace
+     * the interrupt via uart_tx_cnt/uart_tx_idle so each burst is signalled
+     * exactly once (no interrupt storm). */
+    for (int p = 0; p < 2; p++) {
+        uint32_t base = C6_PERIPH_BASE + 0x1000u * p;
+        if (soc->uart_tx_cnt[p])
+            soc->uart_tx_cnt[p]--;
+        /* raise TXFIFO_EMPTY once per empty spell (when enabled) so the
+         * esp-idf uart TX ISR drains its ring buffer into the FIFO */
+        if (!soc->uart_tx_idle[p] && soc->uart_tx_cnt[p] == 0) {
+            uint32_t *raw =
+                &mmio32[(base + UART_INT_RAW_REG - C6_PERIPH_BASE) >> 2];
+            uint32_t *ena =
+                &mmio32[(base + UART_INT_ENA_REG - C6_PERIPH_BASE) >> 2];
+                if ((*ena & UART_TXFIFO_EMPTY_BIT) &&
+                    !(*raw & UART_TXFIFO_EMPTY_BIT)) {
+                    *raw |= UART_TXFIFO_EMPTY_BIT;
+                    int src = (p == 0) ? C6_UART0_INTR_SOURCE
+                                       : C6_UART1_INTR_SOURCE;
+                    soc->intc_status |= ((__uint128_t)1) << src;
+                    soc->uart_tx_idle[p] = 1;
+                }
         }
     }
 

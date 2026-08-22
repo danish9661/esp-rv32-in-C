@@ -245,7 +245,31 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      TWAI TX + GPIO input interrupts were found to already be modeled — RNG via a
      xorshift PRNG seeded by the SYSTIMER counter, TWAI TX via `twai_tx_pending`, and
      GPIO ISRs via the virtual-button → per-pin `GPIO_PINn` type/enable → `gpio_status`
-     + source 30 path.
+      + source 30 path.
+    - **UART1 (ESP32-C6 has only UART0 + UART1) MMIO model + TX→RX loopback,
+      verified 2026-08-22.** Generalized the previous UART0-only model to a
+      2-port array (`uart_rx[2]`, `uart_rx_head[1]`, `uart_rx_tail[1]`). Key
+      facts learned:
+        * UART register windows are at the **APB** bases `0x60000000` (UART0)
+          and `0x60001000` (UART1 = `DR_REG_UART_BASE + 0x1000`); the AHB
+          alias `0x60010000` collides with the **interrupt matrix** and must
+          NOT be used for UART. (Caught this the hard way — mapping UART1 to
+          0x60010000 hijacked the matrix MMIO and crashed every interrupt.)
+        * Loopback is CONF0 bit 12. On a TX-FIFO write with loopback set, the
+          byte is pushed into that port's RX FIFO and `INT_RAW` RX bits
+          (RXFIFO_FULL 0x1 | RXFIFO_TOUT 0x100) are raised, which makes the
+          esp-idf uart RX ISR drain the FIFO into the driver ring buffer.
+        * Added `uart_tx_cnt[2]`/`uart_tx_idle[2]` + a paced **TXFIFO_EMPTY**
+          (bit 1) interrupt in the periodic update so the driver's TX ISR is
+          actually triggered to drain its ring buffer (the model reports the TX
+          FIFO as always-empty).
+      Sketch `sketches/uart1regtest/uart1regtest.ino` pokes UART1 FIFO/CONF0
+      directly (the esp-idf `uart_write_bytes` driver routes TX through an
+      internal path that does not write the FIFO *register* the model sees, so
+      the high-level driver loopback is not yet exercisable — see gotcha
+      below). It enables CONF0 loopback, writes 20 bytes to the TX FIFO, reads
+      them back from the RX FIFO, and asserts equality → `uart1regtest: OK` →
+      `DEMO_DONE`. Regression: `i2srxtest` and `wdtlintest` still pass.
 
 ## Known issues / gotchas
 
@@ -255,6 +279,14 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
 - WASM requires tail-call support: Chrome 112+, Firefox 121+, Safari 18.2+.
 - P4 needs Zc + SMP before real ESP-IDF apps can run (rv32emu doesn't have either).
 - WiFi/BT RF + WLAN MAC coprocessor firmware is out of scope for a faithful model → stub.
+- **esp-idf `uart_write_bytes` (high-level driver) does not exercise UART1
+  loopback in the emulator.** The driver transmits via an internal path
+  (ring buffer + TX ISR driven by an interrupt the C6 model does not raise /
+  the driver does not enable TXFIFO_EMPTY in `INT_ENA`), so it never writes
+  the UART FIFO *register* that the loopback interception watches. Loopback
+  is verified only at the register level (`uart1regtest`); making the
+  esp-idf uart driver itself loopback-clean requires emulating the driver's
+  actual TX DMA/ISR path.
 
 ## Reference links
 
