@@ -2775,6 +2775,9 @@ static void __trap_handler(riscv_t *rv)
  */
 static void _trap_handler(riscv_t *rv)
 {
+    if (rv->csr_mcause == 2)
+        fprintf(stderr, "DBG illegal-insn pc=%08x mepc=%08x mtval=%08x\n",
+                rv->PC, rv->csr_mepc, rv->csr_mtval);
     /* m/stvec (Machine/Supervisor Trap-Vector Base Address Register)
      * m/stvec[MXLEN-1:2]: vector base address
      * m/stvec[1:0] : vector mode

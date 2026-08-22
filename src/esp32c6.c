@@ -200,7 +200,7 @@ struct esp32c6_soc {
     uint32_t flash_sr2;
 
     /* interrupt matrix (INTMTX): peripheral source -> CPU line */
-    uint32_t intc_intmap[72];
+    uint32_t intc_intmap[96];
     __uint128_t intc_status; /* pending peripheral sources (128-bit: sources 0..127) */
 
     /* PLIC (0x20001000) */
@@ -511,7 +511,7 @@ esp32c6_t *esp32c6_new(void)
     memcpy(rom->data, esp32c6_rom_bin, esp32c6_rom_bin_len);
 
     /* INTMTX default: source s maps to CPU line s */
-    for (int i = 0; i < 72; i++)
+    for (int i = 0; i < 96; i++)
         soc->intc_intmap[i] = i;
 
     return soc;
@@ -564,7 +564,11 @@ esp32c6_t *esp32c6_new(void)
 /* UART_TXFIFO_EMPTY_INT_RAW (bit 1) */
 #define UART_TXFIFO_EMPTY_BIT 0x2u
 
-/* AES (0x60088000) register offsets/values */
+/* AES (0x60088000) register offsets/values — layout matches aes_struct.h:
+ * key 0x00, text_in 0x20, text_out 0x30, mode 0x40, endian 0x44,
+ * trigger 0x48, state 0x4C, iv 0x50, h/j0/t0 0x60..0x8C, dma_enable 0x90,
+ * block_mode 0x94, block_num 0x98, aad_block_num 0xA0, conti 0xA8,
+ * int_clear 0xAC, int_ena 0xB0, date 0xB4, dma_exit 0xB8. */
 #define AES_BASE        (C6_PERIPH_BASE + 0x88000u)
 #define AES_KEY_OFF     0x00u
 #define AES_TEXT_IN_OFF 0x20u
@@ -573,7 +577,11 @@ esp32c6_t *esp32c6_new(void)
 #define AES_TRIG_OFF    0x48u   /* write 1 to start */
 #define AES_STATE_OFF   0x4Cu   /* 0 idle, 1 busy */
 #define AES_IV_OFF      0x50u
-#define AES_BLOCKMODE_OFF 0x84u /* 0 ECB, 1 CBC, 2 OFB, 3 CTR, 4 CFB-8, 5 CFB-128 */
+#define AES_DMA_ENABLE_OFF 0x90u /* bit0: DMA mode enable */
+#define AES_BLOCKMODE_OFF 0x94u /* 0 ECB, 1 CBC, 2 OFB, 3 CTR, 4 CFB-8, 5 CFB-128 */
+#define AES_INT_CLR_OFF 0xACu
+#define AES_INT_ENA_OFF 0xB0u   /* bit0: raise AES_INTR_SOURCE on DMA done */
+#define ETS_AES_INTR_SOURCE 73u /* from esp32c6 interrupts.h (ESP32-C6) */
 
 /* TWAI0 (CAN) register bits */
 #define TWAI0_CMD_TX_REQUEST 0x1u
@@ -915,6 +923,10 @@ static void aes_block(const uint8_t *in, const uint8_t *key, int nk, int nr,
         aes_invsubbytes(w);
         aes_addroundkey(w, rk);
     }
+    if (nr == 10)
+        fprintf(stderr, "DBG_BLOCK nr=%d enc=%d w=%08x %08x %08x %08x rk10=%08x %08x %08x %08x\n",
+                nr, encrypt, w[0], w[1], w[2], w[3],
+                rk[40], rk[41], rk[42], rk[43]);
     for (int i = 0; i < 4; i++)
         out[4*i]=(w[i]>>24)&0xff, out[4*i+1]=(w[i]>>16)&0xff,
         out[4*i+2]=(w[i]>>8)&0xff, out[4*i+3]=w[i]&0xff;
@@ -927,6 +939,13 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     if (addr >= AES_BASE && addr < AES_BASE + 0x100u)
         return soc->aes_reg[(addr - AES_BASE) >> 2];
 
+    /* Interrupt matrix (INTMTX) read-back: 0x60010000 + 4*source */
+    if (addr >= C6_PERIPH_BASE + 0x10000u &&
+        addr < C6_PERIPH_BASE + 0x10000u + 96 * 4u) {
+        uint32_t s = (addr - C6_PERIPH_BASE - 0x10000u) >> 2;
+        return soc->intc_intmap[s] & 0x1Fu;
+    }
+
     /* PLIC (0x20001000) / PLIC-U (0x20001400) / CLINT-M (0x20001800) /
      * CLINT-U (0x20001C00) */
     if (addr >= C6_PLIC_BASE && addr < C6_PLIC_BASE + C6_PLIC_SIZE) {
@@ -938,7 +957,7 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
             case 0x08: return 0; /* PLIC clear: write-only */
             case 0x0C: { /* EMIP_STATUS: lines with pending + enabled src */
                 uint32_t lines = 0;
-                for (int s = 0; s < 72; s++)
+                for (int s = 0; s < 96; s++)
                     if (soc->intc_status & (((__uint128_t)1) << s))
                         lines |= 1u << (soc->intc_intmap[s] & 0x1Fu);
                 return lines;
@@ -1349,9 +1368,174 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     return mmio32[off >> 2];
 }
 
+static void esp32c6_aes_run_dma(riscv_t *rv, int ch_out)
+{
+    esp32c6_t *soc = PRIV(rv)->esp32c6;
+    int ch_in = -1;
+    for (int ch = 0; ch < 3; ch++)
+        if (soc->gdma_in_peri_sel[ch] == 6)
+            ch_in = ch;
+
+    int mode = soc->aes_reg[AES_MODE_OFF >> 2] & 0x7u;
+    int bm = soc->aes_reg[AES_BLOCKMODE_OFF >> 2] & 0x7u;
+    int nk = 0, nr = 0, encrypt = 0, ok = 1;
+    switch (mode) {
+    case 0: nk = 4; nr = 10; encrypt = 1; break;
+    case 1: nk = 6; nr = 12; encrypt = 1; break;
+    case 2: nk = 8; nr = 14; encrypt = 1; break;
+    case 4: nk = 4; nr = 10; encrypt = 0; break;
+    case 5: nk = 6; nr = 12; encrypt = 0; break;
+    case 6: nk = 8; nr = 14; encrypt = 0; break;
+    default: ok = 0;
+    }
+    if (!ok)
+        return;
+
+    uint8_t key[32], iv[16], final_out[16] = {0};
+    for (int i = 0; i < nk * 4; i++)
+        key[i] = (soc->aes_reg[(AES_KEY_OFF >> 2) + (i >> 2)] >> (8 * (i & 3))) & 0xff;
+    for (int i = 0; i < 16; i++)
+        iv[i] = (soc->aes_reg[(AES_IV_OFF >> 2) + (i >> 2)] >> (8 * (i & 3))) & 0xff;
+
+    uint32_t in_cur = C6_SRAM_BASE + (soc->gdma_out_link[ch_out] & 0xFFFFFu);
+    uint32_t out_cur = ch_in >= 0 ? C6_SRAM_BASE + (soc->gdma_in_link[ch_in] & 0xFFFFFu) : 0;
+    uint32_t out_desc0 = in_cur;   /* first OUT descriptor (s_stream_out_desc) */
+    uint32_t in_desc0 = out_cur;   /* first IN descriptor (s_stream_in_desc) */
+    uint32_t in_buf = 0, in_off = 0, in_len = 0;
+    uint32_t out_buf = 0, out_off = 0, out_len = 0;
+
+    for (;;) {
+        if (in_len == 0) {
+            if (!in_cur) break;
+            uint8_t *d = esp32c6_dma_ptr(soc, in_cur);
+            if (!d) break;
+            uint32_t dw0, dw1, dw2;
+            memcpy(&dw0, d, 4); memcpy(&dw1, d + 4, 4); memcpy(&dw2, d + 8, 4);
+            if (!(dw0 & 0x80000000u)) break; /* owner = software */
+            in_buf = dw1; in_len = (dw0 >> 12) & 0xFFFu; in_off = 0;
+            in_cur = dw2;
+        }
+        if (in_len < 16) break;
+        uint8_t in[16], out[16], blk[16];
+        for (int i = 0; i < 16; i++) {
+            uint8_t *p = esp32c6_dma_ptr(soc, in_buf + in_off);
+            if (!p) { in_len = 0; goto done; }
+            in[i] = *p; in_off++; in_len--;
+        }
+        fprintf(stderr, "DBG_AES_IN in=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                in[0],in[1],in[2],in[3],in[4],in[5],in[6],in[7],
+                in[8],in[9],in[10],in[11],in[12],in[13],in[14],in[15]);
+        if (bm == 1) {
+            for (int i = 0; i < 16; i++) blk[i] = in[i] ^ iv[i];
+            aes_block(blk, key, nk, nr, encrypt, out);
+            if (encrypt)
+                for (int i = 0; i < 16; i++) iv[i] = out[i];
+            else
+                for (int i = 0; i < 16; i++) iv[i] = in[i];
+        } else {
+            aes_block(in, key, nk, nr, encrypt, out);
+        }
+        memcpy(final_out, out, 16);
+        for (int i = 0; i < 16; i++) {
+            if (out_len == 0) {
+                if (!out_cur) break;
+                uint8_t *d = esp32c6_dma_ptr(soc, out_cur);
+                if (!d) break;
+                uint32_t dw0, dw1, dw2;
+                memcpy(&dw0, d, 4); memcpy(&dw1, d + 4, 4); memcpy(&dw2, d + 8, 4);
+                out_buf = dw1; out_len = (dw0 >> 12) & 0xFFFu; out_off = 0;
+                out_cur = dw2;
+            }
+            uint8_t *p = esp32c6_dma_ptr(soc, out_buf + out_off);
+            if (p) *p = out[i];
+            out_off++; out_len--;
+        }
+    }
+done:
+    /* Descriptor write-back: real GDMA hardware clears the descriptor owner
+     * bit (dw0[31]) and sets the EOF/SUC_EOF bit when a transfer completes.
+     * The esp_aes driver polls s_stream_out_desc[0].owner (bit31) to detect
+     * DMA completion (esp_aes_dma_done returns (~(*s3))>>31), so we must
+     * update the descriptors in guest RAM or the driver spins forever. */
+    for (uint32_t w = out_desc0; w;) {
+        uint8_t *d = esp32c6_dma_ptr(soc, w);
+        if (!d) break;
+        uint32_t dw0, dw1, dw2;
+        memcpy(&dw0, d, 4); memcpy(&dw1, d + 4, 4); memcpy(&dw2, d + 8, 4);
+        dw0 &= ~0x80000000u; /* owner = software */
+        dw0 |= (1u << 0);    /* OUT EOF */
+        memcpy(d, &dw0, 4);
+        w = dw2;
+    }
+    if (ch_in >= 0) {
+        for (uint32_t w = in_desc0; w;) {
+            uint8_t *d = esp32c6_dma_ptr(soc, w);
+            if (!d) break;
+            uint32_t dw0, dw1, dw2;
+            memcpy(&dw0, d, 4); memcpy(&dw1, d + 4, 4); memcpy(&dw2, d + 8, 4);
+            dw0 &= ~0x80000000u; /* owner = software */
+            dw0 |= (1u << 1);    /* IN_SUC_EOF */
+            memcpy(d, &dw0, 4);
+            w = dw2;
+        }
+    }
+    if (bm == 1)
+        for (int i = 0; i < 16; i++)
+            soc->aes_reg[(AES_IV_OFF >> 2) + (i >> 2)] =
+                (soc->aes_reg[(AES_IV_OFF >> 2) + (i >> 2)] & ~(0xffu << (8 * (i & 3)))) |
+                ((uint32_t) iv[i] << (8 * (i & 3)));
+
+    fprintf(stderr, "DBG_AES_DMA ch_out=%d ch_in=%d mode=%d bm=%d key0=%08x out=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+            ch_out, ch_in, mode, bm,
+            (unsigned)(soc->aes_reg[0]),
+            final_out[0], final_out[1], final_out[2], final_out[3],
+            final_out[4], final_out[5], final_out[6], final_out[7]);
+
+    /* Completion. The esp_aes driver busy-waits on the AES state register
+     * (0x4C); set it to calculation_done (2) so its poll releases. The GDMA
+     * EOF/SUC_EOF raw status bits and the AES accelerator interrupt
+     * (ETS_AES_INTR_SOURCE=73) are latched so the esp_aes_complete_isr
+     * (registered by esp_aes_intr_alloc) fires, clears the in-progress flag
+     * (*s3) and gives op_complete_sem. */
+    soc->intc_status |= ((__uint128_t)1) << ETS_AES_INTR_SOURCE;
+    if (ch_out >= 0) {
+        soc->gdma_out_int_raw[ch_out] |= (1u << 1) | (1u << 3); /* EOF + TOTAL_EOF */
+        soc->gdma_out_int_ena[ch_out] |= (1u << 1) | (1u << 3); /* let ISR see+clear it */
+        if (soc->gdma_out_int_ena[ch_out] & ((1u << 1) | (1u << 3)))
+            soc->intc_status |= ((__uint128_t)1) << (C6_DMA_OUT_CH0_INTR_SOURCE + ch_out);
+        soc->gdma_tx_run[ch_out] = 0;
+    }
+    if (ch_in >= 0) {
+        soc->gdma_in_int_raw[ch_in] |= 1u << 1; /* IN_SUC_EOF */
+        soc->gdma_in_int_ena[ch_in] |= 1u << 1;
+        if (soc->gdma_in_int_ena[ch_in] & (1u << 1))
+            soc->intc_status |= ((__uint128_t)1) << (C6_DMA_IN_CH0_INTR_SOURCE + ch_in);
+        soc->gdma_rx_run[ch_in] = 0;
+    }
+    fprintf(stderr, "DBG_DMA_DONE out_ena=%u in_ena=%u map66=%u map69=%u\n",
+            (unsigned)soc->gdma_in_int_ena[0], (unsigned)soc->gdma_in_int_ena[0],
+            (unsigned)(soc->intc_intmap[66]&0x1fu), (unsigned)(soc->intc_intmap[69]&0x1fu));
+    /* DMA-AES: state transitions busy(1) -> calculation_done(2). The esp_aes
+     * driver busy-waits on this register, so set it to "done" (bit0=0 not
+     * busy, bit1=1 done) to release the poll. */
+    soc->aes_reg[AES_STATE_OFF >> 2] = 2;
+    fprintf(stderr, "DBG_STATE_SET aes_reg[0x13]=%u\n", (unsigned)soc->aes_reg[AES_STATE_OFF >> 2]);
+    {
+        int l66 = soc->intc_intmap[66] & 0x1Fu;
+        int l57 = soc->intc_intmap[57] & 0x1Fu;
+        fprintf(stderr, "DBG_INT line66=%d plic_en=%08x mie=%08x plic_thr=%u prio66=%u prio57=%u en66=%u en57=%u\n",
+                l66, (unsigned)soc->plic_enable, (unsigned)rv->csr_mie,
+                (unsigned)soc->plic_threshold, (unsigned)soc->plic_prio[l66], (unsigned)soc->plic_prio[l57],
+                (unsigned)((soc->plic_enable>>l66)&1), (unsigned)((soc->plic_enable>>l57)&1));
+    }
+}
+
 static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
 {
     esp32c6_t *soc = PRIV(rv)->esp32c6;
+
+    if (addr >= 0x60010000u && addr < 0x60010180u)
+        fprintf(stderr, "DBG_MTXW %08x<=%08x\n", addr, val);
 
     /* AES (0x60088000): most registers are plain storage; the trigger writes
      * the transform synchronously so the esp-idf driver (which busy-waits on
@@ -1359,64 +1543,82 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
     if (addr >= AES_BASE && addr < AES_BASE + 0x100u) {
         uint32_t o = addr - AES_BASE;
         soc->aes_reg[o >> 2] = val;
+        if (o == 0xB8u) /* AES_INT_CLR: firmware acknowledges the AES IRQ */
+            soc->intc_status &= ~(((__uint128_t)1) << ETS_AES_INTR_SOURCE);
         if (o == AES_TRIG_OFF && (val & 1u)) {
-            int mode = soc->aes_reg[AES_MODE_OFF >> 2] & 0x7u;
-            int bm = soc->aes_reg[AES_BLOCKMODE_OFF >> 2] & 0x7u;
-            int nk = 0, nr = 0, encrypt = 0, ok = 1;
-            switch (mode) {
-            case 0: nk = 4; nr = 10; encrypt = 1; break;
-            case 1: nk = 6; nr = 12; encrypt = 1; break;
-            case 2: nk = 8; nr = 14; encrypt = 1; break;
-            case 4: nk = 4; nr = 10; encrypt = 0; break;
-            case 5: nk = 6; nr = 12; encrypt = 0; break;
-            case 6: nk = 8; nr = 14; encrypt = 0; break;
-            default: ok = 0;
-            }
-            if (ok) {
-                uint8_t key[32], in[16], out[16], iv[16];
-                /* words hold byte 0 in the MSB (driver writes b0<<24|..|b3),
-                 * so byte i of the stream is at bit position 8*(3 - (i&3)). */
-                for (int i = 0; i < nk * 4; i++)
-                    key[i] = (soc->aes_reg[(AES_KEY_OFF >> 2) + (i >> 2)] >>
-                              (8 * (3 - (i & 3)))) & 0xff;
-                for (int i = 0; i < 16; i++)
-                    in[i] = (soc->aes_reg[(AES_TEXT_IN_OFF >> 2) + (i >> 2)] >>
-                             (8 * (3 - (i & 3)))) & 0xff;
-                for (int i = 0; i < 16; i++)
-                    iv[i] = (soc->aes_reg[(AES_IV_OFF >> 2) + (i >> 2)] >>
-                             (8 * (3 - (i & 3)))) & 0xff;
-                uint8_t blk[16];
-                if (bm == 1) { /* CBC */
+            /* DMA mode (esp_aes / mbedtls): the input arrives via the GDMA
+             * OUT channel (peri_sel == AES0 = 6) descriptor buffer and the
+             * result is written back through the GDMA IN channel; the
+             * text_in register is never written. Detect it by a started AES
+             * GDMA channel. */
+            int dma_ch = -1;
+            for (int ch = 0; ch < 3; ch++)
+                if (soc->gdma_out_peri_sel[ch] == 6 && soc->gdma_tx_run[ch])
+                    dma_ch = ch;
+            if (dma_ch >= 0) {
+                esp32c6_aes_run_dma(rv, dma_ch);
+            } else {
+                int mode = soc->aes_reg[AES_MODE_OFF >> 2] & 0x7u;
+                int bm = soc->aes_reg[AES_BLOCKMODE_OFF >> 2] & 0x7u;
+                int nk = 0, nr = 0, encrypt = 0, ok = 1;
+                switch (mode) {
+                case 0: nk = 4; nr = 10; encrypt = 1; break;
+                case 1: nk = 6; nr = 12; encrypt = 1; break;
+                case 2: nk = 8; nr = 14; encrypt = 1; break;
+                case 4: nk = 4; nr = 10; encrypt = 0; break;
+                case 5: nk = 6; nr = 12; encrypt = 0; break;
+                case 6: nk = 8; nr = 14; encrypt = 0; break;
+                default: ok = 0;
+                }
+                if (ok) {
+                    uint8_t key[32], in[16], out[16], iv[16];
+                    /* The driver writes each 32-bit word via memcpy as
+                     * b0|b1<<8|b2<<16|b3<<24, so byte i of the stream is at
+                     * bit position 8*(i & 3) (LSB-first within the word). */
+                    for (int i = 0; i < nk * 4; i++)
+                        key[i] = (soc->aes_reg[(AES_KEY_OFF >> 2) + (i >> 2)] >>
+                                  (8 * (i & 3))) & 0xff;
                     for (int i = 0; i < 16; i++)
-                        blk[i] = in[i] ^ iv[i];
-                    aes_block(blk, key, nk, nr, encrypt, out);
-                    if (encrypt)
+                        in[i] = (soc->aes_reg[(AES_TEXT_IN_OFF >> 2) + (i >> 2)] >>
+                                 (8 * (i & 3))) & 0xff;
+                    for (int i = 0; i < 16; i++)
+                        iv[i] = (soc->aes_reg[(AES_IV_OFF >> 2) + (i >> 2)] >>
+                                 (8 * (i & 3))) & 0xff;
+                    uint8_t blk[16];
+                    if (bm == 1) { /* CBC */
                         for (int i = 0; i < 16; i++)
-                            iv[i] = out[i];
-                    else
-                        for (int i = 0; i < 16; i++)
-                            iv[i] = in[i];
-                } else { /* ECB (and fallback for other chaining modes) */
-                    aes_block(in, key, nk, nr, encrypt, out);
-                }
-                for (int i = 0; i < 16; i++) {
-                    int w = i >> 2, b = i & 3;
-                    soc->aes_reg[(AES_TEXT_OUT_OFF >> 2) + w] &=
-                        ~(0xffu << (8 * (3 - b)));
-                    soc->aes_reg[(AES_TEXT_OUT_OFF >> 2) + w] |=
-                        (uint32_t) out[i] << (8 * (3 - b));
-                }
-                if (bm == 1)
+                            blk[i] = in[i] ^ iv[i];
+                        aes_block(blk, key, nk, nr, encrypt, out);
+                        if (encrypt)
+                            for (int i = 0; i < 16; i++)
+                                iv[i] = out[i];
+                        else
+                            for (int i = 0; i < 16; i++)
+                                iv[i] = in[i];
+                    } else { /* ECB (and fallback for other chaining modes) */
+                        aes_block(in, key, nk, nr, encrypt, out);
+                    }
                     for (int i = 0; i < 16; i++) {
                         int w = i >> 2, b = i & 3;
-                        soc->aes_reg[(AES_IV_OFF >> 2) + w] &=
-                            ~(0xffu << (8 * (3 - b)));
-                        soc->aes_reg[(AES_IV_OFF >> 2) + w] |=
-                            (uint32_t) iv[i] << (8 * (3 - b));
+                        soc->aes_reg[(AES_TEXT_OUT_OFF >> 2) + w] &=
+                            ~(0xffu << (8 * b));
+                        soc->aes_reg[(AES_TEXT_OUT_OFF >> 2) + w] |=
+                            (uint32_t) out[i] << (8 * b);
                     }
+                    if (bm == 1)
+                        for (int i = 0; i < 16; i++) {
+                            int w = i >> 2, b = i & 3;
+                            soc->aes_reg[(AES_IV_OFF >> 2) + w] &=
+                                ~(0xffu << (8 * b));
+                            soc->aes_reg[(AES_IV_OFF >> 2) + w] |=
+                                (uint32_t) iv[i] << (8 * b);
+                        }
+                }
             }
             soc->aes_reg[AES_TRIG_OFF >> 2] = 0; /* WT: self-clears */
-            soc->aes_reg[AES_STATE_OFF >> 2] = 0; /* idle */
+            /* DMA path keeps state=2 (calculation_done) so the driver's
+             * busy-wait releases; register path returns to idle (0). */
+            soc->aes_reg[AES_STATE_OFF >> 2] = (dma_ch >= 0) ? 2u : 0u;
         }
         return;
     }
@@ -2224,8 +2426,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
     /* interrupt matrix (0x60010000 + 4*source, 72 sources incl. the DMA
      * channels at 0x108-0x11C) */
     if (addr >= C6_PERIPH_BASE + 0x10000u &&
-        addr < C6_PERIPH_BASE + 0x10000u + 72 * 4u) {
+        addr < C6_PERIPH_BASE + 0x10000u + 96 * 4u) {
         uint32_t s = (addr - C6_PERIPH_BASE - 0x10000u) >> 2;
+        fprintf(stderr, "DBG_MTX s=%u val=%u\n", s, (unsigned)(val & 0x1Fu));
         soc->intc_intmap[s] = val & 0x1Fu;
         return;
     }
@@ -2613,7 +2816,7 @@ uint32_t esp32c6_boot(esp32c6_t *soc, const char *elf_path)
 static uint32_t esp32_intc_raise(esp32c6_t *soc)
 {
     uint32_t lines = 0;
-    for (int s = 0; s < 72; s++) {
+    for (int s = 0; s < 96; s++) {
         if (!(soc->intc_status & (((__uint128_t)1) << s)))
             continue;
         int line = soc->intc_intmap[s] & 0x1Fu;
@@ -2646,10 +2849,21 @@ void esp32c6_check_interrupt(riscv_t *rv)
     if ((soc->intc_status >> 69) & 1ull)
         dbg_69_at_check++;
     if (pending) {
+        static unsigned _c;
+        if ((_c++ % 20000) == 0) {
+            uint64_t lo = (uint64_t)(soc->intc_status & ~(__uint128_t)0);
+            uint64_t hi = (uint64_t)((soc->intc_status >> 64) & ~(__uint128_t)0);
+            fprintf(stderr, "DBG_PEND mie=%08x lines=%08x lo=%016llx hi=%016llx\n",
+                    (unsigned)rv->csr_mie, (unsigned)lines, (unsigned long long)lo, (unsigned long long)hi);
+        }
         dbg_trap_deliv++;
     }
-    if (!pending)
+    if (!pending) {
+        static unsigned _pc_c;
+        if ((_pc_c++ % 100000) == 0)
+            fprintf(stderr, "DBG_PC pc=%08x mstatus=%08x\n", (unsigned)rv_get_pc(rv), (unsigned)rv->csr_mstatus);
         return;
+    }
     /* lowest set bit = CPU interrupt number */
     int idx = __builtin_ctz(pending);
     SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ((1u << 31) | idx), 0);
@@ -3053,6 +3267,8 @@ void esp32c6_periodic(riscv_t *rv)
     for (int ch = 0; ch < 3; ch++) {
         if (!soc->gdma_tx_run[ch])
             continue;
+        if (soc->gdma_out_peri_sel[ch] == 6)
+            continue; /* AES0: data is consumed by the AES trigger, not I2S */
         if (!(mmio32[0xC024u >> 2] & (1u << 2))) /* I2S TX not started */
             continue;
         if (rv->csr_cycle < soc->gdma_tx_drain_cyc[ch])
@@ -3124,6 +3340,8 @@ void esp32c6_periodic(riscv_t *rv)
     for (int ch = 0; ch < 3; ch++) {
         if (!soc->gdma_rx_run[ch])
             continue;
+        if (soc->gdma_in_peri_sel[ch] == 6)
+            continue; /* AES0: data is produced by the AES trigger, not I2S */
         if (!(mmio32[0xC020u >> 2] & (1u << 2))) /* I2S RX not started */
             continue;
         if (rv->csr_cycle < soc->gdma_rx_fill_cyc[ch])

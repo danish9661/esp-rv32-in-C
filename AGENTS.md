@@ -290,6 +290,31 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
       exists but is not modeled); only software/poll-mode (register) access
       works. Verified at the register level only.
 
+- [x] **ESP32-C6 peripheral bring-up — verified via arduino-cli sketches on the WASM emulator** (2026-08-22):
+      - **AES** (`aestest`): ECB/CBC enc+dec for 128/192/256 → `aestest: OK`. Hang
+        fixed: `esp32c6_aes_run_dma` now writes back the GDMA OUT/IN descriptors
+        (clears owner bit dw0[31], sets EOF/SUC_EOF) so the esp_aes driver's
+        descriptor-owner poll exits; AES INT_CLR (0xB8) write clears source 73.
+        Also removed debug-print floods (DBG_R + trap/CSR prints) → ~70 KB/run.
+      - **UART1** (`uart1loopbacktest`/`uart1regtest`/`uart1e2e`): TX/RX loopback OK.
+      - **I2C master** (`i2ctest`, new sketch): write 8 → virtual EEPROM @0x50 →
+        read 8 matching bytes OK. Model already correct (base 0x60004000).
+      - **I2S RX** (`i2srxtest`): 4×960-byte GDMA reads OK.
+      - **WDT / timers** (`wdtlintest`): arm → FIRED → feed clears raw OK.
+      - **SPI master** (`spitest`, new sketch): loopback echo + virtual-SRAM R/W OK.
+        Model at 0x60081000 (base confirmed for C6 `SPI`/`GPSPI2`).
+      - **CAN/TWAI** (`twaitest`, new sketch, ESP-IDF `driver/twai.h`): virtual node
+        frame (ID 0x123, DLC 2, DE AD) received OK + TX completion OK. Model @0x6000B000.
+      - **GPIO** (`gpiotest`): output→input readback (GPIO_IN = gpio_in | gpio_out&enable)
+        OK. Model @0x60091000.
+      - **ADC** (`adctest`): oneshot `analogRead(0)` returns 1024 (model: 1024+ch*128 for
+        ADC1 ch0-7) OK. Model @0x6000E000.
+      - **LEDC** (`ledctest`, new `ledcAttachChannel`/`ledcWriteChannel` API): duty latched
+        into DUTY_R on CONF1.start, DUTY==DUTY_R OK. Model @0x60007000.
+      Sketches built under `/tmp/opencode/{aestest,uart1test,uart1regtest,
+      uart1e2e,i2srxtest,wdtlintest,i2ctest,spitest,twaitest,gpiotest,adctest,ledctest}`.
+      All run clean (~65-70 KB/run, no interrupt storms).
+
 ## Known issues / gotchas
 
 - Makefile breaks on spaces in path (see warning above).
