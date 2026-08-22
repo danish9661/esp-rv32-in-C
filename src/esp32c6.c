@@ -268,6 +268,11 @@ struct esp32c6_soc {
 
     /* TIMG0/1 (0x60008000/0x60009000): one timer per group */
     uint32_t timg_reg[2][64]; /* 0x100 bytes, mirrors timer_group_dev_t */
+    /* MWDT (Timer Group Watchdog): armed flag, expiry cycle, write-protect
+     * unlock. The WDT raises the group's WDT interrupt source on timeout. */
+    int wdt_en[2];
+    uint64_t wdt_expire[2];
+    int wdt_unlock[2];
     uint64_t timg_counter[2]; /* live counter value */
     uint64_t timg_anchor[2];  /* cycle at which the counter base applies */
     uint64_t timg_frac[2];    /* fractional cycle remainder per group */
@@ -519,6 +524,9 @@ esp32c6_t *esp32c6_new(void)
 /* TIMG0/TIMG1 timer interrupt sources (interrupts.h enum) */
 #define C6_TG0_T0_INTR_SOURCE 51u
 #define C6_TG1_T0_INTR_SOURCE 54u
+/* TIMG0/TIMG1 watchdog interrupt sources (interrupts.h enum) */
+#define C6_TG0_WDT_INTR_SOURCE 52u
+#define C6_TG1_WDT_INTR_SOURCE 55u
 /* PCNT interrupt source (interrupts.h enum) */
 #define C6_PCNT_INTR_SOURCE 62u
 /* MCPWM0 interrupt source (interrupts.h enum) */
@@ -597,6 +605,32 @@ esp32c6_t *esp32c6_new(void)
 #define TIMG_T0_ALARM_EN (1u << 10)
 #define TIMG_T0_USE_XTAL (1u << 9)
 #define TIMG_INT_T0_ALARM (1u << 0)
+#define TIMG_INT_WDT (1u << 1) /* WDT interrupt bit in the combined INT regs */
+
+/* MWDT (within TIMG) register offsets and bits (esp32c6 timer_group) */
+#define TIMG_WDT_CONFIG0 0x48u
+#define TIMG_WDT_CONFIG1 0x4cu
+#define TIMG_WDT_CONFIG2 0x50u
+#define TIMG_WDT_FEED 0x60u
+#define TIMG_WDT_WPROTECT 0x64u
+#define TIMG_WDT_MAGIC 0x50D83AA1u /* unlock key written to WDTWPROTECT */
+#define TIMG_WDT_EN (1u << 31)
+#define TIMG_WDT_STG0 (3u << 29) /* stage0 action: 0=off,1=int,2=cpu-rst,3=sys-rst */
+#define TIMG_WDT_STG0_INT (1u << 29)
+
+/* Number of guest cycles until the MWDT (group g) times out, given the
+ * current CONFIG1 (prescale) and CONFIG2 (stage0 hold). The WDT clock is
+ * ~40 MHz while the guest cycle clock is ~80 MHz, so we multiply by 2 as
+ * an approximation; exact timing is not required for correctness. */
+static uint64_t esp32c6_wdt_cycles(esp32c6_t *soc, int g)
+{
+    uint32_t prescale =
+        (soc->timg_reg[g][TIMG_WDT_CONFIG1 >> 2] >> 16) & 0xFFFFu;
+    uint32_t hold = soc->timg_reg[g][TIMG_WDT_CONFIG2 >> 2];
+    if (!hold)
+        hold = 1u;
+    return (uint64_t) hold * (uint64_t) (prescale + 1u) * 2u;
+}
 
 static void esp32_uart_putc(esp32c6_t *soc, char c)
 {
@@ -1357,6 +1391,35 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     (uint32_t) ((uint64_t) max * 40000000u / clk_hz);
                 r[o >> 2] |= 0x8000u; /* TIMG_RTC_CALI_RDY */
             }
+        } else if (o == TIMG_WDT_WPROTECT) {
+            soc->wdt_unlock[0] = (val == TIMG_WDT_MAGIC);
+            r[o >> 2] = val;
+        } else if (o == TIMG_WDT_CONFIG0) {
+            r[o >> 2] = val;
+            if (!soc->wdt_unlock[0])
+                ; /* writes are ignored while the WDT is write-protected */
+            else if (val & TIMG_WDT_EN) {
+                soc->wdt_en[0] = 1;
+                soc->wdt_expire[0] = rv->csr_cycle + esp32c6_wdt_cycles(soc, 0);
+            } else {
+                soc->wdt_en[0] = 0;
+                r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
+                soc->intc_status &=
+                    ~(((__uint128_t)1) << C6_TG0_WDT_INTR_SOURCE);
+            }
+        } else if (o == TIMG_WDT_CONFIG1 || o == TIMG_WDT_CONFIG2) {
+            r[o >> 2] = val;
+            if (soc->wdt_en[0])
+                soc->wdt_expire[0] = rv->csr_cycle + esp32c6_wdt_cycles(soc, 0);
+        } else if (o == TIMG_WDT_FEED) {
+            if (soc->wdt_unlock[0]) {
+                r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
+                if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
+                    soc->intc_status &=
+                        ~(((__uint128_t)1) << C6_TG0_WDT_INTR_SOURCE);
+                soc->wdt_expire[0] = rv->csr_cycle + esp32c6_wdt_cycles(soc, 0);
+            }
+            r[o >> 2] = val;
         } else {
             r[o >> 2] = val;
         }
@@ -1396,6 +1459,35 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     (uint32_t) ((uint64_t) max * 40000000u / clk_hz);
                 r[o >> 2] |= 0x8000u;
             }
+        } else if (o == TIMG_WDT_WPROTECT) {
+            soc->wdt_unlock[1] = (val == TIMG_WDT_MAGIC);
+            r[o >> 2] = val;
+        } else if (o == TIMG_WDT_CONFIG0) {
+            r[o >> 2] = val;
+            if (!soc->wdt_unlock[1])
+                ; /* writes are ignored while the WDT is write-protected */
+            else if (val & TIMG_WDT_EN) {
+                soc->wdt_en[1] = 1;
+                soc->wdt_expire[1] = rv->csr_cycle + esp32c6_wdt_cycles(soc, 1);
+            } else {
+                soc->wdt_en[1] = 0;
+                r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
+                soc->intc_status &=
+                    ~(((__uint128_t)1) << C6_TG1_WDT_INTR_SOURCE);
+            }
+        } else if (o == TIMG_WDT_CONFIG1 || o == TIMG_WDT_CONFIG2) {
+            r[o >> 2] = val;
+            if (soc->wdt_en[1])
+                soc->wdt_expire[1] = rv->csr_cycle + esp32c6_wdt_cycles(soc, 1);
+        } else if (o == TIMG_WDT_FEED) {
+            if (soc->wdt_unlock[1]) {
+                r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
+                if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
+                    soc->intc_status &=
+                        ~(((__uint128_t)1) << C6_TG1_WDT_INTR_SOURCE);
+                soc->wdt_expire[1] = rv->csr_cycle + esp32c6_wdt_cycles(soc, 1);
+            }
+            r[o >> 2] = val;
         } else {
             r[o >> 2] = val;
         }
@@ -2958,6 +3050,23 @@ void esp32c6_periodic(riscv_t *rv)
                 soc->timg_anchor[g] = rv->csr_cycle;
                 soc->timg_frac[g] = 0;
             }
+        }
+    }
+
+    /* MWDT (Timer Group Watchdog) timeouts: when armed and the expiry
+     * cycle passes without a feed, raise the group's WDT interrupt (level
+     * semantics: the raw bit stays set until a feed or disable clears it). */
+    for (int g = 0; g < 2; g++) {
+        if (!soc->wdt_en[g])
+            continue;
+        if (rv->csr_cycle < soc->wdt_expire[g])
+            continue;
+        soc->timg_reg[g][TIMG_INT_RAW >> 2] |= TIMG_INT_WDT;
+        if (soc->timg_reg[g][TIMG_INT_RAW >> 2] &
+            soc->timg_reg[g][TIMG_INT_ENA >> 2]) {
+            uint32_t src = (g == 0) ? C6_TG0_WDT_INTR_SOURCE
+                                    : C6_TG1_WDT_INTR_SOURCE;
+            soc->intc_status |= ((__uint128_t)1) << src;
         }
     }
 

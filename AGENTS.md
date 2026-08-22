@@ -224,6 +224,28 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      real codec data can replace the synth later. Debug `fprintf` scaffolding from this
      session was stripped after verification (the per-descriptor `RX EOF` print alone
      emitted ~7k lines).
+   - **MWDT (Timer Group Watchdog) implemented & verified 2026-08-22.** Modeled the
+     ESP32-C6 MWDT0/MWDT1 inside the existing TIMG0/1 region (0x60008000 / 0x60009000):
+     `WDTCONFIG0` (0x48, `wdt_en` bit31 + stage0 action bits29-30), `WDTCONFIG1` (0x4c,
+     `wdt_clk_prescale` bits[31:16]), `WDTCONFIG2` (0x50, `stg0_hold`), `WDT_FEED`
+     (0x60), `WDTWPROTECT` (0x64, unlock key `0x50D83AA1`). Writes are gated on the
+     write-protect unlock (faithful to HW). When armed and the expiry cycle passes
+     without a feed, the combined TIMG `INT_RAW` (0x74) bit 1 (WDT) is set and, if the
+     WDT interrupt is enabled in `INT_ENA` (0x70), the group's WDT source is raised
+     (`C6_TG0_WDT_INTR_SOURCE = 52`, `C6_TG1_WDT_INTR_SOURCE = 55`). Feeding or
+     disabling clears the raw bit and the pending source. A `wdt_cycles` helper
+     approximates the timeout as `stg0_hold * (prescale+1) * 2` guest cycles (WDT ~40 MHz
+     vs the ~80 MHz guest cycle clock). Sketch `sketches/wdtlintest/wdtlintest.ino`
+     unlocks + arms MWDT0 with a short stage0-interrupt timeout, polls `INT_RAW` until
+     the WDT bit sets (`wdtlintest: FIRED`), feeds the dog, and confirms the bit clears
+     (`after feed raw cleared=1`) → `wdtlintest: OK` → `DEMO_DONE`. Note: the model
+     raises the interrupt source but does not perform the CPU/system reset that a real
+     WDT stage2/3 would trigger (that would be destructive in the emulator); stage0
+     interrupt behavior is what is exercised here. RNG (0x600B2808 WDEV_RND_REG) and
+     TWAI TX + GPIO input interrupts were found to already be modeled — RNG via a
+     xorshift PRNG seeded by the SYSTIMER counter, TWAI TX via `twai_tx_pending`, and
+     GPIO ISRs via the virtual-button → per-pin `GPIO_PINn` type/enable → `gpio_status`
+     + source 30 path.
 
 ## Known issues / gotchas
 
