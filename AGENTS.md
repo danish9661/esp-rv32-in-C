@@ -264,12 +264,31 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
           actually triggered to drain its ring buffer (the model reports the TX
           FIFO as always-empty).
       Sketch `sketches/uart1regtest/uart1regtest.ino` pokes UART1 FIFO/CONF0
-      directly (the esp-idf `uart_write_bytes` driver routes TX through an
-      internal path that does not write the FIFO *register* the model sees, so
-      the high-level driver loopback is not yet exercisable — see gotcha
-      below). It enables CONF0 loopback, writes 20 bytes to the TX FIFO, reads
-      them back from the RX FIFO, and asserts equality → `uart1regtest: OK` →
-      `DEMO_DONE`. Regression: `i2srxtest` and `wdtlintest` still pass.
+      directly and asserts equality → `uart1regtest: OK` → `DEMO_DONE`.
+      Critically, the loopback bit is in **`conf0_sync` at offset 0x20**, NOT
+      `conf0` at 0x14 (0x14 is now `clkdiv_sync`). The earlier "the driver
+      never writes the FIFO register" theory was wrong — the real bug was the
+      loopback register offset. With it fixed, the **full esp-idf driver**
+      works end-to-end: `sketches/uart1e2e/uart1e2e.ino` uses `Serial1` +
+      `uart_set_loop_back(UART_NUM_1, true)`, writes 22 bytes, reads them back
+      (`uart1e2e: wrote=22 read=22` → `uart1e2e: OK`). Regression: `i2srxtest`
+      and `wdtlintest` still pass.
+
+    - **AES hardware accelerator (0x60088000) modeled + verified 2026-08-22.**
+      Added a 256-byte `aes_reg[]` bank and a from-scratch FIPS-197 block
+      cipher (SubBytes/ShiftRows/MixColumns + equivalent-inverse for decrypt,
+      full key schedule; ECB + CBC chaining). The trigger write (0x48) runs the
+      transform **synchronously** (state stays idle) so the esp-idf driver's
+      busy-wait on the state register sees the result immediately. Encrypt/
+      decrypt for 128/192/256 and CBC verified against FIPS-197 / NIST
+      SP800-38A vectors via `sketches/aesregtest/aesregtest.ino` (direct
+      register pokes): `AES128 ECB enc/dec`, `AES256 ECB enc`, `AES128 CBC enc`
+      all → `aesregtest: OK`. Byte order follows the esp-idf `aes_ll`
+      convention (word `i = b0<<24 | b1<<16 | b2<<8 | b3`, no swapping).
+      Gotcha: the high-level **mbedtls AES API hangs** because the esp-idf
+      `esp_aes` driver feeds the peripheral via **GDMA** (the AES GDMA trigger
+      exists but is not modeled); only software/poll-mode (register) access
+      works. Verified at the register level only.
 
 ## Known issues / gotchas
 
@@ -279,14 +298,16 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
 - WASM requires tail-call support: Chrome 112+, Firefox 121+, Safari 18.2+.
 - P4 needs Zc + SMP before real ESP-IDF apps can run (rv32emu doesn't have either).
 - WiFi/BT RF + WLAN MAC coprocessor firmware is out of scope for a faithful model → stub.
-- **esp-idf `uart_write_bytes` (high-level driver) does not exercise UART1
-  loopback in the emulator.** The driver transmits via an internal path
-  (ring buffer + TX ISR driven by an interrupt the C6 model does not raise /
-  the driver does not enable TXFIFO_EMPTY in `INT_ENA`), so it never writes
-  the UART FIFO *register* that the loopback interception watches. Loopback
-  is verified only at the register level (`uart1regtest`); making the
-  esp-idf uart driver itself loopback-clean requires emulating the driver's
-  actual TX DMA/ISR path.
+- **ESP32-C6 `conf0_sync` (UART loopback) is at offset 0x20, not 0x14.**
+  The header register struct shifted: 0x14 is now `clkdiv_sync`, 0x20 is
+  `conf0_sync` (loopback bit 12). Any new UART-register model must use 0x20.
+- **High-level mbedtls/esp_aes AES API hangs** in the emulator. The esp-idf
+  `esp_aes` driver feeds the AES peripheral via **GDMA** (the AES0 GDMA
+  trigger exists in the C6 trigger list but GDMA-to-AES is not modeled), so a
+  DMA-completion interrupt never arrives and the caller blocks forever. The
+  AES peripheral itself works correctly in software/poll mode — verified via
+  direct register pokes (`sketches/aesregtest`). Adding AES (and any GDMA-
+  backed peripheral's) *DMA* path is the remaining work.
 
 ## Reference links
 
