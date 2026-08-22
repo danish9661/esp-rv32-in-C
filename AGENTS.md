@@ -195,9 +195,35 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     (inside `onRuntimeInitialized`; stub `globalThis.document = {getElementById:()=>({disabled:false})}`
     to satisfy the browser UI helpers `_disable/_enable_run_button`). Captured output:
     `i2stest: starting` → four `write N: err=0 written=960` → `i2stest: OK` → `DEMO_DONE`.
-    This confirms bit-69 DMA-out interrupt delivery works (4 sequential writes cycle the
-    descriptor ring twice). Headless does not self-exit (guest idles after DEMO_DONE);
-    wrap in `timeout` and capture console.log to a file.
+     This confirms bit-69 DMA-out interrupt delivery works (4 sequential writes cycle the
+     descriptor ring twice). Headless does not self-exit (guest idles after DEMO_DONE);
+     wrap in `timeout` and capture console.log to a file.
+   - **I2S RX (GDMA IN channel + I2S RX engine) implemented & verified 2026-08-22.**
+     The model previously had GDMA OUT + I2S TX only. Added the mirror IN path:
+       * GDMA `in_intr[3]` (device 0x60080000+0x00..0x2F: RAW/ST/ENA/CLR at
+         0x00+0x10*ch) and the IN block (in_conf0/in_conf1/infifo_status/in_link/
+         in_state/in_suc_eof_des_addr/in_dscr/in_pri/in_peri_sel at channel base
+         0x70 + 0xC0*ch). `in_link.start = bit 22` arms the walker; `in_conf0.in_rst`
+         (bit 0, WT) resets the RX FIFO + walker.
+       * I2S `RX_CONF` (0xC020) `rx_start` (bit 2) kept set so the RX engine runs
+         (mirrors TX_CONF at 0xC024).
+       * Periodic-update RX engine: when `rx_start` is set and the walker is armed, it
+         synthesizes **one 32-bit sample per 256 cycles** into a 12-word RX FIFO (a
+         monotonic counter 0,1,2,… — left = word, right = word>>16), copies FIFO words
+         into the current descriptor buffer, and on descriptor completion raises
+         **IN_SUC_EOF (bit 1)** of `in_intr` + `intc_status` bit **66+ch**
+         (`C6_DMA_IN_CH0_INTR_SOURCE = 66`); the descriptor ring is walked via DW2 and
+         parked when the next pointer is 0.
+       * New `esp32c6_gdma_load_rx_desc` mirrors `esp32c6_gdma_load_desc` but loads into
+         the rx_* walker fields.
+     Sketch `sketches/i2srxtest/i2srxtest.ino` opens an I2S0 std RX channel (note:
+     `i2s_new_channel(cfg, *tx, *rx)` — RX is the 3rd arg, not 2nd) and reads 4×960 B,
+     asserting each 32-bit word equals the expected counter. Headless result: four
+     `read N: err=0 read=960` → `i2srxtest: OK` → `DEMO_DONE`. The synthesized-counter
+     stream is sufficient to validate the DMA-in + interrupt + descriptor-walk path;
+     real codec data can replace the synth later. Debug `fprintf` scaffolding from this
+     session was stripped after verification (the per-descriptor `RX EOF` print alone
+     emitted ~7k lines).
 
 ## Known issues / gotchas
 

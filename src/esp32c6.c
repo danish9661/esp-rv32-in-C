@@ -312,6 +312,29 @@ struct esp32c6_soc {
     uint32_t gdma_tx_next_addr[3]; /* next descriptor address (DW2) */
     uint64_t gdma_tx_drain_cyc[3]; /* next cycle for the paced drain */
 
+    /* GDMA RX (IN) channels: fed from the I2S0 RX FIFO (synthesized
+     * samples) and copied into guest RAM descriptors by the walker. */
+    uint32_t gdma_in_conf0[3];
+    uint32_t gdma_in_conf1[3];
+    uint32_t gdma_in_link[3];
+    uint32_t gdma_in_eof_des_addr[3];
+    uint32_t gdma_in_dscr[3];
+    uint32_t gdma_in_pri[3];
+    uint32_t gdma_in_peri_sel[3];
+    uint32_t gdma_in_int_raw[3];
+    uint32_t gdma_in_int_ena[3];
+    uint32_t gdma_rx_fifo[3][12];  /* 12-word RX FIFO (shared with I2S) */
+    uint8_t gdma_rx_fifo_cnt[3];
+    uint8_t gdma_rx_fifo_head[3];  /* index of oldest entry */
+    uint8_t gdma_rx_run[3];         /* descriptor walker active */
+    uint32_t gdma_rx_desc_addr[3];  /* current descriptor address (full) */
+    uint32_t gdma_rx_desc_buf[3];  /* current descriptor buffer (full) */
+    uint32_t gdma_rx_desc_len[3];  /* current descriptor length (bytes) */
+    uint32_t gdma_rx_desc_left[3]; /* bytes still to pull */
+    uint32_t gdma_rx_next_addr[3]; /* next descriptor address (DW2) */
+    uint64_t gdma_rx_fill_cyc[3];  /* next cycle for the paced fill */
+    uint32_t gdma_rx_sample[3];     /* running synthesized sample counter */
+
     /* UART0 RX FIFO (128 bytes, ring) fed from the host injection file */
     uint8_t uart_rx[128];
     unsigned int uart_rx_head;
@@ -380,6 +403,25 @@ static void esp32c6_gdma_load_desc(esp32c6_t *soc, int ch)
     soc->gdma_tx_desc_len[ch] = (dw0 >> 12) & 0xFFFu;
     soc->gdma_tx_desc_left[ch] = soc->gdma_tx_desc_len[ch] & ~3u;
     soc->gdma_out_dscr[ch] = soc->gdma_tx_desc_addr[ch];
+}
+
+/* Load the RX (IN) descriptor at gdma_rx_desc_addr[ch] into the walker. */
+static void esp32c6_gdma_load_rx_desc(esp32c6_t *soc, int ch)
+{
+    uint8_t *d = esp32c6_dma_ptr(soc, soc->gdma_rx_desc_addr[ch]);
+    if (!d) { /* descriptor not in RAM: park the channel */
+        soc->gdma_rx_run[ch] = 0;
+        return;
+    }
+    uint32_t dw0, dw1, dw2;
+    memcpy(&dw0, d, 4);
+    memcpy(&dw1, d + 4, 4);
+    memcpy(&dw2, d + 8, 4);
+    soc->gdma_rx_next_addr[ch] = dw2;
+    soc->gdma_rx_desc_buf[ch] = dw1;
+    soc->gdma_rx_desc_len[ch] = (dw0 >> 12) & 0xFFFu;
+    soc->gdma_rx_desc_left[ch] = soc->gdma_rx_desc_len[ch] & ~3u;
+    soc->gdma_in_dscr[ch] = soc->gdma_rx_desc_addr[ch];
 }
 
 static void esp32_add_region(esp32c6_t *soc,
@@ -713,12 +755,23 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         return soc->spi2_reg[(addr - C6_PERIPH_BASE - 0x81000u) >> 2];
     }
 
-    /* GDMA (0x60080000-0x600802B0): TX channels + per-channel interrupts.
-     * out_intr[ch] = {raw, st, ena, clr} at 0x30 + 16*ch; st = raw & ena.
-     * channel[ch] at 0x70 + 0xC0*ch; the OUT block is at +0x60. */
+    /* GDMA (0x60080000-0x600802B0): IN + OUT channels and per-channel
+     * interrupts. in_intr[ch] = {raw, st, ena, clr} at 0x00 + 16*ch;
+     * out_intr[ch] at 0x30 + 16*ch. channel[ch] at 0x70 + 0xC0*ch; the IN
+     * block is at +0x00 and the OUT block at +0x60. */
     if (addr >= C6_PERIPH_BASE + 0x80000u &&
         addr < C6_PERIPH_BASE + 0x802B0u) {
         uint32_t o = addr - C6_PERIPH_BASE - 0x80000u;
+        if (o < 0x30u) { /* in_intr[3]: 0x00..0x2F */
+            uint32_t ch = o >> 4;
+            switch (o & 0xFu) {
+            case 0x00: return soc->gdma_in_int_raw[ch];
+            case 0x04: return soc->gdma_in_int_raw[ch] &
+                              soc->gdma_in_int_ena[ch];
+            case 0x08: return soc->gdma_in_int_ena[ch];
+            default:   return 0; /* clr: write-only */
+            }
+        }
         if (o >= 0x30u && o < 0x70u) { /* out_intr[3] */
             uint32_t ch = (o - 0x30u) >> 4;
             switch (o & 0xFu) {
@@ -732,8 +785,28 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         if (o >= 0x70u && o < 0x2B0u) {
             uint32_t c = (o - 0x70u) / 0xC0u;
             uint32_t r = o - 0x70u - c * 0xC0u;
-            if (r >= 0x60u) { /* OUT block */
+            if (r < 0x60u) { /* IN block */
                 switch (r) {
+                case 0x00: return soc->gdma_in_conf0[c];
+                case 0x04: return soc->gdma_in_conf1[c];
+                case 0x08: /* infifo_status: FULL/EMPTY/CNT */
+                    return (uint32_t)(soc->gdma_rx_fifo_cnt[c] << 2) |
+                           (soc->gdma_rx_fifo_cnt[c] >= 12u ? 1u : 0u) |
+                           (soc->gdma_rx_fifo_cnt[c] == 0u ? 2u : 0u);
+                case 0x0C: return 0; /* in_pop: read returns nothing */
+                case 0x10: /* in_link: park set when the FSM is idle */
+                    return (soc->gdma_in_link[c] & 0xFFFFFu) |
+                           (soc->gdma_rx_run[c] ? 0u : (1u << 24));
+                case 0x14: return 0; /* in_state: idle */
+                case 0x18: return soc->gdma_in_eof_des_addr[c];
+                case 0x1C: return 0; /* in_err_eof_des_addr */
+                case 0x20: return soc->gdma_in_dscr[c];
+                case 0x2C: return soc->gdma_in_pri[c];
+                case 0x30: return soc->gdma_in_peri_sel[c];
+                default:   return 0;
+                }
+            }
+            switch (r) { /* OUT block */
                 case 0x60: return soc->gdma_out_conf0[c];
                 case 0x64: return soc->gdma_out_conf1[c];
                 case 0x68: /* outfifo_status: FULL/EMPTY/CNT */
@@ -748,7 +821,6 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
                 case 0x80: return soc->gdma_out_dscr[c];
                 case 0x8C: return soc->gdma_out_pri[c];
                 case 0x90: return soc->gdma_out_peri_sel[c];
-                }
             }
         }
         return mmio32[off >> 2];
@@ -1360,14 +1432,32 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         return;
     }
 
-    /* GDMA (0x60080000-0x600802B0): TX channel control. out_intr[ch] =
-     * {raw, st, ena, clr} at 0x30 + 16*ch; channel[ch] at 0x70 + 0xC0*ch
-     * with the OUT block at +0x60. OUT_LINK.start (bit 21) arms the
-     * descriptor walker at 0x40800000 + outlink_addr; OUT_CONF0.out_rst
-     * (bit 0) is write-only and resets the FIFO + walker. */
+    /* GDMA (0x60080000-0x600802B0): IN + OUT channel control. in_intr[ch]
+     * at 0x00 + 16*ch; out_intr[ch] at 0x30 + 16*ch. channel[ch] at
+     * 0x70 + 0xC0*ch with the IN block at +0x00 and OUT block at +0x60.
+     * IN_LINK.start (bit 22) / OUT_LINK.start (bit 21) arm the descriptor
+     * walker; *_conf0.*_rst (bit 0) is write-only and resets FIFO+walker. */
     if (addr >= C6_PERIPH_BASE + 0x80000u &&
         addr < C6_PERIPH_BASE + 0x802B0u) {
         uint32_t o = addr - C6_PERIPH_BASE - 0x80000u;
+        if (o < 0x30u) { /* in_intr[3]: 0x00..0x2F */
+            uint32_t ch = o >> 4;
+            switch (o & 0xFu) {
+            case 0x08: /* ena */
+                soc->gdma_in_int_ena[ch] = val;
+                break;
+            case 0x0C: /* clr: W1C */
+                soc->gdma_in_int_raw[ch] &= ~val;
+                break;
+            default:
+                return; /* raw/st: read-only */
+            }
+            if (!(soc->gdma_in_int_raw[ch] & soc->gdma_in_int_ena[ch])) {
+                soc->intc_status &=
+                    ~(((__uint128_t)1) << (C6_DMA_IN_CH0_INTR_SOURCE + ch));
+            }
+            return;
+        }
         if (o >= 0x30u && o < 0x70u) { /* out_intr[3] */
             uint32_t ch = (o - 0x30u) >> 4;
             switch (o & 0xFu) {
@@ -1391,7 +1481,49 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         if (o >= 0x70u && o < 0x2B0u) {
             uint32_t c = (o - 0x70u) / 0xC0u;
             uint32_t r = o - 0x70u - c * 0xC0u;
-            switch (r) {
+            if (r < 0x60u) { /* IN block */
+                switch (r) {
+                case 0x00: /* in_conf0 */
+                    soc->gdma_in_conf0[c] = val & ~1u; /* in_rst is WT */
+                    if (val & 1u) { /* reset the FIFO and the walker */
+                        soc->gdma_rx_fifo_cnt[c] = 0;
+                        soc->gdma_rx_fifo_head[c] = 0;
+                        soc->gdma_rx_run[c] = 0;
+                        soc->gdma_rx_desc_left[c] = 0;
+                        soc->gdma_in_dscr[c] = 0;
+                    }
+                    return;
+                case 0x04: /* in_conf1 */
+                    soc->gdma_in_conf1[c] = val;
+                    return;
+                case 0x10: /* in_link */
+                    soc->gdma_in_link[c] =
+                        val & ~0xF00000u; /* start/stop/restart/park WT */
+                    if (val & (1u << 22)) { /* start */
+                        soc->gdma_rx_desc_addr[c] = C6_SRAM_BASE +
+                            (soc->gdma_in_link[c] & 0xFFFFFu);
+                        soc->gdma_rx_sample[c] = 0;
+                        esp32c6_gdma_load_rx_desc(soc, c);
+                        soc->gdma_rx_run[c] = 1;
+                        soc->gdma_rx_fill_cyc[c] = rv->csr_cycle + 256u;
+                    } else if (val & (1u << 21)) { /* stop */
+                        soc->gdma_rx_run[c] = 0;
+                    } else if (val & (1u << 23)) { /* restart */
+                        soc->gdma_rx_run[c] = 1;
+                        soc->gdma_rx_fill_cyc[c] = rv->csr_cycle + 256u;
+                    }
+                    return;
+                case 0x2C: /* in_pri */
+                    soc->gdma_in_pri[c] = val;
+                    return;
+                case 0x30: /* in_peri_sel */
+                    soc->gdma_in_peri_sel[c] = val;
+                    return;
+                default:
+                    return; /* stored nowhere (never read back) */
+                }
+            }
+            switch (r) { /* OUT block */
             case 0x60: /* out_conf0 */
                 soc->gdma_out_conf0[c] = val & ~1u; /* out_rst is WT */
                 if (val & 1u) { /* reset the FIFO and the walker */
@@ -1440,9 +1572,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         return;
     }
 
-    /* I2S (0x6000C000-0x6000C100): TX_CONF self-clearing bits. The reset
-     * bits (0,1) are write-only and tx_update (8) clears itself once the
-     * configuration has been applied (the driver polls it). */
+    /* I2S (0x6000C000-0x6000C100): TX_CONF/RX_CONF self-clearing bits. The
+     * reset bits (0,1) are write-only and *_update (8) clears itself once
+     * the configuration has been applied (the driver polls it). rx_start /
+     * tx_start (bit 2) are kept set so the engine knows the stream runs. */
     if (addr >= C6_PERIPH_BASE + 0xC000u &&
         addr < C6_PERIPH_BASE + 0xC100u) {
         uint32_t o = addr - C6_PERIPH_BASE - 0xC000u;
@@ -1450,6 +1583,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             mmio32[off >> 2] = val & ~0x103u;
             if (val & (1u << 2))
                 fprintf(stderr, "DBG i2s tx_start set\n");
+        } else if (o == 0x20u) { /* RX_CONF */
+            mmio32[off >> 2] = val & ~0x103u;
         } else if (o == 0x18u) { /* INT_CLR: W1C */
             mmio32[(0xC00Cu) >> 2] &= ~val;
         } else {
@@ -2569,6 +2704,61 @@ void esp32c6_periodic(riscv_t *rv)
         } else {
             soc->gdma_tx_desc_addr[ch] = soc->gdma_tx_next_addr[ch];
             esp32c6_gdma_load_desc(soc, ch);
+        }
+    }
+
+    /* GDMA RX <- I2S0: the I2S RX engine synthesizes one 32-bit sample word
+     * per 256 cycles into the channel RX FIFO; the DMA walker copies FIFO
+     * words into the current descriptor buffer and raises IN_SUC_EOF
+     * (INTMTX source 66+ch) once the descriptor is full. The synthesized
+     * stream is a monotonic 32-bit counter so a guest read can verify it
+     * (left channel = word, right channel = word>>16). */
+    for (int ch = 0; ch < 3; ch++) {
+        if (!soc->gdma_rx_run[ch])
+            continue;
+        if (!(mmio32[0xC020u >> 2] & (1u << 2))) /* I2S RX not started */
+            continue;
+        if (rv->csr_cycle < soc->gdma_rx_fill_cyc[ch])
+            continue;
+        soc->gdma_rx_fill_cyc[ch] = rv->csr_cycle + 256u;
+        /* produce one sample into the RX FIFO if there is room */
+        if (soc->gdma_rx_fifo_cnt[ch] < 12u) {
+            uint8_t t = (soc->gdma_rx_fifo_head[ch] +
+                         soc->gdma_rx_fifo_cnt[ch]) % 12u;
+            soc->gdma_rx_fifo[ch][t] = soc->gdma_rx_sample[ch]++;
+            soc->gdma_rx_fifo_cnt[ch]++;
+        }
+        /* walker copies one FIFO word into the guest buffer */
+        if (soc->gdma_rx_fifo_cnt[ch] > 0 &&
+            soc->gdma_rx_desc_left[ch] > 0) {
+            uint8_t h = soc->gdma_rx_fifo_head[ch];
+            uint32_t w = soc->gdma_rx_fifo[ch][h];
+            soc->gdma_rx_fifo_head[ch] = (h + 1u) % 12u;
+            soc->gdma_rx_fifo_cnt[ch]--;
+            uint8_t *buf = esp32c6_dma_ptr(
+                soc, soc->gdma_rx_desc_buf[ch] +
+                         (soc->gdma_rx_desc_len[ch] -
+                          soc->gdma_rx_desc_left[ch]));
+            if (!buf) { /* buffer outside RAM: park the channel */
+                soc->gdma_rx_run[ch] = 0;
+                break;
+            }
+            memcpy(buf, &w, 4);
+            soc->gdma_rx_desc_left[ch] -= 4;
+        }
+        if (soc->gdma_rx_desc_left[ch] > 0)
+            continue;
+        /* descriptor complete: record the EOF and advance in the ring */
+        soc->gdma_in_eof_des_addr[ch] = soc->gdma_rx_desc_addr[ch];
+        soc->gdma_in_int_raw[ch] |= 1u << 1; /* IN_SUC_EOF */
+        if (soc->gdma_in_int_raw[ch] & soc->gdma_in_int_ena[ch]) {
+            soc->intc_status |= ((__uint128_t)1) << (C6_DMA_IN_CH0_INTR_SOURCE + ch);
+        }
+        if (!soc->gdma_rx_next_addr[ch]) {
+            soc->gdma_rx_run[ch] = 0; /* park after the last descriptor */
+        } else {
+            soc->gdma_rx_desc_addr[ch] = soc->gdma_rx_next_addr[ch];
+            esp32c6_gdma_load_rx_desc(soc, ch);
         }
     }
 
