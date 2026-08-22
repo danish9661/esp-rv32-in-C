@@ -190,6 +190,16 @@ struct esp32c6_soc {
     /* LP_TIMER (0x600B0C00): RTC slow-clock 64-bit main timer */
     uint64_t lp_timer;
 
+    /* LP_TIMER sleep-wait counter: advanced on each MAIN_TIMER_UPDATE pulse
+     * so the firmware's timer-wakeup busy-wait (counter >= target) exits. */
+    uint64_t lp_counter;
+    uint64_t lp_target;   /* armed sleep-timer target (LP_TIMER target[0]) */
+    uint8_t  lp_armed;    /* sleep timer enable latched */
+
+    /* PMU_INT_RAW (0x600B015C): SOC_WAKEUP_INT_RAW (bit 31) is set when the
+     * sleep timer fires so pmu_sleep_start's wakeup-wait loop exits. */
+    uint32_t pmu_int_raw;
+
     /* CLINT (0x20001800): free-running MTIME + MSIP/MTIMECMP */
     uint64_t clint_mtime;
     uint64_t clint_mtimcmp;
@@ -926,10 +936,6 @@ static void aes_block(const uint8_t *in, const uint8_t *key, int nk, int nr,
         aes_invsubbytes(w);
         aes_addroundkey(w, rk);
     }
-    if (nr == 10)
-        fprintf(stderr, "DBG_BLOCK nr=%d enc=%d w=%08x %08x %08x %08x rk10=%08x %08x %08x %08x\n",
-                nr, encrypt, w[0], w[1], w[2], w[3],
-                rk[40], rk[41], rk[42], rk[43]);
     for (int i = 0; i < 4; i++)
         out[4*i]=(w[i]>>24)&0xff, out[4*i+1]=(w[i]>>16)&0xff,
         out[4*i+2]=(w[i]>>8)&0xff, out[4*i+3]=w[i]&0xff;
@@ -937,6 +943,38 @@ static void aes_block(const uint8_t *in, const uint8_t *key, int nk, int nr,
 
 static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
 {
+    /* LP_TIMER (0x600B0C00): the firmware's light-sleep timer-wakeup path
+     * busy-waits on the free-running 64-bit counter (counter[0].lo @0x14,
+     * counter[0].hi @0x18). Advance the counter on each update pulse (see the
+     * write path) so the wait loop eventually sees counter >= target and
+     * exits the sleep. */
+    if (addr >= 0x600B0C00u && addr < 0x600B0D00u) {
+        uint32_t off = addr - 0x600B0C00u;
+        if (off == 0x14u) return (uint32_t)(soc->lp_counter & 0xffffffffu);
+        if (off == 0x18u) return (uint32_t)((soc->lp_counter >> 32) & 0xffffu);
+        return 0;
+    }
+
+    /* PMU_INT_RAW (0x600B015C): bit 31 = SOC_WAKEUP_INT_RAW, set when the
+     * sleep timer fires so pmu_sleep_start's wakeup-wait loop exits. The
+     * firmware polls this register in a tight loop while the (free-running)
+     * LP_TIMER counts up to the armed target; advance the timer on each poll
+     * and latch the wakeup bit once it expires. */
+    if (addr == 0x600B015Cu) {
+        if (soc->lp_armed) {
+            soc->lp_counter += 1000ull;
+            if (soc->lp_counter >= soc->lp_target)
+                soc->pmu_int_raw |= (1u << 31); /* SOC_WAKEUP_INT_RAW */
+        }
+        return soc->pmu_int_raw;
+    }
+
+    /* EFUSE_STATUS_REG (0x600B09D0): EFUSE_STATE (bits[3:0]) == 1 means the
+     * eFuse state machine is idle/ready. pmu_sleep_finish busy-waits on this;
+     * report ready so the wait completes. */
+    if (addr == 0x600B09D0u)
+        return 1;
+
     /* AES (0x60088000): plain storage except trigger/state, which the write
      * path maintains. */
     if (addr >= AES_BASE && addr < AES_BASE + 0x100u)
@@ -1425,9 +1463,6 @@ static void esp32c6_aes_run_dma(riscv_t *rv, int ch_out)
             if (!p) { in_len = 0; goto done; }
             in[i] = *p; in_off++; in_len--;
         }
-        fprintf(stderr, "DBG_AES_IN in=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                in[0],in[1],in[2],in[3],in[4],in[5],in[6],in[7],
-                in[8],in[9],in[10],in[11],in[12],in[13],in[14],in[15]);
         if (bm == 1) {
             for (int i = 0; i < 16; i++) blk[i] = in[i] ^ iv[i];
             aes_block(blk, key, nk, nr, encrypt, out);
@@ -1488,12 +1523,6 @@ done:
                 (soc->aes_reg[(AES_IV_OFF >> 2) + (i >> 2)] & ~(0xffu << (8 * (i & 3)))) |
                 ((uint32_t) iv[i] << (8 * (i & 3)));
 
-    fprintf(stderr, "DBG_AES_DMA ch_out=%d ch_in=%d mode=%d bm=%d key0=%08x out=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-            ch_out, ch_in, mode, bm,
-            (unsigned)(soc->aes_reg[0]),
-            final_out[0], final_out[1], final_out[2], final_out[3],
-            final_out[4], final_out[5], final_out[6], final_out[7]);
-
     /* Completion. The esp_aes driver busy-waits on the AES state register
      * (0x4C); set it to calculation_done (2) so its poll releases. The GDMA
      * EOF/SUC_EOF raw status bits and the AES accelerator interrupt
@@ -1515,22 +1544,10 @@ done:
             soc->intc_status |= ((__uint128_t)1) << (C6_DMA_IN_CH0_INTR_SOURCE + ch_in);
         soc->gdma_rx_run[ch_in] = 0;
     }
-    fprintf(stderr, "DBG_DMA_DONE out_ena=%u in_ena=%u map66=%u map69=%u\n",
-            (unsigned)soc->gdma_in_int_ena[0], (unsigned)soc->gdma_in_int_ena[0],
-            (unsigned)(soc->intc_intmap[66]&0x1fu), (unsigned)(soc->intc_intmap[69]&0x1fu));
     /* DMA-AES: state transitions busy(1) -> calculation_done(2). The esp_aes
      * driver busy-waits on this register, so set it to "done" (bit0=0 not
      * busy, bit1=1 done) to release the poll. */
     soc->aes_reg[AES_STATE_OFF >> 2] = 2;
-    fprintf(stderr, "DBG_STATE_SET aes_reg[0x13]=%u\n", (unsigned)soc->aes_reg[AES_STATE_OFF >> 2]);
-    {
-        int l66 = soc->intc_intmap[66] & 0x1Fu;
-        int l57 = soc->intc_intmap[57] & 0x1Fu;
-        fprintf(stderr, "DBG_INT line66=%d plic_en=%08x mie=%08x plic_thr=%u prio66=%u prio57=%u en66=%u en57=%u\n",
-                l66, (unsigned)soc->plic_enable, (unsigned)rv->csr_mie,
-                (unsigned)soc->plic_threshold, (unsigned)soc->plic_prio[l66], (unsigned)soc->plic_prio[l57],
-                (unsigned)((soc->plic_enable>>l66)&1), (unsigned)((soc->plic_enable>>l57)&1));
-    }
 }
 
 static void esp32c6_gpio_edge_check(esp32c6_t *soc, uint32_t *mmio32,
@@ -1540,8 +1557,41 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
 {
     esp32c6_t *soc = PRIV(rv)->esp32c6;
 
-    if (addr >= 0x60010000u && addr < 0x60010180u)
-        fprintf(stderr, "DBG_MTXW %08x<=%08x\n", addr, val);
+    /* LP_TIMER (0x600B0C00): the firmware arms a sleep timer by writing the
+     * target (target[0].lo @0x00, target[0].hi @0x04, enable in bit 31 of hi)
+     * and then busy-waits on the free-running counter (counter[0].lo @0x14,
+     * counter[0].hi @0x18). On each MAIN_TIMER_UPDATE pulse (bit 28) we
+     * advance the counter; once it reaches the target we latch the PMU
+     * SOC_WAKEUP_INT_RAW bit so pmu_sleep_start's wakeup-wait loop exits. */
+    if (addr >= 0x600B0C00u && addr < 0x600B0D00u) {
+        uint32_t off = addr - 0x600B0C00u;
+        if (off == 0x00u) {
+            soc->lp_target = (soc->lp_target & ~0xffffffffull) | (uint64_t)val;
+            return;
+        }
+        if (off == 0x04u) {
+            soc->lp_target = (soc->lp_target & 0xffffffffull) |
+                             (((uint64_t)(val & 0xffffu)) << 32);
+            if (val & (1u << 31)) {
+                soc->lp_armed = 1;
+                soc->lp_counter = 0; /* start a fresh countdown each arm */
+            }
+            return;
+        }
+        if (off == 0x10u) {
+            if (val & (1u << 28))
+                soc->lp_counter += 1000000ull;
+            return;
+        }
+        return;
+    }
+
+    /* PMU_INT_RAW (0x600B015C): R/WTC — writing 1 clears the corresponding
+     * raw bit (the firmware clears SOC_WAKEUP_INT_RAW after waking). */
+    if (addr == 0x600B015Cu) {
+        soc->pmu_int_raw &= ~val;
+        return;
+    }
 
     /* AES (0x60088000): most registers are plain storage; the trigger writes
      * the transform synchronously so the esp-idf driver (which busy-waits on
@@ -1852,10 +1902,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->intc_status &= ~(((__uint128_t)1) << C6_TG0_T0_INTR_SOURCE);
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
-            /* RTC slow-clock calibration (preserved from the pre-TIMG
-             * model): on START the hardware counts XTAL cycles over
-             * RTC_CALI_MAX cycles of the selected clock, then sets
-             * RTC_CALI_RDY and latches the count into RTCCALICFG1. */
+            /* RTC slow-clock calibration: on START the hardware counts the
+             * number of slow-clock cycles in a window of RTC_CALI_MAX periods
+             * of a reference clock (XTAL/128). It latches the count into the
+             * RTCCALI_VALUE field (bits[31:7]) of RTCCALICFG1 and sets
+             * RTC_CALI_RDY. The firmware reads the value back as (RTCCALICFG1
+             * >> 7). */
             r[o >> 2] = val;
             if (val & 0x80000000u) { /* TIMG_RTC_CALI_START */
                 uint32_t clk_hz, max = (val >> 16) & 0x7FFFu;
@@ -1864,8 +1916,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 case 1: clk_hz = 20000000u; break;  /* RC_FAST */
                 default: clk_hz = 32768u; break;    /* XTAL32K/RC32K/OSC_SLOW */
                 }
-                r[TIMG_RTCCALICFG1 >> 2] =
-                    (uint32_t) ((uint64_t) max * 40000000u / clk_hz);
+                /* count = max * slow_freq / (XTAL/128) */
+                uint32_t count = (uint32_t) ((uint64_t) max * clk_hz
+                                             * 128u / 40000000u);
+                r[TIMG_RTCCALICFG1 >> 2] = count << 7;
                 r[o >> 2] |= 0x8000u; /* TIMG_RTC_CALI_RDY */
             }
         } else if (o == TIMG_WDT_WPROTECT) {
@@ -2114,13 +2168,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     esp32c6_gdma_load_desc(soc, c);
                     soc->gdma_tx_run[c] = 1;
                     soc->gdma_tx_drain_cyc[c] = rv->csr_cycle + 256u;
-                    fprintf(stderr, "DBG gdma start ch%d link=%08x desc=%08x len=%u next=%08x buf=%08x run=%d\n",
-                            c, soc->gdma_out_link[c],
-                            soc->gdma_tx_desc_addr[c],
-                            soc->gdma_tx_desc_len[c],
-                            soc->gdma_tx_next_addr[c],
-                            soc->gdma_tx_desc_buf[c],
-                            soc->gdma_tx_run[c]);
                 } else if (val & (1u << 20)) { /* stop */
                     soc->gdma_tx_run[c] = 0;
                 } else if (val & (1u << 22)) { /* restart */
@@ -2150,8 +2197,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         uint32_t o = addr - C6_PERIPH_BASE - 0xC000u;
         if (o == 0x24u) {
             mmio32[off >> 2] = val & ~0x103u;
-            if (val & (1u << 2))
-                fprintf(stderr, "DBG i2s tx_start set\n");
         } else if (o == 0x20u) { /* RX_CONF */
             mmio32[off >> 2] = val & ~0x103u;
         } else if (o == 0x18u) { /* INT_CLR: W1C */
@@ -2375,8 +2420,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             } else if (cmd == 0x9Fu) {
                 /* RDID: JEDEC ID (Winbond W25Q32: 0xEF 0x40 0x16) */
                 w[0] = 0x1640EFu;
-            } else if (cmd == 0x03u || cmd == 0x0Bu || cmd == 0x3Bu ||
-                       cmd == 0x6Bu || cmd == 0xEBu) {
+             } else if (cmd == 0x03u || cmd == 0x0Bu || cmd == 0x3Bu ||
+                        cmd == 0x6Bu || cmd == 0xEBu) {
                 /* flash read commands: copy from flash image */
                 if (faddr < C6_FLASH_SIZE)
                     memcpy(w, fi->data + faddr, nbytes);
@@ -2436,7 +2481,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
     if (addr >= C6_PERIPH_BASE + 0x10000u &&
         addr < C6_PERIPH_BASE + 0x10000u + 96 * 4u) {
         uint32_t s = (addr - C6_PERIPH_BASE - 0x10000u) >> 2;
-        fprintf(stderr, "DBG_MTX s=%u val=%u\n", s, (unsigned)(val & 0x1Fu));
         soc->intc_intmap[s] = val & 0x1Fu;
         return;
     }
@@ -2857,19 +2901,9 @@ void esp32c6_check_interrupt(riscv_t *rv)
     if ((soc->intc_status >> 69) & 1ull)
         dbg_69_at_check++;
     if (pending) {
-        static unsigned _c;
-        if ((_c++ % 20000) == 0) {
-            uint64_t lo = (uint64_t)(soc->intc_status & ~(__uint128_t)0);
-            uint64_t hi = (uint64_t)((soc->intc_status >> 64) & ~(__uint128_t)0);
-            fprintf(stderr, "DBG_PEND mie=%08x lines=%08x lo=%016llx hi=%016llx\n",
-                    (unsigned)rv->csr_mie, (unsigned)lines, (unsigned long long)lo, (unsigned long long)hi);
-        }
         dbg_trap_deliv++;
     }
     if (!pending) {
-        static unsigned _pc_c;
-        if ((_pc_c++ % 100000) == 0)
-            fprintf(stderr, "DBG_PC pc=%08x mstatus=%08x\n", (unsigned)rv_get_pc(rv), (unsigned)rv->csr_mstatus);
         return;
     }
     /* lowest set bit = CPU interrupt number */
@@ -3362,24 +3396,9 @@ void esp32c6_periodic(riscv_t *rv)
                 memcpy(d, &dw0, 4);
             }
         }
-        uint32_t raw_before = soc->gdma_out_int_raw[ch];
         soc->gdma_out_int_raw[ch] |= 1u << 1; /* TX_EOF */
         if (soc->gdma_out_int_raw[ch] & soc->gdma_out_int_ena[ch]) {
             soc->intc_status |= ((__uint128_t)1) << (C6_DMA_OUT_CH0_INTR_SOURCE + ch);
-            int dbgl = soc->intc_intmap[69] & 0x1Fu;
-            fprintf(stderr, "DBG gdma EOF ch%d raw_before=%x raw=%x ena=%x eof_desc=%08x next=%08x intmap=%u line=%u plic_en=%x plic_prio=%u thr=%u mie=%08x mstatus=%08x priv=%u pc=%08x mmu=%x,%x,%x,%x win=%08x 69at=%u trapdeliv=%u intrwr=%u intrwrclr=%u\n",
-                    ch, raw_before, soc->gdma_out_int_raw[ch],
-                    soc->gdma_out_int_ena[ch],
-                    soc->gdma_out_eof_des_addr[ch],
-                    soc->gdma_tx_next_addr[ch],
-                    soc->intc_intmap[69], dbgl,
-                    soc->plic_enable, soc->plic_prio[dbgl],
-                    soc->plic_threshold, rv->csr_mie, rv->csr_mstatus,
-                    rv->priv_mode, rv->PC,
-                    soc->mmu[0] & 0x1FFu, soc->mmu[1] & 0x1FFu,
-                    soc->mmu[2] & 0x1FFu, soc->mmu[3] & 0x1FFu,
-                    esp32_flash_window_off(soc, rv->PC),
-                     dbg_69_at_check, dbg_trap_deliv, dbg_gdma_intrwr, dbg_gdma_intrwr_clear);
         }
         if (!soc->gdma_tx_next_addr[ch]) {
             soc->gdma_tx_run[ch] = 0; /* park after the last descriptor */

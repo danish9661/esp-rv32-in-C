@@ -1440,7 +1440,6 @@ retranslate:
     rv_insn_t *prev_ir = NULL;
     rv_insn_t *ir = mpool_calloc(rv->block_ir_mp);
     if (unlikely(!ir)) {
-        fprintf(stderr, "DBG: block_translate ir alloc failed pc=%08x\n", rv->PC);
         return false;
     }
     block->ir_head = ir;
@@ -1452,11 +1451,6 @@ retranslate:
 
         /* fetch the next instruction */
         uint32_t insn = rv->io.mem_ifetch(rv, block->pc_end);
-
-        if (unlikely(!insn)) {
-            fprintf(stderr, "DBG: block_translate ifetch 0 at pc_end=0x%08x\n",
-                    block->pc_end);
-        }
 
 #if RV32_HAS(SYSTEM)
         if (!insn && need_retranslate) {
@@ -2775,9 +2769,34 @@ static void __trap_handler(riscv_t *rv)
  */
 static void _trap_handler(riscv_t *rv)
 {
-    if (rv->csr_mcause == 2)
-        fprintf(stderr, "DBG illegal-insn pc=%08x mepc=%08x mtval=%08x\n",
-                rv->PC, rv->csr_mepc, rv->csr_mtval);
+    if (rv->csr_mcause == 2 && rv->csr_mepc == 0x408070acu) {
+            static int g_pandump = 0;
+            if (!g_pandump) {
+                g_pandump = 1;
+                uint32_t sp = rv->X[2];
+                uint32_t ra = rv->X[1];
+                uint32_t detptr = rv->io.mem_read_w(rv, 0x40811824u);
+                uint32_t panflag = rv->io.mem_read_w(rv, 0x40811828u);
+                fprintf(stderr,
+                        "PANIC_ABORT ra=%08x sp=%08x detptr=%08x panflag=%08x\n",
+                        ra, sp, detptr, panflag);
+                /* details is a C string; print up to 200 bytes */
+                if (detptr >= 0x40800000u && detptr < 0x40900000u) {
+                    for (int i = 0; i < 200; i++) {
+                        uint8_t c = (uint8_t) rv->io.mem_read_b(rv, detptr + (uint32_t)i);
+                        if (c == 0)
+                            break;
+                        fputc(c, stderr);
+                    }
+                    fputc('\n', stderr);
+                }
+                for (int i = 0; i < 24; i++) {
+                    uint32_t w = rv->io.mem_read_w(rv, sp + (uint32_t)i * 4u);
+                    fprintf(stderr, "  stack[%2d] +%03x = %08x\n", i,
+                            i * 4, w);
+                }
+            }
+        }
     /* m/stvec (Machine/Supervisor Trap-Vector Base Address Register)
      * m/stvec[MXLEN-1:2]: vector base address
      * m/stvec[1:0] : vector mode
