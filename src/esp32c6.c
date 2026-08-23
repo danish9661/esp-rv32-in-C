@@ -1175,8 +1175,9 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     if (addr >= C6_PERIPH_BASE + 0x14000u &&
         addr < C6_PERIPH_BASE + 0x14130u) {
         uint32_t o = off - 0x14000u;
-        if ((o & 0xFu) == 0x0u && o <= 0x30u) { /* timer_status: live */
-            int t = o >> 4;
+        if ((o & 0xFu) == 0x0u && o >= 0x10u && o <= 0x30u) {
+            /* timer_status: live counter value (timer t = offset/16 - 1) */
+            int t = (o >> 4) - 1;
             return ((uint32_t) soc->mcpwm_dir[t] << 16) |
                    soc->mcpwm_phase[t];
         }
@@ -2278,10 +2279,15 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             } else if (cmd <= 4u) { /* START_NO_STOP / _STOP_EMPTY / _STOP_FULL */
                 soc->mcpwm_running[t] = 1;
                 soc->mcpwm_stopat[t] = (cmd == 3u) ? 1 : (cmd == 4u) ? 2 : 0;
+                /* start the counter cleanly from the configured phase */
+                soc->mcpwm_anchor[t] = rv->csr_cycle;
+                soc->mcpwm_frac[t] = 0;
+                soc->mcpwm_phase[t] = 0;
             }
             return;
         }
-        if ((o & 0xFu) == 0x0u && o <= 0x30u) /* timer_status: RO */
+        /* timer_status registers (0x10/0x20/0x30) are read-only */
+        if ((o & 0xFu) == 0x0u && o >= 0x10u && o <= 0x30u)
             return;
         soc->mcpwm_reg[o >> 2] = val;
         return;
