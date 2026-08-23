@@ -941,6 +941,27 @@ static void aes_block(const uint8_t *in, const uint8_t *key, int nk, int nr,
         out[4*i+2]=(w[i]>>8)&0xff, out[4*i+3]=w[i]&0xff;
 }
 
+/* Effective pad output for output-enabled pins: when the GPIO matrix routes a
+ * peripheral signal (OUT_SEL set in FUNCn_OUT_SEL_CFG), the level is the one the
+ * peripheral model already maintains in gpio_in; otherwise it is the GPIO
+ * output register. This lets digitalRead() on a peripheral-driven pin (e.g. an
+ * LEDC PWM output) report the live peripheral level instead of the static
+ * gpio_out value. */
+static uint32_t esp32c6_gpio_eff_out(esp32c6_t *soc, uint32_t *mmio32)
+{
+    uint32_t out = 0;
+    for (int p = 0; p < 30; p++) {
+        if (!(soc->gpio_enable & (1u << p)))
+            continue;
+        uint32_t sel = mmio32[(0x91554u + 4u * p) >> 2];
+        if (sel & 0x100u)            /* peripheral signal drives the pad */
+            out |= (soc->gpio_in & (1u << p));
+        else
+            out |= (soc->gpio_out & (1u << p));
+    }
+    return out;
+}
+
 static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
 {
     /* LP_TIMER (0x600B0C00): the firmware's light-sleep timer-wakeup path
@@ -1314,7 +1335,7 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
         case GPIO_ENABLE_REG:
             return soc->gpio_enable;
         case GPIO_IN_REG:
-            return soc->gpio_in | (soc->gpio_out & soc->gpio_enable);
+            return soc->gpio_in | esp32c6_gpio_eff_out(soc, mmio32);
         case GPIO_STATUS_REG:
             return soc->gpio_status;
         case GPIO_PCPU_INT_REG:
@@ -2473,7 +2494,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         /* a firmware GPIO write may toggle an output pin; its own pad input
          * tracks the output, so detect edges on the live input here. */
         esp32c6_gpio_edge_check(soc, mmio32,
-            soc->gpio_in | (soc->gpio_out & soc->gpio_enable));
+            soc->gpio_in | esp32c6_gpio_eff_out(soc, mmio32));
         if (esp32c6_gpio_output) {
             for (int pin = 0; pin < 30; pin++) {
                 if (soc->gpio_enable & (1u << pin))
@@ -3547,7 +3568,7 @@ void esp32c6_periodic(riscv_t *rv)
                 uint64_t ticks = soc->ledc_timer_frac[t] / f;
                 uint32_t pos = (uint32_t)(ticks % period);
                 uint32_t hpoint = soc->ledc_reg[LEDC_CH_HPOINT(c) >> 2] &
-                                  0xFFFFFu;
+                                   0xFFFFFu;
                 uint32_t duty = (soc->ledc_duty_r[c] & 0x1FFFFFFu) >> 4u;
                 level = ((pos + period - hpoint) % period) < duty;
             }
