@@ -3055,6 +3055,58 @@ static void esp32c6_gpio_edge_check(esp32c6_t *soc, uint32_t *mmio32,
             soc->gpio_status |= 1u << pin;
             soc->intc_status |= ((__uint128_t)1) << C6_GPIO_INTR_SOURCE;
         }
+        /* PCNT: any edge on a pin that the GPIO matrix routes to a PCNT
+         * unit/channel is counted here. Matrix input select for signal s
+         * lives at 0x60091000 + 0x154 + 4*s; its low 6 bits are the source
+         * GPIO. ESP32-C6 PCNT signal indices are unit u channel ch ->
+         * 101 + 4*ch + u (CH0_IN0=101, CH0_IN1=105, CH1_IN0=102, ...). */
+        if (level != prev) {
+            for (int u = 0; u < 4; u++) {
+                if (soc->pcnt_reg[0x60 >> 2] & (1u << (2 * u + 1)))
+                    continue; /* counter paused */
+                uint32_t conf0 = soc->pcnt_reg[(0x0c * u) >> 2];
+                uint32_t conf1 = soc->pcnt_reg[(0x04 + 0x0c * u) >> 2];
+                uint32_t conf2 = soc->pcnt_reg[(0x08 + 0x0c * u) >> 2];
+                for (int ch = 0; ch < 2; ch++) {
+                    uint32_t sig = 101u + 4u * ch + u;
+                    uint32_t insel =
+                        mmio32[(0x91000u + 0x154u + 4u * sig) >> 2];
+                    if ((insel & 0x3Fu) != (uint32_t) pin)
+                        continue;
+                    int act = level
+                        ? (ch ? (conf0 >> 26) & 0x3u : (conf0 >> 18) & 0x3u)
+                        : (ch ? (conf0 >> 24) & 0x3u : (conf0 >> 16) & 0x3u);
+                    int16_t cnt = (int16_t) soc->pcnt_reg[(0x30u + 4u * u) >> 2];
+                    if (act == 1u)
+                        cnt++;
+                    else if (act == 2u)
+                        cnt--;
+                    soc->pcnt_reg[(0x30u + 4u * u) >> 2] = (uint16_t) cnt;
+                    uint32_t status = 0;
+                    if ((conf0 >> 15) & 1u && /* thr_thres1_en */
+                        cnt == (int16_t) (conf1 >> 16))
+                        status |= 1u << 2;
+                    if ((conf0 >> 14) & 1u && /* thr_thres0_en */
+                        cnt == (int16_t) (conf1 & 0xFFFFu))
+                        status |= 1u << 3;
+                    if ((conf0 >> 13) & 1u && /* thr_l_lim_en */
+                        cnt == (int16_t) (conf2 >> 16))
+                        status |= 1u << 4;
+                    if ((conf0 >> 12) & 1u && /* thr_h_lim_en */
+                        cnt == (int16_t) (conf2 & 0xFFFFu))
+                        status |= 1u << 5;
+                    if ((conf0 >> 11) & 1u && cnt == 0) /* thr_zero_en */
+                        status |= 1u << 6;
+                    soc->pcnt_reg[(0x50 + 4 * u) >> 2] = status;
+                    if (status) {
+                        soc->pcnt_reg[0x40 >> 2] |= 1u << u;
+                        if (soc->pcnt_reg[0x40 >> 2] &
+                            soc->pcnt_reg[0x48 >> 2])
+                            soc->intc_status |= ((__uint128_t)1) << C6_PCNT_INTR_SOURCE;
+                    }
+                }
+            }
+        }
     }
     soc->gpio_in_prev = new_live;
 }
@@ -3080,56 +3132,6 @@ void esp32c6_periodic(riscv_t *rv)
                 soc->gpio_in = new_levels;
                 esp32c6_gpio_edge_check(soc, mmio32,
                     new_levels | (soc->gpio_out & soc->gpio_enable));
-                /* PCNT: feed the edge to any unit/channel wired to this pin
-                 * via the GPIO matrix input select: FUNC<signal>_IN_SEL
-                 * (0x60091000 + 0x154 + 4*signal) selects which GPIO feeds
-                 * that signal (field sig_in_sel = pin number). Signal for
-                 * unit u channel ch = 101 + 4u + ch. */
-                for (int u = 0; u < 4; u++) {
-                    if (soc->pcnt_reg[0x60 >> 2] & (1u << (2 * u + 1)))
-                        continue; /* counter paused */
-                    uint32_t conf0 = soc->pcnt_reg[(0x0c * u) >> 2];
-                    uint32_t conf1 = soc->pcnt_reg[(0x04 + 0x0c * u) >> 2];
-                    uint32_t conf2 = soc->pcnt_reg[(0x08 + 0x0c * u) >> 2];
-                    for (int ch = 0; ch < 2; ch++) {
-                        uint32_t sig = 101u + 4u * u + ch;
-                        uint32_t insel =
-                            mmio32[(0x91000u + 0x154u + 4u * sig) >> 2];
-                        if ((insel & 0x3Fu) != 7u)
-                            continue;
-                        int act = phase
-                            ? (ch ? (conf0 >> 26) & 0x3u : (conf0 >> 18) & 0x3u)
-                            : (ch ? (conf0 >> 24) & 0x3u : (conf0 >> 16) & 0x3u);
-                        int16_t cnt = (int16_t) soc->pcnt_reg[(0x30u + 4u * u) >> 2];
-                        if (act == 1u)
-                            cnt++;
-                        else if (act == 2u)
-                            cnt--;
-                        soc->pcnt_reg[(0x30u + 4u * u) >> 2] = (uint16_t) cnt;
-                        uint32_t status = 0;
-                        if ((conf0 >> 15) & 1u && /* thr_thres1_en */
-                            cnt == (int16_t) (conf1 >> 16))
-                            status |= 1u << 2;
-                        if ((conf0 >> 14) & 1u && /* thr_thres0_en */
-                            cnt == (int16_t) (conf1 & 0xFFFFu))
-                            status |= 1u << 3;
-                        if ((conf0 >> 13) & 1u && /* thr_l_lim_en */
-                            cnt == (int16_t) (conf2 >> 16))
-                            status |= 1u << 4;
-                        if ((conf0 >> 12) & 1u && /* thr_h_lim_en */
-                            cnt == (int16_t) (conf2 & 0xFFFFu))
-                            status |= 1u << 5;
-                        if ((conf0 >> 11) & 1u && cnt == 0) /* thr_zero_en */
-                            status |= 1u << 6;
-                        soc->pcnt_reg[(0x50 + 4 * u) >> 2] = status;
-                        if (status) {
-                            soc->pcnt_reg[0x40 >> 2] |= 1u << u;
-                            if (soc->pcnt_reg[0x40 >> 2] &
-                                soc->pcnt_reg[0x48 >> 2])
-                                soc->intc_status |= ((__uint128_t)1) << C6_PCNT_INTR_SOURCE;
-                        }
-                    }
-                }
             }
         }
         /* level-triggered pins: re-assert while the level matches */
