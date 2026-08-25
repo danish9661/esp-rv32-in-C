@@ -22,6 +22,12 @@
 #if RV32_HAS(ESP32_C6)
 #include "esp32c6.h"
 #endif
+#if RV32_HAS(ESP32_H2)
+#include "esp32h2.h"
+#endif
+#if RV32_HAS(ESP32_P4)
+#include "esp32p4.h"
+#endif
 
 #include "elf.h"
 #include "io.h"
@@ -231,13 +237,13 @@ static bool parse_args(int argc, char **args)
         case 'p':
             opt_prof_data = true;
             break;
-#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
+#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6) || RV32_HAS(ESP32_H2) || RV32_HAS(ESP32_P4)
         case 'C':
             opt_esp32_chip = optarg;
             emu_argc++;
             break;
 #endif
-#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
+#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6) || RV32_HAS(ESP32_H2) || RV32_HAS(ESP32_P4)
         case 'F':
 #if RV32_HAS(ESP32_C3)
             esp32c3_flash_image_path = optarg;
@@ -245,10 +251,22 @@ static bool parse_args(int argc, char **args)
 #if RV32_HAS(ESP32_C6)
             esp32c6_flash_image_path = optarg;
 #endif
+#if RV32_HAS(ESP32_H2)
+            esp32h2_flash_image_path = optarg;
+#endif
+#if RV32_HAS(ESP32_P4)
+            esp32p4_flash_image_path = optarg;
+#endif
             break;
         case 'U':
 #if RV32_HAS(ESP32_C6)
             esp32c6_uart_rx_path = optarg;
+#endif
+#if RV32_HAS(ESP32_H2)
+            esp32h2_uart_rx_path = optarg;
+#endif
+#if RV32_HAS(ESP32_P4)
+            esp32p4_uart_rx_path = optarg;
 #endif
             break;
 #endif
@@ -425,13 +443,29 @@ int main(int argc, char **args)
         .fd_stdout = STDOUT_FILENO,
         .fd_stderr = STDERR_FILENO,
     };
-#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
+#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6) || RV32_HAS(ESP32_H2) || RV32_HAS(ESP32_P4)
     if (opt_esp32_chip) {
+#if RV32_HAS(ESP32_C3)
         if (strcmp(opt_esp32_chip, "esp32c3") == 0) {
             attr.esp32c3 = esp32c3_new();
-        } else if (strcmp(opt_esp32_chip, "esp32c6") == 0) {
+        } else
+#endif
+#if RV32_HAS(ESP32_C6)
+        if (strcmp(opt_esp32_chip, "esp32c6") == 0) {
             attr.esp32c6 = esp32c6_new();
-        } else {
+        } else
+#endif
+#if RV32_HAS(ESP32_H2)
+        if (strcmp(opt_esp32_chip, "esp32h2") == 0) {
+            attr.esp32h2 = esp32h2_new();
+        } else
+#endif
+#if RV32_HAS(ESP32_P4)
+        if (strcmp(opt_esp32_chip, "esp32p4") == 0) {
+            attr.esp32p4 = esp32p4_new();
+        } else
+#endif
+        {
             rv_log_fatal("Unsupported chip: %s", opt_esp32_chip);
             return 1;
         }

@@ -38,6 +38,9 @@
 #if RV32_HAS(ESP32_C6)
 #include "esp32c6.h"
 #endif
+#if RV32_HAS(ESP32_H2)
+#include "esp32h2.h"
+#endif
 #include "mpool.h"
 #include "riscv.h"
 #include "riscv_private.h"
@@ -681,7 +684,10 @@ riscv_t *rv_create(riscv_user_t rv_attr)
 #endif
     #if RV32_HAS(ESP32_C6)
     if (!attr->esp32c6) {
-#endif
+    #endif
+    #if RV32_HAS(ESP32_H2)
+    if (!attr->esp32h2) {
+    #endif
     elf_t *elf = elf_new();
     assert(elf);
 
@@ -720,6 +726,9 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     assert(rv_set_pc(rv, hdr->e_entry));
 
     elf_delete(elf);
+#if RV32_HAS(ESP32_H2)
+    }
+#endif
 #if RV32_HAS(ESP32_C3)
     }
 #endif
@@ -1013,7 +1022,17 @@ riscv_t *rv_create(riscv_user_t rv_attr)
         esp32c6_install_io(rv);
         return rv;
     }
-#endif /* RV32_HAS(ESP32_C6) */
+    #endif /* RV32_HAS(ESP32_C6) */
+
+    #if RV32_HAS(ESP32_H2)
+    if (attr->esp32h2) {
+        /* ESP32-H2 machine: shares the C6-class peripheral IP. */
+        rv->PC = esp32h2_boot(attr->esp32h2, attr->data.user.elf_program);
+        PRIV(rv)->allow_misalign = true;
+        esp32h2_install_io(rv);
+        return rv;
+    }
+    #endif /* RV32_HAS(ESP32_H2) */
 
     return rv;
 
@@ -1109,8 +1128,21 @@ void rv_run(riscv_t *rv)
     assert(attr &&
 #if RV32_HAS(SYSTEM_MMIO)
            attr->data.system.kernel && attr->data.system.initrd
-#elif RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
-           (attr->esp32c3 || attr->esp32c6 || attr->data.user.elf_program)
+#elif RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6) || RV32_HAS(ESP32_H2) || RV32_HAS(ESP32_P4)
+           (
+#if RV32_HAS(ESP32_C3)
+               attr->esp32c3 ||
+#endif
+#if RV32_HAS(ESP32_C6)
+               attr->esp32c6 ||
+#endif
+#if RV32_HAS(ESP32_H2)
+               attr->esp32h2 ||
+#endif
+#if RV32_HAS(ESP32_P4)
+               attr->esp32p4 ||
+#endif
+               attr->data.user.elf_program)
 #else
            attr->data.user.elf_program
 #endif
@@ -1391,6 +1423,13 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
         rv->X[rv_reg_sp] = C6_SRAM_BASE + C6_SRAM_SIZE;
     }
 #endif /* RV32_HAS(ESP32_C6) */
+#if RV32_HAS(ESP32_H2)
+    if (attr->esp32h2) {
+        /* ESP32-H2 bare-metal firmware runs in M-mode; the ROM reset vector
+         * sets up the stack, so only the privilege mode needs overriding. */
+        rv->priv_mode = RV_PRIV_M_MODE;
+    }
+#endif /* RV32_HAS(ESP32_H2) */
 #else
     /* ISA simulation defaults to M-mode */
     rv->priv_mode = RV_PRIV_M_MODE;

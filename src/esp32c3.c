@@ -214,6 +214,13 @@ struct esp32c3_soc {
     /* flash cache MMU page table (128 x 64KB pages), programmed by the
      * bootloader's esp_rom_spiflash_mmap at 0x18031400 + 4*idx */
     uint32_t mmu[128];
+
+    /* RMT: emulate enough of the TX path that the legacy rmtInit/rmtWrite
+     * API (used by the Arduino RGB-LED helper for LED_BUILTIN=30) completes.
+     * When a channel's CONF0 tx_start is set we schedule a TX_DONE a few
+     * cycles later; the firmware's RMT ISR then posts the transaction and
+     * unblocks the caller's event-group wait. */
+    uint64_t rmt_tx_done_cycle;
 };
 
 void (*esp32c3_uart_output)(char c) = NULL;
@@ -386,6 +393,12 @@ static void esp32_uart_putc(esp32c3_t *soc, char c)
 #define SYSTIMER_T0_SOURCE 37u
 #define SYSTIMER_T2_SOURCE 39u
 
+/* RMT (LEDC-less RGB LED uses it on C3): base offset from C3_PERIPH_BASE.
+ * DR_REG_RMT_BASE = 0x60016000; the driver's IRQ comes from
+ * rmt_periph_signals[0].irq = 28 (NOT the ETS_RMT_INTR_SOURCE enum value). */
+#define C3_RMT_BASE 0x16000u
+#define C3_RMT_INTR_SOURCE 28u
+
 /* ------------------------------------------------------------------ */
 /* INTC (0x600C2000)                                                   */
 /* ------------------------------------------------------------------ */
@@ -487,6 +500,15 @@ have_seen:
         if (addr == C3_PERIPH_BASE + 0x8850u)
             /* EFUSE_RD_MAC_SPI_SYS_0: chip ID 5 in bits [26:24] and [20:18] */
             return (0x5u << 24) | (0x5u << 18);
+        return mmio32[off >> 2];
+    }
+    /* RMT (0x60016000) */
+    if (addr >= C3_PERIPH_BASE + C3_RMT_BASE &&
+        addr < C3_PERIPH_BASE + C3_RMT_BASE + 0x1000u) {
+        uint32_t roff = addr - (C3_PERIPH_BASE + C3_RMT_BASE);
+        if (roff == 0x3Cu) /* INT_ST = INT_RAW & INT_ENA */
+            return mmio32[(C3_RMT_BASE + 0x38u) >> 2] &
+                   mmio32[(C3_RMT_BASE + 0x40u) >> 2];
         return mmio32[off >> 2];
     }
     /* TIMG0/TIMG1/SYSTIMER (0x1F000-0x24000) */
@@ -697,6 +719,30 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
     /* RTC_CNTL / IO_MUX / eFuse / RTC_I2C */
     if (addr < C3_PERIPH_BASE + 0xF000u) {
         mmio32[off >> 2] = val;
+        return;
+    }
+    /* RMT (0x60016000) */
+    if (addr >= C3_PERIPH_BASE + C3_RMT_BASE &&
+        addr < C3_PERIPH_BASE + C3_RMT_BASE + 0x1000u) {
+        uint32_t roff = addr - (C3_PERIPH_BASE + C3_RMT_BASE);
+        mmio32[off >> 2] = val;
+        switch (roff) {
+        case 0x10u: /* CH0 CONF0 */
+        case 0x14u: /* CH1 CONF0 */
+        case 0x18u: /* CH2 CONF0 */
+        case 0x20u: /* CH3 CONF0 */
+            if (val & 0x1u) { /* tx_start (channel mem write begins) */
+                mmio32[(C3_RMT_BASE + 0x38u) >> 2] &= ~0x1u; /* clear TX_DONE */
+                soc->rmt_tx_done_cycle = rv->csr_cycle + 2048u;
+            }
+            break;
+        case 0x44u: /* INT_CLR */
+            mmio32[(C3_RMT_BASE + 0x38u) >> 2] &= ~val;
+            soc->intc_status &= ~(1ULL << C3_RMT_INTR_SOURCE);
+            break;
+        default:
+            break;
+        }
         return;
     }
     /* TIMG0/TIMG1/SYSTIMER (0x1F000-0x24000) */
@@ -1431,5 +1477,15 @@ void esp32c3_periodic(riscv_t *rv)
                 soc->intc_status |= 1ull << SYSTIMER_T2_SOURCE;
             }
         }
+    }
+
+    /* RMT TX_DONE: a few cycles after a channel's CONF0 tx_start was seen,
+     * raise the RMT interrupt so the firmware's RMT ISR can post the
+     * transaction and unblock the caller's event-group wait. */
+    if (soc->rmt_tx_done_cycle && rv->csr_cycle >= soc->rmt_tx_done_cycle) {
+        uint32_t *mmio32 = (uint32_t *) soc->mmio;
+        soc->rmt_tx_done_cycle = 0;
+        mmio32[(C3_RMT_BASE + 0x38u) >> 2] |= 0x1u; /* INT_RAW TX_DONE (CH0) */
+        soc->intc_status |= 1ULL << C3_RMT_INTR_SOURCE;
     }
 }

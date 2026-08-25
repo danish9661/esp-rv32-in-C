@@ -300,6 +300,23 @@ config ESP32_C6
       M-mode with UART0, SYSTIMER, interrupt matrix + PLIC/CLINT, GPIO,
       eFuse and stub peripheral banks. Select at runtime with -C esp32c6.
 
+config ESP32_H2
+    bool "ESP32-H2 SoC support"
+    default n
+    depends on SYSTEM && ELF_LOADER
+    help
+      Enable the ESP32-H2 SoC model. Shares the C6-class peripheral IP
+      (UART, I2C, SPI, RMT, LEDC, MCPWM, PCNT, TIMG, ADC, GPIO, I2S, GDMA)
+      at the H2 memory map. Select at runtime with -C esp32h2.
+
+config ESP32_P4
+    bool "ESP32-P4 SoC support"
+    default n
+    depends on SYSTEM && ELF_LOADER
+    help
+      Enable the ESP32-P4 SoC model (dual-core, no wireless). Select at
+      runtime with -C esp32p4.
+
 endmenu
 
 # Performance Optimizations
