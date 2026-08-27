@@ -1933,22 +1933,6 @@ void esp32c3_check_interrupt(riscv_t *rv)
     /* lowest set bit = CPU interrupt number */
     int idx = __builtin_ctz(pending);
     soc->intc_eip |= 1u << idx; /* claim the line (blocks re-delivery) */
-    static unsigned long itr_count;
-    if ((itr_count++ & 0x3FFu) == 0) {
-        uint64_t ps = soc->intc_status;
-        fprintf(stderr, "DBG: int-trap idx=%d mstatus=%08x mie=%08x mip=%08x intc_status=%08llx eip=%08x mepc_target=%08x\n",
-                idx, rv->csr_mstatus, rv->csr_mie, rv->csr_mip,
-                (unsigned long long) ps, soc->intc_eip, rv->PC);
-        fprintf(stderr, "DBG:   t0conf=%08x comp0=%016llx cnt0=%016llx t0x=%llu t2conf=%08x comp2=%016llx cnt2=%016llx t2x=%llu\n",
-                soc->systimer_target0_conf, (unsigned long long)soc->systimer_comp0,
-                (unsigned long long)soc->systimer_counter, (unsigned long long)soc->systimer_t0_crossed,
-                soc->systimer_target2_conf, (unsigned long long)soc->systimer_comp2,
-                (unsigned long long)soc->systimer_unit1_counter, (unsigned long long)soc->systimer_t2_crossed);
-        for (int s = 0; s < 52; s++)
-            if (ps & (1ULL << s))
-                fprintf(stderr, "DBG:   pending src=%d -> line=%d\n", s,
-                        (int)(soc->intc_intmap[s] & 0x1Fu));
-    }
     SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ((1u << 31) | idx), 0);
 }
 
