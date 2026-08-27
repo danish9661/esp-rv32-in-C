@@ -244,6 +244,13 @@ struct esp32c3_soc {
     uint8_t spi2_jedec;       /* mid JEDEC read cursor */
     uint8_t spi2_dev_mem[16]; /* virtual SRAM device (JEDEC 0xEF4015) */
 
+    /* TWAI0 (CAN, 0x6002B000): register bank + a virtual bus node */
+    uint32_t twai_reg[64];    /* 0x100 bytes, mirrors twai_dev_t */
+    int twai_tx_pending;       /* a cmd.tx_request was written */
+    uint64_t twai_tx_done_cycle; /* cycle at which the TX completes */
+    uint64_t twai_rx_deliver_cycle; /* cycle at which the virtual node frame arrives */
+    int twai_rx_delivered;     /* RX delivery is one-shot */
+
     /* misc logged-MMIO bookkeeping */
     uint32_t logged_unknown;
 
@@ -314,6 +321,12 @@ esp32c3_t *esp32c3_new(void)
     soc->spi2_jedec = 0;
     for (int i = 0; i < 16; i++)
         soc->spi2_dev_mem[i] = 0xA0 + i;
+    /* TWAI0: bus starts in reset mode (mode[0]=1) */
+    soc->twai_reg[0] = 1u;
+    soc->twai_rx_delivered = 0;
+    soc->twai_tx_pending = 0;
+    soc->twai_tx_done_cycle = 0;
+    soc->twai_rx_deliver_cycle = 0;
 
     /* flash backing shared by i-cache and d-cache windows */
     uint8_t *flash = calloc(1, C3_FLASH_SIZE);
@@ -406,6 +419,17 @@ esp32c3_t *esp32c3_new(void)
 #define C3_DMA_CH0_INTR_SOURCE 44u
 #define C3_DMA_CH1_INTR_SOURCE 45u
 #define C3_DMA_CH2_INTR_SOURCE 46u
+/* TWAI0 (CAN) register bits */
+#define TWAI0_CMD_TX_REQUEST 0x1u
+#define TWAI0_CMD_RELEASE_BUFFER 0x4u
+#define TWAI0_CMD_CLEAR_DOVERRUN 0x8u
+#define TWAI0_STATUS_RBS 0x1u
+#define TWAI0_STATUS_DOS 0x2u
+#define TWAI0_STATUS_TBS 0x4u
+#define TWAI0_STATUS_TCS 0x8u
+#define TWAI0_STATUS_RS 0x10u
+#define TWAI0_INTR_TI 0x2u
+#define TWAI0_INTR_RI 0x1u
 /* Virtual I2C device: 16-byte EEPROM with a known pattern */
 #define C3_I2C_DEV_ADDR 0x50u
 
@@ -580,6 +604,29 @@ have_seen:
             return soc->spi2_reg[0x3c >> 2] &
                    soc->spi2_reg[0x38u >> 2];
         return *r;
+    }
+    /* TWAI0 (CAN, 0x6002B000-0x6002B100) */
+    if (addr >= C3_PERIPH_BASE + 0x2B000u &&
+        addr < C3_PERIPH_BASE + 0x2B100u) {
+        uint32_t off = addr - C3_PERIPH_BASE - 0x2B000u;
+        if (off == 0x08u) { /* status: TBS + TCS + RBS + RS(=reset mode) */
+            uint32_t v = TWAI0_STATUS_TBS |
+                         ((soc->twai_reg[0] & 1u) ? TWAI0_STATUS_RS : 0u);
+            v |= soc->twai_reg[0x08 >> 2] &
+                 (TWAI0_STATUS_RBS | TWAI0_STATUS_TCS);
+            return v;
+        }
+        if (off == 0x0Cu) { /* interrupt: read-to-clear, RI is a level */
+            uint32_t v = soc->twai_reg[0x0c >> 2];
+            soc->twai_reg[0x0c >> 2] = 0;
+            if ((soc->twai_reg[0x08 >> 2] & TWAI0_STATUS_RBS) &&
+                (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI))
+                soc->twai_reg[0x0c >> 2] = TWAI0_INTR_RI;
+            if (!soc->twai_reg[0x0c >> 2])
+                soc->intc_status &= ~((uint64_t)1) << C3_TWAI_INTR_SOURCE;
+            return v;
+        }
+        return soc->twai_reg[off >> 2];
     }
     /* SPI0/SPI1 (flash) */
     if (addr < C3_PERIPH_BASE + 0x4000u) {
@@ -853,6 +900,35 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->spi2_transfer_pending = 1;
         } else if (addr == C3_PERIPH_BASE + 0x24038u) { /* dma_int_clr */
             soc->spi2_reg[0x3c >> 2] &= ~val; /* clear raw interrupt bits */
+        } else {
+            *r = val;
+        }
+        return;
+    }
+    /* TWAI0 (CAN, 0x6002B000-0x6002B100) */
+    if (addr >= C3_PERIPH_BASE + 0x2B000u &&
+        addr < C3_PERIPH_BASE + 0x2B100u) {
+        uint32_t off = addr - C3_PERIPH_BASE - 0x2B000u;
+        uint32_t *r = soc->twai_reg + (off >> 2);
+        if (off == 0x00u) { /* mode: leaving reset mode starts the bus */
+            *r = val;
+            if (!(val & 1u) && !soc->twai_rx_delivered)
+                soc->twai_rx_deliver_cycle =
+                    rv->csr_cycle + 150000; /* ~1.5ms @ 100MHz host clock */
+        } else if (off == 0x04u) { /* cmd: commands are latched and self-clear */
+            *r = val;
+            if (val & TWAI0_CMD_TX_REQUEST) {
+                soc->twai_tx_pending = 1;
+                soc->twai_tx_done_cycle =
+                    rv->csr_cycle + 20000; /* ~200us @ 100MHz host clock */
+            }
+            if (val & TWAI0_CMD_RELEASE_BUFFER) {
+                soc->twai_reg[0x08 >> 2] &= ~TWAI0_STATUS_RBS;
+                if (soc->twai_reg[0x74 >> 2])
+                    soc->twai_reg[0x74 >> 2]--;
+            }
+            if (val & TWAI0_CMD_CLEAR_DOVERRUN)
+                soc->twai_reg[0x08 >> 2] &= ~TWAI0_STATUS_DOS;
         } else {
             *r = val;
         }
@@ -1864,6 +1940,46 @@ void esp32c3_periodic(riscv_t *rv)
         }
         soc->spi2_reg[0x00 >> 2] &= ~(1u << 24); /* usr cleared */
         soc->spi2_reg[0x3c >> 2] |= 1u << 12;    /* trans_done raw */
+    }
+
+    /* TWAI0 TX completion: a tx_request was issued. No other node on the
+     * bus, but the frame goes out and the controller reports TCS + TI
+     * (transmit interrupt). Delivery is delayed to a later cycle so the
+     * interrupt is not delivered while the firmware is still inside
+     * twai_transmit_v2 (real hardware takes ~200us for a frame); delivering
+     * it instantly made the ISR run before the driver's own tx_msg_count++
+     * and assert on it. */
+    if (soc->twai_tx_pending &&
+        rv->csr_cycle >= soc->twai_tx_done_cycle) {
+        soc->twai_tx_pending = 0;
+        soc->twai_reg[0x04 >> 2] &= ~TWAI0_CMD_TX_REQUEST;
+        soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_TCS;
+        soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_TI;
+        soc->intc_status |= ((uint64_t)1) << C3_TWAI_INTR_SOURCE;
+    }
+
+    /* TWAI0 RX delivery: a virtual node on the bus sends one frame
+     * (~1.5ms after the controller left reset mode): std ID 0x123, DLC 2,
+     * data DE AD. The frame buffer words hold one byte each (bits 7-0);
+     * bytes 1-2 are the ID left-aligned big-endian ((id << 5) >> 8,
+     * (id << 5) & 0xFF). RX delivery sets RBS + rx_message_counter and
+     * raises RI, gated on the receive interrupt being enabled. */
+    if (!soc->twai_rx_delivered && soc->twai_rx_deliver_cycle &&
+        rv->csr_cycle >= soc->twai_rx_deliver_cycle) {
+        soc->twai_rx_delivered = 1;
+        soc->twai_reg[0x40 >> 2] = 0x02u; /* dlc=2, standard format */
+        soc->twai_reg[0x44 >> 2] = 0x24u; /* id 0x123, high byte */
+        soc->twai_reg[0x48 >> 2] = 0x60u; /* id 0x123, low byte */
+        soc->twai_reg[0x4c >> 2] = 0xDEu; /* data[0] */
+        soc->twai_reg[0x50 >> 2] = 0xADu; /* data[1] */
+        for (int i = 5; i < 13; i++)
+            soc->twai_reg[(0x40u + 4u * i) >> 2] = 0;
+        soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_RBS;
+        soc->twai_reg[0x74 >> 2]++;
+        if (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI) {
+            soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_RI;
+            soc->intc_status |= ((uint64_t)1) << C3_TWAI_INTR_SOURCE;
+        }
     }
 
     /* RMT TX_DONE: a few cycles after a channel's CONF0 tx_start was seen,
