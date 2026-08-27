@@ -214,16 +214,6 @@ struct esp32c3_soc {
     unsigned int uart_tx_cnt[2];
     uint8_t uart_tx_idle[2];
 
-    /* verification aid: loopback bytes captured at uart_write_bytes and
-     * replayed into the caller's buffer at the uart_read_bytes return site */
-    uint32_t uart_aid_wra; /* return address of uart_write_bytes */
-    uint8_t uart_aid_tx[2][256];
-    uint32_t uart_aid_txlen[2];
-    uint32_t uart_aid_rra; /* return address of uart_read_bytes */
-    uint32_t uart_aid_rport;
-    uint32_t uart_aid_rbuf;
-    uint32_t uart_aid_rlen;
-
     /* I2C_EXT (0x60013000): virtual EEPROM device model (mirrors i2c_dev_t) */
     uint32_t i2c_reg[128]; /* 0x200 bytes */
     int i2c_scl_rst_cnt;   /* reads left with SCL_RST_SLV_EN asserted */
@@ -918,12 +908,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 uint8_t b = (uint8_t) (val & 0xFFu);
                 if (p == 0)
                     esp32_uart_putc(soc, (char) b);
-                /* model the byte leaving the TX FIFO (instant transmit) */
                 if (soc->uart_tx_cnt[p] < UART_RX_FIFO_SZ)
                     soc->uart_tx_cnt[p]++;
                 soc->uart_tx_idle[p] = 0;
-                /* TX->RX loopback (CONF0 bit 12) feeds this port's RX
-                 * FIFO so a sketch can send and receive on the same UART */
+                /* TX->RX loopback (CONF0 bit 14) feeds this port's RX FIFO
+                 * so a sketch can send and receive on the same UART */
                 if (mmio32[(base + UART_CONF0_REG - C3_PERIPH_BASE) >> 2] &
                     UART_LOOPBACK_BIT) {
                     unsigned cnt = (soc->uart_rx_head[p] -
@@ -942,15 +931,26 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                         uint32_t *ena =
                             &mmio32[(base + UART_INT_ENA_REG -
                                      C3_PERIPH_BASE) >> 2];
-                        if (!(*raw & (UART_RXFIFO_TOUT_BIT | 0x1u))) {
-                            *raw |= (UART_RXFIFO_TOUT_BIT | 0x1u);
-                                if (*ena & (UART_RXFIFO_TOUT_BIT | 0x1u)) {
-                                int src = (p == 0) ? C3_UART0_INTR_SOURCE
-                                                   : C3_UART1_INTR_SOURCE;
-                                soc->intc_status |= ((uint64_t) 1) << src;
-                            }
+                        *raw |= (UART_RXFIFO_TOUT_BIT | 0x1u);
+                        if (*ena & (UART_RXFIFO_TOUT_BIT | 0x1u)) {
+                            int src = (p == 0) ? C3_UART0_INTR_SOURCE
+                                               : C3_UART1_INTR_SOURCE;
+                            soc->intc_status |= ((uint64_t) 1) << src;
                         }
                     }
+                }
+            } else if (o == UART_INT_ENA_REG) {
+                mmio32[off >> 2] = val;
+                /* when the TX-empty interrupt is enabled, raise it so the
+                 * esp-idf TX ISR feeds the TX FIFO from its ring buffer */
+                if (val & UART_TXFIFO_EMPTY_BIT) {
+                    uint32_t *raw =
+                        &mmio32[(base + UART_INT_RAW_REG -
+                                 C3_PERIPH_BASE) >> 2];
+                    *raw |= UART_TXFIFO_EMPTY_BIT;
+                    int src = (p == 0) ? C3_UART0_INTR_SOURCE
+                                       : C3_UART1_INTR_SOURCE;
+                    soc->intc_status |= ((uint64_t) 1) << src;
                 }
             } else if (o == UART_INT_CLR_REG) { /* W1C */
                 uint32_t *raw =
@@ -962,6 +962,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                                        : C3_UART1_INTR_SOURCE;
                     soc->intc_status &= ~(((uint64_t) 1) << src);
                 }
+            } else if (o == UART_CONF0_REG) {
+                mmio32[off >> 2] = val;
             } else
                 mmio32[off >> 2] = val;
             return;
@@ -1646,49 +1648,6 @@ uint32_t esp32_ifetch(riscv_t *rv, uint32_t addr)
     static int hist_i;
     hist[hist_i++ & 31] = rv->PC;
 
-    /* ---- UART loopback verification aid -------------------------------
-     * The esp-idf uart driver moves bytes through its own ring buffers and
-     * a real UART; we model a simple TX->RX loopback in the MMIO layer, but
-     * to make uart_read_bytes() return exactly what was written we also
-     * capture the transfer at the driver entry points and replay it into
-     * the caller's buffer at the return site. This is a verification hack,
-     * not real UART emulation. */
-    esp32c3_t *aid_soc = PRIV(rv)->esp32c3;
-    if (addr == 0x4200d766u) {            /* uart_write_bytes */
-        uint32_t port = rv->X[10] & 1u;
-        uint32_t size = rv->X[12];
-        uint32_t src = rv->X[11];
-        if (size > 256)
-            size = 256;
-        for (uint32_t i = 0; i < size; i++)
-            aid_soc->uart_aid_tx[port][i] = esp32_read_b(rv, src + i);
-        aid_soc->uart_aid_txlen[port] = size;
-        aid_soc->uart_aid_wra = rv->X[1]; /* return address */
-    } else if (addr == 0x4200d828u) {     /* uart_read_bytes */
-        aid_soc->uart_aid_rra = rv->X[1]; /* return address */
-        aid_soc->uart_aid_rport = rv->X[10] & 1u;
-        aid_soc->uart_aid_rbuf = rv->X[11];
-        aid_soc->uart_aid_rlen = rv->X[12];
-    } else if (addr == aid_soc->uart_aid_rra && aid_soc->uart_aid_rra) {
-        uint32_t port = aid_soc->uart_aid_rport;
-        uint32_t len = aid_soc->uart_aid_rlen;
-        uint32_t *mmio32 = (uint32_t *) aid_soc->mmio;
-        uint32_t conf0 = mmio32[(C3_PERIPH_BASE + 0x10000u * port +
-                                 UART_CONF0_REG - C3_PERIPH_BASE) >> 2];
-        if (conf0 & UART_LOOPBACK_BIT) {
-            uint32_t n = len < aid_soc->uart_aid_txlen[port]
-                             ? len : aid_soc->uart_aid_txlen[port];
-            if (n && aid_soc->uart_aid_rbuf) {
-                esp32_region_t *br = esp32_lookup(rv, aid_soc->uart_aid_rbuf);
-                if (br && br->type == ESP32_REG_RAM)
-                    memcpy(br->data + (aid_soc->uart_aid_rbuf - br->base),
-                           aid_soc->uart_aid_tx[port], n);
-            }
-            rv->X[10] = n;            /* bytes read */
-            aid_soc->uart_aid_txlen[port] = 0;
-        }
-        aid_soc->uart_aid_rra = 0;
-    }
     if (rv->PC == 0x403d04c0u) {
         fprintf(stderr,
                 "DBG: cpyloop s3=0x%08x s10=0x%08x s2=0x%08x s8=0x%08x s6=0x%08x "
