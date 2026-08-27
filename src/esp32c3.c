@@ -224,6 +224,20 @@ struct esp32c3_soc {
     uint32_t uart_aid_rbuf;
     uint32_t uart_aid_rlen;
 
+    /* I2C_EXT (0x60013000): virtual EEPROM device model (mirrors i2c_dev_t) */
+    uint32_t i2c_reg[128]; /* 0x200 bytes */
+    int i2c_scl_rst_cnt;   /* reads left with SCL_RST_SLV_EN asserted */
+    int i2c_transfer_pending; /* a trans_start was written */
+    uint8_t i2c_tx_fifo[32];  /* bytes pushed to I2C_DATA before trans_start */
+    int i2c_tx_len;
+    uint8_t i2c_rx_fifo[32];  /* bytes the virtual device sent on a read */
+    int i2c_rx_len;
+    int i2c_rx_pos;
+    int i2c_slave_active;     /* transfer targets the virtual device */
+    int i2c_slave_rw;         /* 1 = read from the device, 0 = write */
+    uint8_t i2c_dev_mem[16];  /* virtual EEPROM contents (address 0x50) */
+    int i2c_dev_ptr;          /* current register/memory address pointer */
+
     /* misc logged-MMIO bookkeeping */
     uint32_t logged_unknown;
 
@@ -285,6 +299,11 @@ esp32c3_t *esp32c3_new(void)
     esp32c3_t *soc = calloc(1, sizeof(esp32c3_t));
     assert(soc);
     soc->systimer_conf = 0x40000000u; /* TIMER_UNIT0_WORK_EN default 1 */
+
+    /* virtual I2C device: 16-byte EEPROM with a known pattern */
+    for (int i = 0; i < 16; i++)
+        soc->i2c_dev_mem[i] = 0x40 + i;
+    soc->i2c_dev_ptr = 0;
 
     /* flash backing shared by i-cache and d-cache windows */
     uint8_t *flash = calloc(1, C3_FLASH_SIZE);
@@ -368,9 +387,17 @@ esp32c3_t *esp32c3_new(void)
 #define UART_RXFIFO_TOUT_BIT 0x100u
 #define UART_TXFIFO_EMPTY_BIT 0x2u
 #define UART_RXFIFO_FULL_BIT 0x1u
-/* INTMTX source numbers for UART0/UART1 (esp32c3 interrupts.h) */
-#define C3_UART0_INTR_SOURCE 39u
-#define C3_UART1_INTR_SOURCE 40u
+/* INTMTX source numbers (esp32c3 interrupts.h, firmware uses this numbering) */
+#define C3_UART0_INTR_SOURCE 21u
+#define C3_UART1_INTR_SOURCE 22u
+#define C3_I2C_EXT0_INTR_SOURCE 29u
+#define C3_TWAI_INTR_SOURCE 25u
+#define C3_SPI2_INTR_SOURCE 19u
+#define C3_DMA_CH0_INTR_SOURCE 44u
+#define C3_DMA_CH1_INTR_SOURCE 45u
+#define C3_DMA_CH2_INTR_SOURCE 46u
+/* Virtual I2C device: 16-byte EEPROM with a known pattern */
+#define C3_I2C_DEV_ADDR 0x50u
 
 static void esp32_uart_putc(esp32c3_t *soc, char c)
 {
@@ -515,6 +542,25 @@ have_seen:
                 return mmio32[off >> 2];
             }
         }
+    }
+    /* I2C_EXT (0x60013000-0x60013200) */
+    if (addr >= C3_PERIPH_BASE + 0x13000u &&
+        addr < C3_PERIPH_BASE + 0x13200u) {
+        uint32_t *r = soc->i2c_reg + ((addr - C3_PERIPH_BASE - 0x13000u) >> 2);
+        if (addr == C3_PERIPH_BASE + 0x13080u && soc->i2c_scl_rst_cnt > 0 &&
+            --soc->i2c_scl_rst_cnt == 0)
+            *r &= ~1u; /* SCL_RST_SLV_EN self-clears after the pulses */
+        if (addr == C3_PERIPH_BASE + 0x1302cu) {
+            uint32_t v = soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2];
+            return v;
+        }
+        if (addr == C3_PERIPH_BASE + 0x1301cu) { /* data: RX fifo pop */
+            if (soc->i2c_rx_pos < soc->i2c_rx_len) {
+                uint32_t v = soc->i2c_rx_fifo[soc->i2c_rx_pos++];
+                soc->i2c_reg[0x1c >> 2] = v;
+            }
+        }
+        return *r;
     }
     /* SPI0/SPI1 (flash) */
     if (addr < C3_PERIPH_BASE + 0x4000u) {
@@ -733,6 +779,50 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 mmio32[off >> 2] = val;
             return;
         }
+    }
+    /* I2C_EXT (0x60013000-0x60013200) */
+    if (addr >= C3_PERIPH_BASE + 0x13000u &&
+        addr < C3_PERIPH_BASE + 0x13200u) {
+        uint32_t *r = soc->i2c_reg + ((addr - C3_PERIPH_BASE - 0x13000u) >> 2);
+        if (addr == C3_PERIPH_BASE + 0x13024u) { /* int_clr */
+            soc->i2c_reg[0x20 >> 2] &= ~val; /* clear raw status bits */
+            soc->intc_status &=
+                ~(((uint64_t) 1) << C3_I2C_EXT0_INTR_SOURCE); /* drop IRQ */
+        } else if (addr == C3_PERIPH_BASE + 0x13018u) { /* fifo_conf */
+            soc->i2c_reg[0x18 >> 2] = val;
+            if (val & (1u << 13)) /* tx_fifo_rst */
+                soc->i2c_tx_len = 0;
+            if (val & (1u << 12)) { /* rx_fifo_rst */
+                soc->i2c_rx_len = 0;
+                soc->i2c_rx_pos = 0;
+            }
+        } else if (addr == C3_PERIPH_BASE + 0x1301cu) { /* data: TX fifo push */
+            soc->i2c_reg[0x1c >> 2] = val;
+            if (soc->i2c_tx_len < 32)
+                soc->i2c_tx_fifo[soc->i2c_tx_len++] = val & 0xFFu;
+        } else if (addr == C3_PERIPH_BASE + 0x13004u) { /* ctr */
+            *r = val;
+            if (val & (1u << 5)) { /* trans_start (WT): transfer begins */
+                uint32_t addr_byte = soc->i2c_tx_len > 0 ?
+                                     soc->i2c_tx_fifo[0] : 0xFFu;
+                soc->i2c_transfer_pending = 1;
+                if ((addr_byte >> 1) == C3_I2C_DEV_ADDR) {
+                    soc->i2c_slave_active = 1;
+                    soc->i2c_slave_rw = addr_byte & 1u;
+                } else {
+                    soc->i2c_slave_active = 0;
+                }
+            }
+        } else {
+            *r = val;
+        }
+        if (addr == C3_PERIPH_BASE + 0x13080u) {
+            if (val & 1u) /* SCL_RST_SLV_EN: start the reset pulses */
+                soc->i2c_scl_rst_cnt = 64; /* held high ~64 reads */
+            else
+                soc->i2c_scl_rst_cnt = 0;
+        }
+        return;
     }
     /* SPI0/SPI1 (flash) */
     if (addr < C3_PERIPH_BASE + 0x4000u) {
@@ -1631,6 +1721,58 @@ void esp32c3_periodic(riscv_t *rv)
                 soc->intc_status |= 1ull << SYSTIMER_T2_SOURCE;
             }
         }
+    }
+
+    /* I2C transfer completion: a trans_start was issued. Without a slave the
+     * address byte is never ACKed -> NACK + trans-complete. With the virtual
+     * device (0x50) the transfer is ACKed: writes are stored into its memory,
+     * reads return the memory contents via the RX fifo. */
+    if (soc->i2c_transfer_pending) {
+        soc->i2c_transfer_pending = 0;
+        if (soc->i2c_slave_active) {
+            uint8_t *t = soc->i2c_tx_fifo;
+            int tl = soc->i2c_tx_len;
+            if (!soc->i2c_slave_rw && tl >= 3 &&
+                (t[0] & 1u) == 0u && (t[2] & 1u) == 1u &&
+                (t[0] >> 1) == (t[2] >> 1)) {
+                int p = t[1];
+                soc->i2c_dev_ptr = p;
+                soc->i2c_rx_len = 0;
+                soc->i2c_rx_pos = 0;
+                for (int i = 0; i < 8; i++) {
+                    soc->i2c_rx_fifo[i] = soc->i2c_dev_mem[(p++) & 15];
+                    soc->i2c_rx_len = 8;
+                }
+                soc->i2c_dev_ptr = p & 15;
+            } else if (soc->i2c_slave_rw) {
+                soc->i2c_rx_len = 0;
+                soc->i2c_rx_pos = 0;
+                int p = soc->i2c_dev_ptr;
+                for (int i = 0; i < 8; i++) {
+                    soc->i2c_rx_fifo[i] = soc->i2c_dev_mem[(p++) & 15];
+                    soc->i2c_rx_len = 8;
+                }
+                soc->i2c_dev_ptr = p & 15;
+            } else {
+                int p = soc->i2c_dev_ptr;
+                for (int i = 1; i < soc->i2c_tx_len; i++) {
+                    if (i == 1) {
+                        soc->i2c_dev_ptr = soc->i2c_tx_fifo[i];
+                        p = soc->i2c_dev_ptr;
+                    } else {
+                        soc->i2c_dev_mem[(p++) & 15] = soc->i2c_tx_fifo[i];
+                    }
+                }
+                soc->i2c_dev_ptr = p & 15;
+            }
+            soc->i2c_reg[0x20 >> 2] |= 1u << 7; /* trans complete, no nack */
+        } else {
+            soc->i2c_reg[0x20 >> 2] |= (1u << 10) | (1u << 7); /* nack */
+        }
+        soc->i2c_reg[0x4 >> 2] &= ~(1u << 5); /* trans_start self-clears */
+        soc->i2c_tx_len = 0;
+        if (soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2])
+            soc->intc_status |= ((uint64_t) 1) << C3_I2C_EXT0_INTR_SOURCE;
     }
 
     /* RMT TX_DONE: a few cycles after a channel's CONF0 tx_start was seen,
