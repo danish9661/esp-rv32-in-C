@@ -200,6 +200,9 @@ struct esp32c3_soc {
     /* GPIO */
     uint32_t gpio_out;
     uint32_t gpio_enable;
+    uint32_t gpio_status;     /* latched interrupt status (GPIO_STATUS) */
+    uint32_t gpio_in;         /* level-driven external input pins */
+    uint32_t gpio_in_prev;    /* previous live input (for edge detection) */
 
     /* UART output buffering */
     char uart_line[256];
@@ -267,6 +270,24 @@ struct esp32c3_soc {
     uint32_t gdma_in_next_addr[3];
     uint8_t  gdma_m2m_pending[3];
     uint64_t gdma_m2m_done_cycle[3];
+
+    /* SAR_ADC (0x60040000): oneshot conversion state (mirrors apb_saradc_dev_t) */
+    uint32_t adc_reg[257];    /* 0x400 bytes + version reg */
+
+    /* LEDC (0x60019000): register bank + running duty + timer anchors */
+    uint32_t ledc_reg[128];   /* 0x200 bytes, mirrors ledc_dev_t */
+    uint32_t ledc_duty_r[6];  /* running duty per channel (latched on start) */
+    uint64_t ledc_timer_anchor[4]; /* cycle anchor per timer (phase origin) */
+    uint64_t ledc_timer_frac[4];   /* fractional cycle remainder per timer */
+
+    /* TIMG0/1 (0x6001F000/0x60020000): one timer per group + MWDT */
+    uint32_t timg_reg[2][64]; /* 0x100 bytes, mirrors timer_group_dev_t */
+    int wdt_en[2];
+    uint64_t wdt_expire[2];
+    int wdt_unlock[2];
+    uint64_t timg_counter[2]; /* live counter value */
+    uint64_t timg_anchor[2];  /* cycle at which the counter base applies */
+    uint64_t timg_frac[2];     /* fractional cycle remainder per group */
 
     /* misc logged-MMIO bookkeeping */
     uint32_t logged_unknown;
@@ -519,15 +540,157 @@ static void esp32_uart_putc(esp32c3_t *soc, char c)
 /* GPIO (0x60004000)                                                   */
 /* ------------------------------------------------------------------ */
 
-#define GPIO_OUT_REG 0x00u
-#define GPIO_OUT_W1TS 0x04u
-#define GPIO_OUT_W1TC 0x08u
-#define GPIO_ENABLE_REG 0x0Cu
-#define GPIO_ENABLE_W1TS 0x10u
-#define GPIO_ENABLE_W1TC 0x14u
-#define GPIO_IN_REG 0x1Cu
+#define GPIO_OUT_REG 0x04u
+#define GPIO_OUT_W1TS 0x08u
+#define GPIO_OUT_W1TC 0x0Cu
+#define GPIO_ENABLE_REG 0x20u
+#define GPIO_ENABLE_W1TS 0x24u
+#define GPIO_ENABLE_W1TC 0x28u
+#define GPIO_IN_REG 0x3Cu
 #define GPIO_STRAP_REG 0x38u
-#define GPIO_PIN0 0x40u
+#define GPIO_STATUS_REG 0x44u
+#define GPIO_STATUS_W1TS_REG 0x48u
+#define GPIO_STATUS_W1TC_REG 0x4Cu
+#define GPIO_PCPU_INT_REG 0x5Cu
+#define GPIO_PIN0 0x74u
+
+/* LEDC (0x60019000): 6 channels x (CONF0/HPOINT/DUTY/CONF1/DUTY_R) */
+#define LEDC_CH_CONF0(c) (0x14u * (c))
+#define LEDC_CH_HPOINT(c) (0x14u * (c) + 0x4u)
+#define LEDC_CH_DUTY(c) (0x14u * (c) + 0x8u)
+#define LEDC_CH_CONF1(c) (0x14u * (c) + 0xcu)
+#define LEDC_CH_DUTY_R(c) (0x14u * (c) + 0x10u)
+#define LEDC_TIMER_CONF(t) (0xa0u + 8u * (t))
+#define LEDC_TIMER_VALUE(t) (0xa4u + 8u * (t))
+#define LEDC_INT_RAW_OFF 0xc0u
+#define LEDC_INT_ST_OFF 0xc4u
+#define LEDC_INT_ENA_OFF 0xc8u
+#define LEDC_INT_CLR_OFF 0xccu
+#define LEDC_CONF_OFF 0x1f0u
+#define LEDC_SIG_OUT_EN (1u << 2)
+#define LEDC_IDLE_LV (1u << 3)
+#define LEDC_DUTY_START (1u << 31)
+#define LEDC_TIMER_RST (1u << 24)
+#define LEDC_TIMER_PAUSE (1u << 23)
+#define LEDC_TICK_SEL (1u << 25)
+
+/* TIMG0/1 (0x6001F000/0x60020000): one timer + WDT per group */
+#define TIMG_T0CONFIG 0x00u
+#define TIMG_T0LO 0x04u
+#define TIMG_T0HI 0x08u
+#define TIMG_T0UPDATE 0x0cu
+#define TIMG_T0ALARMLO 0x10u
+#define TIMG_T0ALARMHI 0x14u
+#define TIMG_T0LOADLO 0x18u
+#define TIMG_T0LOADHI 0x1cu
+#define TIMG_T0LOAD 0x20u
+#define TIMG_INT_ENA 0x70u
+#define TIMG_INT_RAW 0x74u
+#define TIMG_INT_ST 0x78u
+#define TIMG_INT_CLR 0x7cu
+#define TIMG_RTCCALICFG 0x68u
+#define TIMG_RTCCALICFG1 0x6cu
+#define TIMG_T0_EN (1u << 31)
+#define TIMG_T0_INCREASE (1u << 30)
+#define TIMG_T0_AUTORELOAD (1u << 29)
+#define TIMG_T0_DIVIDER (0xFFFFu << 13)
+#define TIMG_T0_DIVCNT_RST (1u << 12)
+#define TIMG_T0_ALARM_EN (1u << 10)
+#define TIMG_T0_USE_XTAL (1u << 9)
+/* csr_cycle advances at the C3 SYSTIMER base clock (16 MHz); the SoC models
+ * the SYSTIMER counter 1:1 with csr_cycle, so all other clock-derived timers
+ * must scale against this rate. */
+#define ESP32C3_CSR_CLK_MHZ 16u
+#define TIMG_INT_T0_ALARM (1u << 0)
+#define TIMG_INT_WDT (1u << 1)
+#define TIMG_WDT_CONFIG0 0x48u
+#define TIMG_WDT_CONFIG1 0x4cu
+#define TIMG_WDT_CONFIG2 0x50u
+#define TIMG_WDT_FEED 0x60u
+#define TIMG_WDT_WPROTECT 0x64u
+#define TIMG_WDT_MAGIC 0x50D83AA1u
+#define TIMG_WDT_EN (1u << 31)
+
+/* SAR_ADC (0x60040000): oneshot conversion state */
+#define ADC_ONETIME_SAMPLE 0x20u
+#define ADC_INT_ENA 0x40u
+#define ADC_INT_RAW 0x44u
+#define ADC_INT_CLR 0x4Cu
+#define ADC_TSENS_CTRL 0x58u
+#define ADC_DATA1 0x2cu
+#define ADC_DATA2 0x30u
+
+/* C3 interrupt sources (esp32c3 interrupts.h) */
+#define C3_GPIO_INTR_SOURCE 16u
+#define C3_LEDC_INTR_SOURCE 23u
+#define C3_TG0_T0_INTR_SOURCE 32u
+#define C3_TG0_WDT_INTR_SOURCE 33u
+#define C3_TG1_T0_INTR_SOURCE 34u
+#define C3_TG1_WDT_INTR_SOURCE 35u
+
+/* A pin configured as a (peripheral-driven) output reports the live peripheral
+ * level on its own pad input; a GPIO-driven output reports gpio_out. Pins
+ * routed to a peripheral signal (GPIO matrix FUNCx_OUT_SEL) follow the
+ * peripheral; others follow the static gpio_out value. */
+static uint32_t esp32c3_gpio_eff_out(esp32c3_t *soc, uint32_t *mmio32)
+{
+    uint32_t out = 0;
+    for (int p = 0; p < 22; p++) {
+        if (!(soc->gpio_enable & (1u << p)))
+            continue;
+        uint32_t sel = mmio32[(0x4554u + 4u * p) >> 2];
+        if (sel & 0x100u)            /* peripheral signal drives the pad */
+            out |= (soc->gpio_in & (1u << p));
+        else
+            out |= (soc->gpio_out & (1u << p));
+    }
+    return out;
+}
+
+/* MWDT expiry, in emulator cycles: the C3 WDT clock is ~40MHz while the guest
+ * cycle clock is ~80MHz, so multiply by 2 as an approximation. */
+static uint64_t esp32c3_wdt_cycles(esp32c3_t *soc, int g)
+{
+    uint32_t prescale =
+        (soc->timg_reg[g][TIMG_WDT_CONFIG1 >> 2] >> 16) & 0xFFFFu;
+    uint32_t hold = soc->timg_reg[g][TIMG_WDT_CONFIG2 >> 2];
+    if (!hold)
+        hold = 1u;
+    return (uint64_t) hold * (uint64_t) (prescale + 1u) * 2u;
+}
+
+/* Detect input edges on GPIO pins and latch the interrupt status; the driver
+ * ISR reads GPIO_STATUS and clears it via GPIO_STATUS_W1TC. */
+static void esp32c3_gpio_edge_check(esp32c3_t *soc, uint32_t *mmio32,
+                                    uint32_t new_live)
+{
+    uint32_t changed = new_live ^ soc->gpio_in_prev;
+    if (!changed)
+        return;
+    for (int pin = 0; pin < 22; pin++) {
+        if (!(changed & (1u << pin)))
+            continue;
+        uint32_t pr = mmio32[(0x4074u + 4u * pin) >> 2];
+        int type = (pr >> 7) & 0x7u;
+        int ena = (pr >> 13) & 0x1Fu;
+        int level = (new_live >> pin) & 1;
+        int prev = (soc->gpio_in_prev >> pin) & 1;
+        int fire = 0;
+        switch (type) {
+        case 1: fire = level && !prev; break; /* posedge */
+        case 2: fire = !level && prev; break; /* negedge */
+        case 3: fire = level != prev; break;  /* any edge */
+        case 4: fire = !level; break;         /* low level */
+        case 5: fire = level; break;          /* high level */
+        default: break;
+        }
+        if (fire && ena) {
+            soc->gpio_status |= 1u << pin;
+            soc->intc_status |= ((uint64_t) 1) << C3_GPIO_INTR_SOURCE;
+        }
+    }
+}
+
 
 /* ------------------------------------------------------------------ */
 /* SYSTIMER (0x60023000)                                               */
@@ -755,13 +918,72 @@ have_seen:
         case GPIO_ENABLE_REG:
             return soc->gpio_enable;
         case GPIO_IN_REG:
-            /* strapping: GPIO9 high -> SPI flash boot */
-            return 1u << 9;
+            /* strapping: GPIO9 high -> SPI flash boot; plus live input */
+            return (1u << 9) | soc->gpio_in |
+                   esp32c3_gpio_eff_out(soc, mmio32);
         case GPIO_STRAP_REG:
             /* GPIO9 strapped high: boot mode 1xxx (SPI flash boot) */
             return (1u << 9) | 0x8u;
+        case GPIO_STATUS_REG:
+            return soc->gpio_status;
+        case GPIO_PCPU_INT_REG:
+            return soc->gpio_status;
         default:
             return mmio32[off >> 2];
+        }
+    }
+    /* SAR_ADC (0x60040000-0x60040404): oneshot conversion state */
+    if (addr >= C3_PERIPH_BASE + 0x40000u &&
+        addr < C3_PERIPH_BASE + 0x40404u) {
+        uint32_t o = off - 0x40000u;
+        if (o == ADC_DATA1)            /* sar1data_status: raw result */
+            return soc->adc_reg[o >> 2];
+        if (o == ADC_DATA2)
+            return soc->adc_reg[o >> 2];
+        if (o == ADC_TSENS_CTRL)       /* 8-bit sensor output field is RO */
+            return (soc->adc_reg[o >> 2] & ~0xFFu) | 0x78u;
+        if (o == ADC_INT_RAW)
+            return soc->adc_reg[o >> 2];
+        if (o == ADC_INT_ENA)
+            return soc->adc_reg[o >> 2];
+        if (o == 0x48u)               /* int_st = raw & ena */
+            return soc->adc_reg[ADC_INT_RAW >> 2] &
+                   soc->adc_reg[ADC_INT_ENA >> 2];
+        if (o == 0x400u)              /* version */
+            return 0x02206840u;
+        return soc->adc_reg[o >> 2];
+    }
+    /* LEDC (0x60019000-0x60019200) */
+    if (addr >= C3_PERIPH_BASE + 0x19000u &&
+        addr < C3_PERIPH_BASE + 0x19200u) {
+        uint32_t o = addr - C3_PERIPH_BASE - 0x19000u;
+        for (int c = 0; c < 6; c++)
+            if (o == LEDC_CH_DUTY_R(c))
+                return soc->ledc_duty_r[c];
+        for (int t = 0; t < 4; t++)
+            if (o == LEDC_TIMER_VALUE(t))
+                return soc->ledc_reg[o >> 2];
+        if (o == LEDC_INT_ST_OFF)
+            return soc->ledc_reg[LEDC_INT_RAW_OFF >> 2] &
+                   soc->ledc_reg[LEDC_INT_ENA_OFF >> 2];
+        if (o == LEDC_INT_RAW_OFF)
+            return soc->ledc_reg[o >> 2];
+        return soc->ledc_reg[o >> 2];
+    }
+    /* TIMG0/1 (0x6001F000, 0x60020000): one timer + WDT per group */
+    for (int g = 0; g < 2; g++) {
+        uint32_t base = (g == 0) ? 0x1F000u : 0x20000u;
+        if (addr >= C3_PERIPH_BASE + base &&
+            addr < C3_PERIPH_BASE + base + 0x100u) {
+            uint32_t o = addr - C3_PERIPH_BASE - base;
+            if (o == TIMG_T0LO)
+                return (uint32_t) soc->timg_counter[g];
+            if (o == TIMG_T0HI)
+                return (uint32_t) (soc->timg_counter[g] >> 32);
+            if (o == TIMG_INT_ST)
+                return soc->timg_reg[g][TIMG_INT_RAW >> 2] &
+                       soc->timg_reg[g][TIMG_INT_ENA >> 2];
+            return soc->timg_reg[g][o >> 2];
         }
     }
     /* RTC_CNTL / IO_MUX / eFuse / RTC_I2C */
@@ -1195,7 +1417,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
     }
     /* GPIO */
     if (addr < C3_PERIPH_BASE + 0x5000u) {
-        switch (off - 0x4000u) {
+        uint32_t o = off - 0x4000u;
+        switch (o) {
         case GPIO_OUT_REG:
             soc->gpio_out = val;
             break;
@@ -1214,10 +1437,23 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         case GPIO_ENABLE_W1TC:
             soc->gpio_enable &= ~val;
             break;
+        case GPIO_STATUS_W1TS_REG:
+            soc->gpio_status |= val;
+            soc->intc_status |= ((uint64_t) 1) << C3_GPIO_INTR_SOURCE;
+            return;
+        case GPIO_STATUS_W1TC_REG:
+            soc->gpio_status &= ~val;
+            if (!soc->gpio_status)
+                soc->intc_status &=
+                    ~(((uint64_t) 1) << C3_GPIO_INTR_SOURCE);
+            return;
         default:
             mmio32[off >> 2] = val;
-            return;
+            break;
         }
+        uint32_t live = soc->gpio_in | esp32c3_gpio_eff_out(soc, mmio32);
+        esp32c3_gpio_edge_check(soc, mmio32, live);
+        soc->gpio_in_prev = live;
         if (esp32c3_gpio_output) {
             for (int pin = 0; pin < 22; pin++) {
                 if (soc->gpio_enable & (1u << pin))
@@ -1225,6 +1461,148 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             }
         }
         return;
+    }
+    /* SAR_ADC (0x60040000-0x60040404) */
+    if (addr >= C3_PERIPH_BASE + 0x40000u &&
+        addr < C3_PERIPH_BASE + 0x40404u) {
+        uint32_t o = off - 0x40000u;
+        if (o == ADC_INT_CLR) {       /* int_clr: write-to-clear */
+            soc->adc_reg[ADC_INT_RAW >> 2] &= ~val;
+        } else {
+            soc->adc_reg[o >> 2] = val;
+            if (o == ADC_ONETIME_SAMPLE && (val & (1u << 29))) {
+                /* onetime start: the conversion completes instantly. The
+                 * selected converter (bit31=ADC1, bit30=ADC2) produces a done
+                 * event; pin channels 0-7 read 1024 + ch*128, internal
+                 * channels read mid-scale. */
+                uint32_t ch = (val >> 25) & 0xFu;
+                if (val & (1u << 31)) { /* sar1 sample */
+                    soc->adc_reg[ADC_DATA1 >> 2] =
+                        (ch < 8) ? 1024u + ch * 128u : 2048u;
+                    soc->adc_reg[ADC_INT_RAW >> 2] |= 1u << 31; /* ADC1 done */
+                }
+                if (val & (1u << 30)) { /* sar2 sample */
+                    soc->adc_reg[ADC_DATA2 >> 2] =
+                        (ch < 8) ? 1024u + ch * 128u : 2048u;
+                    soc->adc_reg[ADC_INT_RAW >> 2] |= 1u << 30; /* ADC2 done */
+                }
+            }
+        }
+        return;
+    }
+    /* LEDC (0x60019000-0x60019200) */
+    if (addr >= C3_PERIPH_BASE + 0x19000u &&
+        addr < C3_PERIPH_BASE + 0x19200u) {
+        uint32_t o = addr - C3_PERIPH_BASE - 0x19000u;
+        for (int c = 0; c < 6; c++) {
+            if (o == LEDC_CH_CONF1(c)) {
+                soc->ledc_reg[o >> 2] = val;
+                if (val & LEDC_DUTY_START) {
+                    soc->ledc_duty_r[c] =
+                        soc->ledc_reg[LEDC_CH_DUTY(c) >> 2];
+                    soc->ledc_reg[LEDC_CH_CONF1(c) >> 2] &= ~LEDC_DUTY_START;
+                }
+                return;
+            }
+        }
+        for (int t = 0; t < 4; t++) {
+            if (o == LEDC_TIMER_CONF(t)) {
+                if (val & LEDC_TIMER_RST) {
+                    soc->ledc_timer_anchor[t] = rv->csr_cycle;
+                    soc->ledc_timer_frac[t] = 0;
+                }
+                soc->ledc_reg[o >> 2] = val & ~(LEDC_TIMER_RST);
+                return;
+            }
+        }
+        if (o == LEDC_INT_CLR_OFF) {
+            soc->ledc_reg[LEDC_INT_RAW_OFF >> 2] &= ~val;
+            return;
+        }
+        soc->ledc_reg[o >> 2] = val;
+        return;
+    }
+    /* TIMG0/1 (0x6001F000, 0x60020000) */
+    for (int g = 0; g < 2; g++) {
+        uint32_t base = (g == 0) ? 0x1F000u : 0x20000u;
+        if (addr >= C3_PERIPH_BASE + base &&
+            addr < C3_PERIPH_BASE + base + 0x100u) {
+            uint32_t o = addr - C3_PERIPH_BASE - base;
+            uint32_t *r = soc->timg_reg[g];
+            if (o == TIMG_T0CONFIG) {
+                soc->timg_anchor[g] = rv->csr_cycle;
+                soc->timg_frac[g] = 0;
+                r[o >> 2] = val & ~TIMG_T0_DIVCNT_RST;
+            } else if (o == TIMG_T0LOAD) {
+                soc->timg_counter[g] =
+                    ((uint64_t) r[TIMG_T0LOADHI >> 2] << 32) |
+                    r[TIMG_T0LOADLO >> 2];
+                soc->timg_anchor[g] = rv->csr_cycle;
+                soc->timg_frac[g] = 0;
+                r[o >> 2] = 0;
+            } else if (o == TIMG_T0UPDATE) {
+                r[o >> 2] = 0;
+            } else if (o == TIMG_INT_CLR) {
+                r[TIMG_INT_RAW >> 2] &= ~val;
+                if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
+                    soc->intc_status &=
+                        ~(((uint64_t) 1) << (g == 0 ? C3_TG0_T0_INTR_SOURCE
+                                                   : C3_TG1_T0_INTR_SOURCE));
+                r[o >> 2] = 0;
+            } else if (o == TIMG_RTCCALICFG) {
+                r[o >> 2] = val;
+                if (val & 0x80000000u) {
+                    uint32_t max = (val >> 16) & 0x7FFFu;
+                    uint32_t clk_hz;
+                    switch ((val >> 13) & 3u) {
+                    case 0: clk_hz = 150000u; break;
+                    case 1: clk_hz = 20000000u; break;
+                    default: clk_hz = 32768u; break;
+                    }
+                    uint32_t count = (uint32_t) ((uint64_t) max * clk_hz
+                                                 * 128u / 40000000u);
+                    r[TIMG_RTCCALICFG1 >> 2] = count << 7;
+                    r[o >> 2] |= 0x8000u;
+                }
+            } else if (o == TIMG_WDT_WPROTECT) {
+                soc->wdt_unlock[g] = (val == TIMG_WDT_MAGIC);
+                r[o >> 2] = val;
+            } else if (o == TIMG_WDT_CONFIG0) {
+                r[o >> 2] = val;
+                if (!soc->wdt_unlock[g])
+                    ; /* writes ignored while write-protected */
+                else if (val & TIMG_WDT_EN) {
+                    soc->wdt_en[g] = 1;
+                    soc->wdt_expire[g] =
+                        rv->csr_cycle + esp32c3_wdt_cycles(soc, g);
+                } else {
+                    soc->wdt_en[g] = 0;
+                    r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
+                    soc->intc_status &=
+                        ~(((uint64_t) 1) << (g == 0 ? C3_TG0_WDT_INTR_SOURCE
+                                                   : C3_TG1_WDT_INTR_SOURCE));
+                }
+            } else if (o == TIMG_WDT_CONFIG1 || o == TIMG_WDT_CONFIG2) {
+                r[o >> 2] = val;
+                if (soc->wdt_en[g])
+                    soc->wdt_expire[g] =
+                        rv->csr_cycle + esp32c3_wdt_cycles(soc, g);
+            } else if (o == TIMG_WDT_FEED) {
+                if (soc->wdt_unlock[g]) {
+                    r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
+                    if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
+                        soc->intc_status &=
+                            ~(((uint64_t) 1) << (g == 0 ? C3_TG0_WDT_INTR_SOURCE
+                                                       : C3_TG1_WDT_INTR_SOURCE));
+                    soc->wdt_expire[g] =
+                        rv->csr_cycle + esp32c3_wdt_cycles(soc, g);
+                }
+                r[o >> 2] = val;
+            } else {
+                r[o >> 2] = val;
+            }
+            return;
+        }
     }
     /* RTC_CNTL / IO_MUX / eFuse / RTC_I2C */
     if (addr < C3_PERIPH_BASE + 0xF000u) {
@@ -1861,14 +2239,14 @@ static uint32_t esp32_intc_raise(esp32c3_t *soc)
     for (int s = 0; s < 52; s++)
         if (pending & (1ULL << s))
             lines |= 1u << (soc->intc_intmap[s] & 0x1Fu);
-    /* Clear EIP for lines that no longer have a pending source. */
-    soc->intc_eip &= lines;
+    /* ESP32 interrupt sources are level-triggered: a line stays asserted for
+     * as long as its source is pending and enabled. Keep csr_mip high until
+     * the ISR clears the source (do not self-clear via the EIP latch). */
     uint32_t raise = 0;
     for (int s = 0; s < 52; s++) {
         if (pending & (1ULL << s)) {
             int line = soc->intc_intmap[s] & 0x1Fu;
-            if (line >= 1 && line < 31 && (soc->intc_enable & (1u << line)) &&
-                !(soc->intc_eip & (1u << line)))
+            if (line >= 1 && line < 31 && (soc->intc_enable & (1u << line)))
                 raise |= 1u << line;
         }
     }
@@ -1882,16 +2260,14 @@ void esp32c3_check_interrupt(riscv_t *rv)
         return;
     if (!(rv->csr_mstatus & MSTATUS_MIE))
         return;
-    rv->csr_mip = (rv->csr_mip & ~0x7FFFFFFEu) | esp32_intc_raise(soc);
-    /* The ESP32-C3 does not use the CSR mie (the app never writes it); the
-     * INTC per-line enable (checked in esp32_intc_raise) plus mstatus.MIE
-     * are the only gates. */
-    uint32_t pending = rv->csr_mip;
-    if (!pending)
+    /* The interrupt matrix (intc_enable) is the per-line gate: raise the CPU
+     * lines that have a pending, enabled source, then deliver the lowest-numbered
+     * one as a machine interrupt (mcause = (1<<31) | line). */
+    uint32_t lines = esp32_intc_raise(soc);
+    rv->csr_mip = (rv->csr_mip & ~0x7FFFFFFEu) | lines;
+    if (!lines)
         return;
-    /* lowest set bit = CPU interrupt number */
-    int idx = __builtin_ctz(pending);
-    soc->intc_eip |= 1u << idx; /* claim the line (blocks re-delivery) */
+    int idx = __builtin_ctz(lines);
     SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ((1u << 31) | idx), 0);
 }
 
@@ -1912,32 +2288,6 @@ void esp32c3_periodic(riscv_t *rv)
     uint64_t rtc_total = elapsed + soc->rtc_frac;
     soc->rtc_frac = rtc_total % 64u;
     soc->rtc_time += rtc_total / 64u;
-    if (rv->PC == 0x403cf2f6u)
-        fprintf(stderr, "DBG: boot-mmap pc=0x403cf2f6 a0(off)=0x%x a1(size)=0x%x\n",
-                rv->X[10], rv->X[11]);
-    if (rv->PC == 0x403cf0d6u)
-        fprintf(stderr, "DBG: efuse-blkrev-check pc=0x403cf0d6 a0(min)=0x%x "
-                "a1(max)=0x%x\n", rv->X[10], rv->X[11]);
-    if (rv->PC == 0x403d051cu) {
-        uint32_t s3 = rv->X[19];
-        uint32_t a = s3 + 176;
-        esp32_region_t *r = esp32_find_region(soc, a);
-        uint32_t v = 0;
-        if (r && a + 2 <= r->base + r->size)
-            v = *(uint32_t *) (r->data + (a - r->base));
-        fprintf(stderr, "DBG: efuse-lhu s3=0x%08x b176=%04x b178=%04x\n", s3,
-                v & 0xFFFFu, v >> 16);
-    }
-    if ((rv->csr_cycle & 0x7FFFFFu) == 0)
-        fprintf(stderr, "DBG: pc=0x%08x cycle=%llu rtc=%llu\n", rv->PC,
-                (unsigned long long) rv->csr_cycle,
-                (unsigned long long) soc->rtc_time);
-    if (rv->PC == 0x42009b16u && (rv->csr_cycle & 0xFFFu) == 0)
-        fprintf(stderr, "DBG: rtc-loop rtc=%llu cycle=%llu\n",
-                (unsigned long long) soc->rtc_time,
-                (unsigned long long) rv->csr_cycle);
-    if (rv->PC == 0x403836beu)
-        fprintf(stderr, "DBG: us2slow us=%08x freq=%08x\n", rv->X[10], rv->X[12]);
 
 /* SYSTIMER alarms. The C3: alarm enables are SYSTIMER_CONF bits
  * (TARGET0_WORK_EN=24, TARGET2_WORK_EN=22); TIMER_UNIT_SEL (bit31 of the
@@ -2199,5 +2549,118 @@ void esp32c3_periodic(riscv_t *rv)
         soc->rmt_tx_done_cycle = 0;
         mmio32[(C3_RMT_BASE + 0x38u) >> 2] |= 0x1u; /* INT_RAW TX_DONE (CH0) */
         soc->intc_status |= 1ULL << C3_RMT_INTR_SOURCE;
+    }
+
+    /* LEDC output drive: enabled channels drive their routed pads. The GPIO
+     * matrix FUNCx_OUT_SEL (0x60004554 + 4*pin) picks the signal; LEDC
+     * channels 0-5 are signals 0-5. The pad level follows the PWM phase. */
+    {
+        uint32_t *mmio32 = (uint32_t *) soc->mmio;
+        for (int c = 0; c < 6; c++) {
+            uint32_t conf0 = soc->ledc_reg[LEDC_CH_CONF0(c) >> 2];
+            int level;
+            if (conf0 & LEDC_SIG_OUT_EN) {
+                uint32_t t = conf0 & 0x3u;
+                uint32_t conf = soc->ledc_reg[LEDC_TIMER_CONF(t) >> 2];
+                uint32_t res = conf & 0x1Fu;
+                uint32_t f = (conf >> 5) & 0x3FFFFu;
+                uint32_t ratio = (conf & LEDC_TICK_SEL) ? 10u : 1u;
+                uint32_t period = 1u << (res < 25 ? res : 25);
+                if (f == 0) {
+                    level = (conf0 & LEDC_IDLE_LV) ? 1 : 0;
+                } else {
+                    uint64_t span = (uint64_t) f * (uint64_t) period * ratio;
+                    soc->ledc_timer_frac[t] +=
+                        (rv->csr_cycle - soc->ledc_timer_anchor[t]) * 512ull;
+                    soc->ledc_timer_anchor[t] = rv->csr_cycle;
+                    soc->ledc_timer_frac[t] %= span;
+                    uint64_t ticks = soc->ledc_timer_frac[t] / f;
+                    uint32_t pos = (uint32_t)(ticks % period);
+                    uint32_t hpoint =
+                        soc->ledc_reg[LEDC_CH_HPOINT(c) >> 2] & 0xFFFFFu;
+                    uint32_t duty =
+                        (soc->ledc_duty_r[c] & 0x1FFFFFFu) >> 4u;
+                    level = ((pos + period - hpoint) % period) < duty;
+                }
+            } else {
+                level = (conf0 & LEDC_IDLE_LV) ? 1 : 0;
+            }
+            for (int p = 0; p < 22; p++) {
+                uint32_t sel = mmio32[(0x4554u + 4u * p) >> 2] & 0xFFu;
+                if (sel == (uint32_t) c) {
+                    if (level)
+                        soc->gpio_in |= 1u << p;
+                    else
+                        soc->gpio_in &= ~(1u << p);
+                }
+            }
+        }
+    }
+
+    /* TIMG0/1 alarms: the counter ticks at the selected clock (PLL 80MHz or
+     * XTAL 40MHz, ratio vs the 1:1 cycle clock) divided by DIVIDER+1. On
+     * alarm: raw bit 0 set and the source raised (level semantics). With
+     * AUTORELOAD the counter reloads from T0LOADLO/HI. */
+    for (int g = 0; g < 2; g++) {
+        uint32_t cfg = soc->timg_reg[g][TIMG_T0CONFIG >> 2];
+        if (!(cfg & TIMG_T0_EN))
+            continue;
+        uint32_t div = ((cfg & TIMG_T0_DIVIDER) >> 13) + 1u;
+        /* csr_cycle advances at the C3 SYSTIMER base clock (16 MHz); the GPTIMER
+         * reference is APB (80 MHz) or XTAL (40 MHz). Convert to csr_cycle units
+         * so the timer ticks at the requested frequency relative to the rest of
+         * the SoC (the SYSTIMER model counts 1:1 with csr_cycle). */
+        uint32_t timer_mhz = (cfg & TIMG_T0_USE_XTAL) ? 40u : 80u;
+        uint64_t step = ((uint64_t) div * ESP32C3_CSR_CLK_MHZ) / timer_mhz;
+        if (step == 0)
+            step = 1;
+        soc->timg_frac[g] += rv->csr_cycle - soc->timg_anchor[g];
+        soc->timg_anchor[g] = rv->csr_cycle;
+        uint64_t elapsed = soc->timg_frac[g] / step;
+        soc->timg_frac[g] %= step;
+        uint64_t cnt;
+        if (cfg & TIMG_T0_INCREASE)
+            cnt = soc->timg_counter[g] + elapsed;
+        else
+            cnt = (elapsed > soc->timg_counter[g]) ? 0
+                                                   : soc->timg_counter[g] - elapsed;
+        soc->timg_counter[g] = cnt;
+        uint64_t alarm =
+            ((uint64_t) soc->timg_reg[g][TIMG_T0ALARMHI >> 2] << 32) |
+            soc->timg_reg[g][TIMG_T0ALARMLO >> 2];
+        uint32_t src = (g == 0) ? C3_TG0_T0_INTR_SOURCE
+                                : C3_TG1_T0_INTR_SOURCE;
+        int past = (cfg & TIMG_T0_ALARM_EN) && alarm &&
+                   ((cfg & TIMG_T0_INCREASE) ? cnt >= alarm : cnt <= alarm);
+        if (past) {
+            soc->timg_reg[g][TIMG_INT_RAW >> 2] |= TIMG_INT_T0_ALARM;
+            if (soc->timg_reg[g][TIMG_INT_RAW >> 2] &
+                soc->timg_reg[g][TIMG_INT_ENA >> 2])
+                soc->intc_status |= ((uint64_t) 1) << src;
+            if (cfg & TIMG_T0_AUTORELOAD) {
+                uint64_t reload =
+                    ((uint64_t) soc->timg_reg[g][TIMG_T0LOADHI >> 2] << 32) |
+                    soc->timg_reg[g][TIMG_T0LOADLO >> 2];
+                soc->timg_counter[g] = reload;
+                soc->timg_anchor[g] = rv->csr_cycle;
+                soc->timg_frac[g] = 0;
+            }
+        }
+    }
+
+    /* MWDT (Timer Group Watchdog) timeouts: when armed and the expiry cycle
+     * passes without a feed, raise the group's WDT interrupt. */
+    for (int g = 0; g < 2; g++) {
+        if (!soc->wdt_en[g])
+            continue;
+        if (rv->csr_cycle < soc->wdt_expire[g])
+            continue;
+        soc->timg_reg[g][TIMG_INT_RAW >> 2] |= TIMG_INT_WDT;
+        if (soc->timg_reg[g][TIMG_INT_RAW >> 2] &
+            soc->timg_reg[g][TIMG_INT_ENA >> 2]) {
+            uint32_t src = (g == 0) ? C3_TG0_WDT_INTR_SOURCE
+                                    : C3_TG1_WDT_INTR_SOURCE;
+            soc->intc_status |= ((uint64_t) 1) << src;
+        }
     }
 }
