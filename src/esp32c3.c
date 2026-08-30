@@ -193,9 +193,9 @@ struct esp32c3_soc {
     /* INTC (interrupt matrix) */
     uint32_t intc_enable;
     uint32_t intc_type;
-    uint64_t intc_status;
+    unsigned __int128 intc_status; /* pending sources 0..127 */
     uint32_t intc_eip; /* claimed (exception-in-progress) lines */
-    uint32_t intc_intmap[64];
+    uint32_t intc_intmap[72];    /* sources 0..71 (AES=69, etc.) */
 
     /* GPIO */
     uint32_t gpio_out;
@@ -282,6 +282,9 @@ struct esp32c3_soc {
 
     /* TIMG0/1 (0x6001F000/0x60020000): one timer per group + MWDT */
     uint32_t timg_reg[2][64]; /* 0x100 bytes, mirrors timer_group_dev_t */
+
+    /* AES accelerator (0x6003A000): key/text/iv/mode/state registers */
+    uint32_t aes_reg[64];     /* 0x100 bytes, mirrors aes_dev_t */
     int wdt_en[2];
     uint64_t wdt_expire[2];
     int wdt_unlock[2];
@@ -461,7 +464,7 @@ esp32c3_t *esp32c3_new(void)
            esp32c3_rom_sram_bin_len);
 
     /* INTC default: source s maps to CPU line s */
-    for (int i = 0; i < 64; i++)
+    for (int i = 0; i < 72; i++)
         soc->intc_intmap[i] = i;
 
     return soc;
@@ -493,6 +496,7 @@ esp32c3_t *esp32c3_new(void)
 #define C3_DMA_CH0_INTR_SOURCE 44u
 #define C3_DMA_CH1_INTR_SOURCE 45u
 #define C3_DMA_CH2_INTR_SOURCE 46u
+#define C3_AES_INTR_SOURCE 48u   /* ETS_AES_INTR_SOURCE (AES_INT_MAP @0xC0) */
 /* TWAI0 (CAN) register bits */
 #define TWAI0_CMD_TX_REQUEST 0x1u
 #define TWAI0_CMD_RELEASE_BUFFER 0x4u
@@ -504,6 +508,9 @@ esp32c3_t *esp32c3_new(void)
 #define TWAI0_STATUS_RS 0x10u
 #define TWAI0_INTR_TI 0x2u
 #define TWAI0_INTR_RI 0x1u
+/* AES accelerator (0x6003A000): key/text/iv/mode/state registers */
+#define C3_AES_BASE 0x6003A000u
+#define C3_AES_SIZE 0xB4u
 /* GDMA (0x6003F000): 3 channels, OUT(TX)=source / IN(RX)=dest */
 #define C3_GDMA_BASE 0x6003F000u
 #define C3_GDMA_SIZE 0x2B0u
@@ -511,6 +518,9 @@ esp32c3_t *esp32c3_new(void)
 #define GDMA_CHAN_BLK_STRIDE 0xC0u
 #define GDMA_OUT_EOF_BIT 4u
 #define GDMA_IN_SUC_EOF_BIT 1u
+/* GDMA peripheral select for the AES accelerator (ESP32-C3). Both the OUT
+ * (data into AES) and IN (data out of AES) channels use this peri_sel. */
+#define C3_GDMA_PERI_AES 6u
 #define GDMA_OUTLINK_START_BIT 21u
 #define GDMA_OUTLINK_STOP_BIT 20u
 #define GDMA_INLINK_START_BIT 22u
@@ -647,6 +657,221 @@ static uint32_t esp32c3_gpio_eff_out(esp32c3_t *soc, uint32_t *mmio32)
     return out;
 }
 
+/* Minimal FIPS-197 AES used to emulate the C3 hardware AES accelerator.
+ * State/key are handled as flat 16-byte / keylen-byte arrays in standard
+ * (big-endian word) order; the guest's little-endian register words are
+ * converted at the MMIO boundary. */
+static const uint8_t esp32c3_aes_sbox[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16};
+
+static uint8_t esp32c3_aes_gmul(uint8_t a, uint8_t b)
+{
+    uint8_t p = 0;
+    for (int i = 0; i < 8; i++) {
+        if (b & 1) p ^= a;
+        uint8_t hi = a & 0x80;
+        a = (uint8_t)(a << 1);
+        if (hi) a ^= 0x1b;
+        b >>= 1;
+    }
+    return p;
+}
+
+static void esp32c3_aes_keyexp(const uint8_t *key, int Nk, uint8_t *w)
+{
+    int Nr = Nk + 6, Nb = 4;
+    for (int i = 0; i < Nk; i++) {
+        w[4*i] = key[4*i]; w[4*i+1] = key[4*i+1];
+        w[4*i+2] = key[4*i+2]; w[4*i+3] = key[4*i+3];
+    }
+    uint8_t rcon = 1, t[4];
+    for (int i = Nk; i < Nb*(Nr+1); i++) {
+        t[0] = w[4*(i-1)]; t[1] = w[4*(i-1)+1];
+        t[2] = w[4*(i-1)+2]; t[3] = w[4*(i-1)+3];
+        if (i % Nk == 0) {
+            uint8_t x = t[0]; t[0] = t[1]; t[1] = t[2]; t[2] = t[3]; t[3] = x;
+            t[0] = esp32c3_aes_sbox[t[0]]; t[1] = esp32c3_aes_sbox[t[1]];
+            t[2] = esp32c3_aes_sbox[t[2]]; t[3] = esp32c3_aes_sbox[t[3]];
+            t[0] ^= rcon;
+            rcon = (uint8_t)((rcon << 1) ^ ((rcon & 0x80) ? 0x1b : 0));
+        } else if (Nk > 6 && i % Nk == 4) {
+            t[0] = esp32c3_aes_sbox[t[0]]; t[1] = esp32c3_aes_sbox[t[1]];
+            t[2] = esp32c3_aes_sbox[t[2]]; t[3] = esp32c3_aes_sbox[t[3]];
+        }
+        w[4*i]   = w[4*(i-Nk)]   ^ t[0];
+        w[4*i+1] = w[4*(i-Nk)+1] ^ t[1];
+        w[4*i+2] = w[4*(i-Nk)+2] ^ t[2];
+        w[4*i+3] = w[4*(i-Nk)+3] ^ t[3];
+    }
+}
+
+static void esp32c3_aes_subshift(uint8_t *s, int dec)
+{
+    if (!dec) {
+        for (int i = 0; i < 16; i++) s[i] = esp32c3_aes_sbox[s[i]];
+        uint8_t t;
+        t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
+        t = s[2]; s[2] = s[10]; s[10] = t;  t = s[6]; s[6] = s[14]; s[14] = t;
+        t = s[3]; s[3] = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = t;
+    } else {
+        uint8_t t;
+        t = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = t;
+        t = s[2]; s[2] = s[10]; s[10] = t;  t = s[6]; s[6] = s[14]; s[14] = t;
+        t = s[3]; s[3] = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = t;
+        /* inverse sbox applied by caller via separate table */
+    }
+}
+
+static const uint8_t esp32c3_aes_inv_sbox[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d};
+
+static void esp32c3_aes_mix(uint8_t *s, int inv)
+{
+    for (int c = 0; c < 4; c++) {
+        uint8_t s0 = s[0+4*c], s1 = s[1+4*c], s2 = s[2+4*c], s3 = s[3+4*c];
+        if (!inv) {
+            s[0+4*c] = esp32c3_aes_gmul(s0,2) ^ esp32c3_aes_gmul(s1,3) ^ s2 ^ s3;
+            s[1+4*c] = s0 ^ esp32c3_aes_gmul(s1,2) ^ esp32c3_aes_gmul(s2,3) ^ s3;
+            s[2+4*c] = s0 ^ s1 ^ esp32c3_aes_gmul(s2,2) ^ esp32c3_aes_gmul(s3,3);
+            s[3+4*c] = esp32c3_aes_gmul(s0,3) ^ s1 ^ s2 ^ esp32c3_aes_gmul(s3,2);
+        } else {
+            s[0+4*c] = esp32c3_aes_gmul(s0,14) ^ esp32c3_aes_gmul(s1,11) ^ esp32c3_aes_gmul(s2,13) ^ esp32c3_aes_gmul(s3,9);
+            s[1+4*c] = esp32c3_aes_gmul(s0,9)  ^ esp32c3_aes_gmul(s1,14) ^ esp32c3_aes_gmul(s2,11) ^ esp32c3_aes_gmul(s3,13);
+            s[2+4*c] = esp32c3_aes_gmul(s0,13) ^ esp32c3_aes_gmul(s1,9)  ^ esp32c3_aes_gmul(s2,14) ^ esp32c3_aes_gmul(s3,11);
+            s[3+4*c] = esp32c3_aes_gmul(s0,11) ^ esp32c3_aes_gmul(s1,13) ^ esp32c3_aes_gmul(s2,9)  ^ esp32c3_aes_gmul(s3,14);
+        }
+    }
+}
+
+static void esp32c3_aes_block(const uint8_t *in, const uint8_t *key, int Nk,
+                              int decrypt, uint8_t *out)
+{
+    int Nr = Nk + 6, Nb = 4;
+    uint8_t w[4 * (Nb*(Nr+1))];
+    uint8_t s[16];
+    esp32c3_aes_keyexp(key, Nk, w);
+    memcpy(s, in, 16);
+    if (!decrypt) {
+        for (int r = 0; r < Nr; r++) {
+            for (int i = 0; i < 16; i++) s[i] ^= w[r*16 + i];
+            for (int i = 0; i < 16; i++) s[i] = esp32c3_aes_sbox[s[i]];
+            uint8_t t;
+            t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
+            t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
+            t = s[3]; s[3] = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = t;
+            if (r < Nr - 1) esp32c3_aes_mix(s, 0);
+        }
+        for (int i = 0; i < 16; i++) s[i] ^= w[Nr*16 + i];
+    } else {
+        /* AES decrypt: standard cipher inverse */
+        for (int i = 0; i < 16; i++) s[i] ^= w[Nr*16 + i];
+        for (int r = Nr - 1; r >= 1; r--) {
+            uint8_t t;
+            t = s[3]; s[3] = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = t;
+            t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
+            t = s[1]; s[1] = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = t;
+            for (int i = 0; i < 16; i++) s[i] = esp32c3_aes_inv_sbox[s[i]];
+            for (int i = 0; i < 16; i++) s[i] ^= w[r*16 + i];
+            esp32c3_aes_mix(s, 1);
+        }
+        /* final round: no InvMixColumns */
+        uint8_t t;
+        t = s[3]; s[3] = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = t;
+        t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
+        t = s[1]; s[1] = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = t;
+        for (int i = 0; i < 16; i++) s[i] = esp32c3_aes_inv_sbox[s[i]];
+        for (int i = 0; i < 16; i++) s[i] ^= w[i];
+    }
+    memcpy(out, s, 16);
+}
+
+/* Emulate one AES block operation triggered by a write to AES_TRIGGER_REG. */
+/* Run `nblocks` 16-byte AES blocks from `in` to `out`, honouring the
+ * key/mode/block-mode registers in soc->aes_reg. CBC chaining (when
+ * selected) advances the IV stored in the IV registers. */
+static void esp32c3_aes_process_buf(esp32c3_t *soc, const uint8_t *in,
+                                    uint8_t *out, int nblocks)
+{
+    uint32_t mode = soc->aes_reg[0x40u >> 2];
+    int decrypt = (mode & 0x4u) ? 1 : 0;
+    int key_bytes = ((mode & 0x3u) + 2) * 8;
+    int Nk = key_bytes / 4;
+    int blk = soc->aes_reg[0x94u >> 2] & 0xF;   /* 0=ECB, 1=CBC, ... */
+    uint8_t key[32], iv[16];
+    for (int i = 0; i < key_bytes; i++)
+        key[i] = (uint8_t)(soc->aes_reg[(0x00u + (i & ~3u)) >> 2] >> (8 * (i & 3)));
+    for (int i = 0; i < 16; i++)
+        iv[i] = (uint8_t)(soc->aes_reg[(0x50u + (i & ~3u)) >> 2] >> (8 * (i & 3)));
+    for (int b = 0; b < nblocks; b++) {
+        const uint8_t *pin = in + 16 * b;
+        uint8_t *pout = out + 16 * b;
+        if (blk == 1) { /* CBC */
+            uint8_t x[16];
+            if (!decrypt) {
+                for (int i = 0; i < 16; i++) x[i] = (uint8_t)(pin[i] ^ iv[i]);
+                esp32c3_aes_block(x, key, Nk, 0, pout);
+                for (int i = 0; i < 16; i++) iv[i] = pout[i];
+            } else {
+                esp32c3_aes_block(pin, key, Nk, 1, pout);
+                for (int i = 0; i < 16; i++) {
+                    pout[i] = (uint8_t)(pout[i] ^ iv[i]);
+                    iv[i] = pin[i];
+                }
+            }
+        } else { /* ECB (and other modes fall back to ECB here) */
+            esp32c3_aes_block(pin, key, Nk, decrypt, pout);
+        }
+    }
+    if (blk == 1) /* write back updated CBC IV */
+        for (int i = 0; i < 16; i++)
+            soc->aes_reg[(0x50u + (i & ~3u)) >> 2] =
+                (soc->aes_reg[(0x50u + (i & ~3u)) >> 2] & ~(0xFFu << (8 * (i & 3)))) |
+                ((uint32_t) iv[i] << (8 * (i & 3)));
+}
+
+/* Trigger path: one block written through the TEXT_IN/TEXT_OUT registers. */
+static void esp32c3_aes_run(esp32c3_t *soc)
+{
+    uint8_t in[16], out[16];
+    for (int i = 0; i < 16; i++)
+        in[i] = (uint8_t)(soc->aes_reg[(0x20u + (i & ~3u)) >> 2] >> (8 * (i & 3)));
+    esp32c3_aes_process_buf(soc, in, out, 1);
+    for (int i = 0; i < 16; i++)
+        soc->aes_reg[(0x30u + (i & ~3u)) >> 2] =
+            (soc->aes_reg[(0x30u + (i & ~3u)) >> 2] & ~(0xFFu << (8 * (i & 3)))) |
+            ((uint32_t) out[i] << (8 * (i & 3)));
+}
+
 /* MWDT expiry, in emulator cycles: the C3 WDT clock is ~40MHz while the guest
  * cycle clock is ~80MHz, so multiply by 2 as an approximation. */
 static uint64_t esp32c3_wdt_cycles(esp32c3_t *soc, int g)
@@ -686,7 +911,7 @@ static void esp32c3_gpio_edge_check(esp32c3_t *soc, uint32_t *mmio32,
         }
         if (fire && ena) {
             soc->gpio_status |= 1u << pin;
-            soc->intc_status |= ((uint64_t) 1) << C3_GPIO_INTR_SOURCE;
+            soc->intc_status |= ((unsigned __int128) 1) << C3_GPIO_INTR_SOURCE;
         }
     }
 }
@@ -759,9 +984,20 @@ have_seen:
     uint32_t off = addr - C3_PERIPH_BASE;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
 
+
     /* Flash cache MMU page table (0x600C5000): return programmed pages */
     if (addr >= C3_MMU_TABLE_BASE && addr < C3_MMU_TABLE_END)
         return soc->mmu[(addr - C3_MMU_TABLE_BASE) >> 2];
+
+    /* AES accelerator (0x6003A000): registers including computed TEXT_OUT;
+     * AES_STATE_REG stays 0 (idle) so the driver's done-poll succeeds. */
+    if (addr >= C3_AES_BASE && addr < C3_AES_BASE + C3_AES_SIZE) {
+        uint32_t a = addr - C3_AES_BASE;
+        if (a == 0xacu)
+            fprintf(stderr, "DBG: aes int_raw rd =0x%08x ena=0x%08x\n",
+                    soc->aes_reg[a >> 2], soc->aes_reg[0xb0u >> 2]);
+        return soc->aes_reg[a >> 2];
+    }
 
     /* TIMG1 WDT_CONFIG0 (0x600260B0): the bootloader's stable-read XORs
      * repeated reads of this register; a constant value yields 0 (even
@@ -854,7 +1090,7 @@ have_seen:
                 (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI))
                 soc->twai_reg[0x0c >> 2] = TWAI0_INTR_RI;
             if (!soc->twai_reg[0x0c >> 2])
-                soc->intc_status &= ~((uint64_t)1) << C3_TWAI_INTR_SOURCE;
+                soc->intc_status &= ~((unsigned __int128) 1) << C3_TWAI_INTR_SOURCE;
             return v;
         }
         return soc->twai_reg[off >> 2];
@@ -1050,13 +1286,17 @@ have_seen:
     if (addr >= C3_PERIPH_BASE + 0xC2000u &&
         addr < C3_PERIPH_BASE + 0xC3000u) {
         uint32_t o = off - 0xC2000u;
-        if (o < 52 * 4u)
+        if (o < 52u * 4u)
             return soc->intc_intmap[o >> 2];
         switch (o) {
         case INTC_INTR_STATUS:
             return (uint32_t) soc->intc_status; /* raw pending sources 0-31 */
         case INTC_INTR_STATUS_1:
             return (uint32_t) (soc->intc_status >> 32); /* sources 32-63 */
+        case 0x08u:
+            return (uint32_t) (soc->intc_status >> 64); /* sources 64-95 */
+        case 0x0Cu:
+            return (uint32_t) (soc->intc_status >> 96); /* sources 96-127 */
         case INTC_INT_ENABLE:
             return soc->intc_enable;
         case INTC_INT_TYPE:
@@ -1121,6 +1361,31 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
     uint32_t off = addr - C3_PERIPH_BASE;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
 
+    /* AES accelerator (0x6003A000): store registers; a TRIGGER write runs
+     * the block op and writes the result into the TEXT_OUT registers. The
+     * guest polls AES_STATE_REG until it reads DONE (2); config writes reset
+     * it to IDLE (0) so a pre-trigger idle wait also succeeds. */
+    if (addr >= C3_AES_BASE && addr < C3_AES_BASE + C3_AES_SIZE) {
+        uint32_t a = addr - C3_AES_BASE;
+        if (a == 0xacu) { /* AES_INT_CLR: write-1-to-clear */
+            soc->aes_reg[a >> 2] &= ~val;
+            return;
+        }
+        if (a == 0xb0u) { /* AES_INT_ENA */
+            soc->aes_reg[a >> 2] = val;
+            return;
+        }
+        soc->aes_reg[a >> 2] = val;
+        if (a == 0x48u) { /* AES_TRIGGER_REG */
+            if (!soc->aes_reg[0x90u >> 2]) /* single-block CPU path only */
+                esp32c3_aes_run(soc);
+            soc->aes_reg[0x4cu >> 2] = 2u; /* ESP_AES_STATE_DONE */
+        } else {
+            soc->aes_reg[0x4cu >> 2] = 0u; /* IDLE */
+        }
+        return;
+    }
+
     /* UART0/1 (0x60000000 / 0x60010000) */
     for (int p = 0; p < 2; p++) {
         uint32_t base = C3_PERIPH_BASE + 0x10000u * p;
@@ -1157,7 +1422,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                         if (*ena & (UART_RXFIFO_TOUT_BIT | 0x1u)) {
                             int src = (p == 0) ? C3_UART0_INTR_SOURCE
                                                : C3_UART1_INTR_SOURCE;
-                            soc->intc_status |= ((uint64_t) 1) << src;
+                            soc->intc_status |= ((unsigned __int128) 1) << src;
                         }
                     }
                 }
@@ -1172,7 +1437,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     *raw |= UART_TXFIFO_EMPTY_BIT;
                     int src = (p == 0) ? C3_UART0_INTR_SOURCE
                                        : C3_UART1_INTR_SOURCE;
-                    soc->intc_status |= ((uint64_t) 1) << src;
+                    soc->intc_status |= ((unsigned __int128) 1) << src;
                 }
             } else if (o == UART_INT_CLR_REG) { /* W1C */
                 uint32_t *raw =
@@ -1182,7 +1447,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                               UART_TXFIFO_EMPTY_BIT))) {
                     int src = (p == 0) ? C3_UART0_INTR_SOURCE
                                        : C3_UART1_INTR_SOURCE;
-                    soc->intc_status &= ~(((uint64_t) 1) << src);
+                    soc->intc_status &= ~(((unsigned __int128) 1) << src);
                 }
             } else if (o == UART_CONF0_REG) {
                 mmio32[off >> 2] = val;
@@ -1198,7 +1463,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         if (addr == C3_PERIPH_BASE + 0x13024u) { /* int_clr */
             soc->i2c_reg[0x20 >> 2] &= ~val; /* clear raw status bits */
             soc->intc_status &=
-                ~(((uint64_t) 1) << C3_I2C_EXT0_INTR_SOURCE); /* drop IRQ */
+                ~(((unsigned __int128) 1) << C3_I2C_EXT0_INTR_SOURCE); /* drop IRQ */
         } else if (addr == C3_PERIPH_BASE + 0x13018u) { /* fifo_conf */
             soc->i2c_reg[0x18 >> 2] = val;
             if (val & (1u << 13)) /* tx_fifo_rst */
@@ -1290,7 +1555,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->gdma_int_raw[ch] &= ~val;
                 if (!(soc->gdma_int_raw[ch] & soc->gdma_int_ena[ch]))
                     soc->intc_status &=
-                        ~((uint64_t)1) << (C3_DMA_CH0_INTR_SOURCE + ch);
+                        ~((unsigned __int128) 1) << (C3_DMA_CH0_INTR_SOURCE + ch);
             }
             return;
         }
@@ -1319,6 +1584,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                             &soc->gdma_in_desc_len[c],
                             &soc->gdma_in_next_addr[c]))
                         soc->gdma_in_run[c] = 1;
+                    soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
+                    soc->gdma_out_conf0[c] &= ~(1u << 31);
                     if (soc->gdma_out_run[c]) { /* mem2mem pair ready */
                         soc->gdma_m2m_pending[c] = 1;
                         soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
@@ -1352,6 +1619,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                             &soc->gdma_out_desc_len[c],
                             &soc->gdma_out_next_addr[c]))
                         soc->gdma_out_run[c] = 1;
+                    soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
+                    soc->gdma_out_conf0[c] &= ~(1u << 31);
                     if (soc->gdma_in_run[c]) { /* mem2mem pair ready */
                         soc->gdma_m2m_pending[c] = 1;
                         soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
@@ -1439,13 +1708,13 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             break;
         case GPIO_STATUS_W1TS_REG:
             soc->gpio_status |= val;
-            soc->intc_status |= ((uint64_t) 1) << C3_GPIO_INTR_SOURCE;
+            soc->intc_status |= ((unsigned __int128) 1) << C3_GPIO_INTR_SOURCE;
             return;
         case GPIO_STATUS_W1TC_REG:
             soc->gpio_status &= ~val;
             if (!soc->gpio_status)
                 soc->intc_status &=
-                    ~(((uint64_t) 1) << C3_GPIO_INTR_SOURCE);
+                    ~(((unsigned __int128) 1) << C3_GPIO_INTR_SOURCE);
             return;
         default:
             mmio32[off >> 2] = val;
@@ -1546,7 +1815,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 r[TIMG_INT_RAW >> 2] &= ~val;
                 if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
                     soc->intc_status &=
-                        ~(((uint64_t) 1) << (g == 0 ? C3_TG0_T0_INTR_SOURCE
+                        ~(((unsigned __int128) 1) << (g == 0 ? C3_TG0_T0_INTR_SOURCE
                                                    : C3_TG1_T0_INTR_SOURCE));
                 r[o >> 2] = 0;
             } else if (o == TIMG_RTCCALICFG) {
@@ -1579,7 +1848,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     soc->wdt_en[g] = 0;
                     r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
                     soc->intc_status &=
-                        ~(((uint64_t) 1) << (g == 0 ? C3_TG0_WDT_INTR_SOURCE
+                        ~(((unsigned __int128) 1) << (g == 0 ? C3_TG0_WDT_INTR_SOURCE
                                                    : C3_TG1_WDT_INTR_SOURCE));
                 }
             } else if (o == TIMG_WDT_CONFIG1 || o == TIMG_WDT_CONFIG2) {
@@ -1592,7 +1861,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
                     if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
                         soc->intc_status &=
-                            ~(((uint64_t) 1) << (g == 0 ? C3_TG0_WDT_INTR_SOURCE
+                            ~(((unsigned __int128) 1) << (g == 0 ? C3_TG0_WDT_INTR_SOURCE
                                                        : C3_TG1_WDT_INTR_SOURCE));
                     soc->wdt_expire[g] =
                         rv->csr_cycle + esp32c3_wdt_cycles(soc, g);
@@ -1626,7 +1895,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             break;
         case 0x44u: /* INT_CLR */
             mmio32[(C3_RMT_BASE + 0x38u) >> 2] &= ~val;
-            soc->intc_status &= ~(1ULL << C3_RMT_INTR_SOURCE);
+            soc->intc_status &= ~(((unsigned __int128)1) << C3_RMT_INTR_SOURCE);
             break;
         default:
             break;
@@ -1708,8 +1977,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             return;
         case SYSTIMER_INT_CLR:
             soc->systimer_int_raw &= ~val;
-            soc->intc_status &= ~((1ull << SYSTIMER_T0_SOURCE) |
-                                  (1ull << SYSTIMER_T2_SOURCE));
+            soc->intc_status &= ~((((unsigned __int128)1) << SYSTIMER_T0_SOURCE) |
+                                  (((unsigned __int128)1) << SYSTIMER_T2_SOURCE));
             return;
         default:
             mmio32[off >> 2] = val;
@@ -1722,6 +1991,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         uint32_t o = off - 0xC2000u;
         if (o < 52 * 4u) {
             soc->intc_intmap[o >> 2] = val;
+            if (o <= 0xF4u)
+                fprintf(stderr, "DBG: intmap src=%d -> line=%u\n",
+                        o >> 2, val & 0x1Fu);
             return;
         }
         switch (o) {
@@ -1734,7 +2006,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             return;
         case INTC_INT_CLEAR:
             soc->intc_eip &= ~val; /* flush claimed state of the line */
-            soc->intc_status &= (uint64_t) (~val);
+            /* CPU_INT_CLEAR clears by CPU *line*; drop every source mapped to a
+             * cleared line (covers high sources such as AES=48 which live in the
+             * upper 32 bits of intc_status). */
+            for (int s = 0; s < 72; s++)
+                if (val & (1u << (soc->intc_intmap[s] & 0x1Fu)))
+                    soc->intc_status &= ~(((unsigned __int128) 1) << s);
             return;
         default:
             mmio32[off >> 2] = val;
@@ -1747,9 +2024,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
          * (the ISR acknowledges by clearing it, see esp_crosscore_isr). */
         if (addr == C3_PERIPH_BASE + 0xC0028u) {
             if (val & 1u)
-                soc->intc_status |= 1ULL << 50u;
+                soc->intc_status |= ((unsigned __int128)1) << 50u;
             else
-                soc->intc_status &= ~(1ULL << 50u);
+                soc->intc_status &= ~(((unsigned __int128)1) << 50u);
             mmio32[off >> 2] = val;
             {
                 static unsigned long cc;
@@ -2047,22 +2324,6 @@ uint32_t esp32_ifetch(riscv_t *rv, uint32_t addr)
                     rv->X[20], rv->X[9], rv->X[24], rv->X[26], sp, acc_writes);
         }
     }
-    {
-        static uint32_t lastblk = ~0u;
-        static uint32_t bhist[16384];
-        static int bn;
-        if (rv->PC != lastblk && bn < 16384) {
-            uint32_t t = rv->PC;
-            for (int i = 0; i < bn; i++)
-                if (bhist[i] == t)
-                    goto have_b;
-            bhist[bn++] = t;
-            fprintf(stderr, "DBG: boot-blk %03d 0x%08x\n", bn, t);
-        }
-        lastblk = rv->PC;
-    have_b:
-        ;
-    }
     if (rv->PC >= 0x4004949au && rv->PC <= 0x40049700u) {
         static uint32_t last_pc;
         if (rv->PC != last_pc) {
@@ -2234,19 +2495,25 @@ uint32_t esp32c3_boot(esp32c3_t *soc, const char *elf_path)
 /* Route enabled pending INTC sources to CPU interrupt lines (mip). */
 static uint32_t esp32_intc_raise(esp32c3_t *soc)
 {
-    uint64_t pending = soc->intc_status;
+    unsigned __int128 pending = soc->intc_status;
     uint32_t lines = 0;
-    for (int s = 0; s < 52; s++)
-        if (pending & (1ULL << s))
+    for (int s = 0; s < 72; s++)
+        if (pending & (((unsigned __int128)1) << s))
             lines |= 1u << (soc->intc_intmap[s] & 0x1Fu);
     /* ESP32 interrupt sources are level-triggered: a line stays asserted for
      * as long as its source is pending and enabled. Keep csr_mip high until
      * the ISR clears the source (do not self-clear via the EIP latch). */
     uint32_t raise = 0;
-    for (int s = 0; s < 52; s++) {
-        if (pending & (1ULL << s)) {
+    for (int s = 0; s < 72; s++) {
+        if (pending & ((unsigned __int128) 1 << s)) {
             int line = soc->intc_intmap[s] & 0x1Fu;
-            if (line >= 1 && line < 31 && (soc->intc_enable & (1u << line)))
+            /* Line 0 is reserved on real hardware, but this SDK maps a few
+             * crypto/DMA sources (44-49) onto it; deliver those, while never
+             * delivering line 0 for the many default-mapped (unused) sources
+             * that would otherwise storm during boot. */
+            int ok = (line >= 1 && line < 31) ||
+                     (line == 0 && s >= 44 && s <= 49);
+            if (ok && (soc->intc_enable & (1u << line)))
                 raise |= 1u << line;
         }
     }
@@ -2307,11 +2574,11 @@ void esp32c3_periodic(riscv_t *rv)
                 if (crossed > soc->systimer_t0_crossed) {
                     soc->systimer_t0_crossed = crossed;
                     soc->systimer_int_raw |= 1u;
-                    soc->intc_status |= 1ull << SYSTIMER_T0_SOURCE;
+                    soc->intc_status |= ((unsigned __int128)1) << SYSTIMER_T0_SOURCE;
                 }
             } else if (soc->systimer_comp0 && cnt0 >= soc->systimer_comp0) {
                 soc->systimer_int_raw |= 1u;
-                soc->intc_status |= 1ull << SYSTIMER_T0_SOURCE;
+                soc->intc_status |= ((unsigned __int128)1) << SYSTIMER_T0_SOURCE;
             }
         }
         uint64_t cnt2 = (soc->systimer_target2_conf & 0x80000000u)
@@ -2324,11 +2591,11 @@ void esp32c3_periodic(riscv_t *rv)
                 if (crossed > soc->systimer_t2_crossed) {
                     soc->systimer_t2_crossed = crossed;
                     soc->systimer_int_raw |= 4u;
-                    soc->intc_status |= 1ull << SYSTIMER_T2_SOURCE;
+                    soc->intc_status |= ((unsigned __int128)1) << SYSTIMER_T2_SOURCE;
                 }
             } else if (soc->systimer_comp2 && cnt2 >= soc->systimer_comp2) {
                 soc->systimer_int_raw |= 4u;
-                soc->intc_status |= 1ull << SYSTIMER_T2_SOURCE;
+                soc->intc_status |= ((unsigned __int128)1) << SYSTIMER_T2_SOURCE;
             }
         }
     }
@@ -2382,7 +2649,7 @@ void esp32c3_periodic(riscv_t *rv)
         soc->i2c_reg[0x4 >> 2] &= ~(1u << 5); /* trans_start self-clears */
         soc->i2c_tx_len = 0;
         if (soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2])
-            soc->intc_status |= ((uint64_t) 1) << C3_I2C_EXT0_INTR_SOURCE;
+            soc->intc_status |= ((unsigned __int128) 1) << C3_I2C_EXT0_INTR_SOURCE;
     }
 
     /* SPI2 transfer completion: cmd.usr was set. The virtual device (a
@@ -2455,7 +2722,7 @@ void esp32c3_periodic(riscv_t *rv)
         soc->twai_reg[0x04 >> 2] &= ~TWAI0_CMD_TX_REQUEST;
         soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_TCS;
         soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_TI;
-        soc->intc_status |= ((uint64_t)1) << C3_TWAI_INTR_SOURCE;
+        soc->intc_status |= ((unsigned __int128) 1) << C3_TWAI_INTR_SOURCE;
     }
 
     /* TWAI0 RX delivery: a virtual node on the bus sends one frame
@@ -2478,7 +2745,7 @@ void esp32c3_periodic(riscv_t *rv)
         soc->twai_reg[0x74 >> 2]++;
         if (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI) {
             soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_RI;
-            soc->intc_status |= ((uint64_t)1) << C3_TWAI_INTR_SOURCE;
+            soc->intc_status |= ((unsigned __int128) 1) << C3_TWAI_INTR_SOURCE;
         }
     }
 
@@ -2502,15 +2769,42 @@ void esp32c3_periodic(riscv_t *rv)
             uint32_t n = soc->gdma_out_desc_len[ch];
             if (n > soc->gdma_in_desc_len[ch])
                 n = soc->gdma_in_desc_len[ch];
-            if (src && dst && n)
-                memcpy(dst, src, n);
-            /* write-back: clear the OUT descriptor owner bit (CPU owns it) */
+            if (src && dst && n) {
+                if (soc->gdma_out_peri_sel[ch] == C3_GDMA_PERI_AES ||
+                    soc->gdma_in_peri_sel[ch] == C3_GDMA_PERI_AES) {
+                    /* AES accelerator: feed the source buffer through the
+                     * cipher (key/mode/IV taken from the AES registers) and
+                     * deliver the ciphertext to the destination buffer. */
+                    int nblk = (int)(n / 16u);
+                    if (nblk > 0) {
+                        uint8_t *enc = malloc(n);
+                        esp32c3_aes_process_buf(soc, src, enc, nblk);
+                        memcpy(dst, enc, n);
+                        free(enc);
+                    }
+                     /* Firmware polls AES_STATE_REG==2 and dw0.owner==0
+                      * (no ISR needed for short AES DMA transfers). */
+                     soc->aes_reg[0x4cu >> 2] = 2u; /* AES_STATE = DONE */
+                } else {
+                    memcpy(dst, src, n);
+                }
+            }
+            /* write-back: clear descriptor owner bits (CPU owns them) */
             uint8_t *od = esp32c3_dma_ptr(soc, out_addr);
             if (od) {
                 uint32_t dw0;
                 memcpy(&dw0, od, 4);
                 dw0 &= ~(1u << 31);
                 memcpy(od, &dw0, 4);
+            }
+            /* Also clear the IN descriptor owner bit — the firmware's
+             * esp_aes_dma_done() polls the output (result) descriptor. */
+            uint8_t *id = esp32c3_dma_ptr(soc, in_addr);
+            if (id) {
+                uint32_t dw0;
+                memcpy(&dw0, id, 4);
+                dw0 &= ~(1u << 31);
+                memcpy(id, &dw0, 4);
             }
             if (!soc->gdma_out_next_addr[ch] || !soc->gdma_in_next_addr[ch])
                 break;
@@ -2538,7 +2832,7 @@ void esp32c3_periodic(riscv_t *rv)
             soc->gdma_in_run[ch] = 0;
         }
         if (soc->gdma_int_raw[ch] & soc->gdma_int_ena[ch])
-            soc->intc_status |= ((uint64_t)1) << (C3_DMA_CH0_INTR_SOURCE + ch);
+            soc->intc_status |= ((unsigned __int128) 1) << (C3_DMA_CH0_INTR_SOURCE + ch);
     }
 
     /* RMT TX_DONE: a few cycles after a channel's CONF0 tx_start was seen,
@@ -2548,7 +2842,7 @@ void esp32c3_periodic(riscv_t *rv)
         uint32_t *mmio32 = (uint32_t *) soc->mmio;
         soc->rmt_tx_done_cycle = 0;
         mmio32[(C3_RMT_BASE + 0x38u) >> 2] |= 0x1u; /* INT_RAW TX_DONE (CH0) */
-        soc->intc_status |= 1ULL << C3_RMT_INTR_SOURCE;
+        soc->intc_status |= ((unsigned __int128)1) << C3_RMT_INTR_SOURCE;
     }
 
     /* LEDC output drive: enabled channels drive their routed pads. The GPIO
@@ -2636,7 +2930,7 @@ void esp32c3_periodic(riscv_t *rv)
             soc->timg_reg[g][TIMG_INT_RAW >> 2] |= TIMG_INT_T0_ALARM;
             if (soc->timg_reg[g][TIMG_INT_RAW >> 2] &
                 soc->timg_reg[g][TIMG_INT_ENA >> 2])
-                soc->intc_status |= ((uint64_t) 1) << src;
+                soc->intc_status |= ((unsigned __int128) 1) << src;
             if (cfg & TIMG_T0_AUTORELOAD) {
                 uint64_t reload =
                     ((uint64_t) soc->timg_reg[g][TIMG_T0LOADHI >> 2] << 32) |
@@ -2660,7 +2954,7 @@ void esp32c3_periodic(riscv_t *rv)
             soc->timg_reg[g][TIMG_INT_ENA >> 2]) {
             uint32_t src = (g == 0) ? C3_TG0_WDT_INTR_SOURCE
                                     : C3_TG1_WDT_INTR_SOURCE;
-            soc->intc_status |= ((uint64_t) 1) << src;
+            soc->intc_status |= ((unsigned __int128) 1) << src;
         }
     }
 }
