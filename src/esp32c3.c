@@ -2059,10 +2059,17 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         addr < C3_PERIPH_BASE + 0xC3000u) {
         uint32_t o = off - 0xC2000u;
         if (o < 52 * 4u) {
-            soc->intc_intmap[o >> 2] = val;
-            if (o <= 0xF4u)
-                fprintf(stderr, "DBG: intmap src=%d -> line=%u\n",
-                        o >> 2, val & 0x1Fu);
+            int src = o >> 2;
+            int new_line = val & 0x1Fu;
+            /* When remapping a source, clear any stale pending bit so that
+             * a previously-disabled source doesn't deliver a spurious
+             * interrupt on its new line.  This prevents the line-0 storm:
+             * the SDK initially maps all sources to line 0 (disable), which
+             * can accumulate INT_RAW bits from UART1/I2C init; remapping
+             * those sources to real lines would otherwise deliver stale
+             * interrupts before ISRs are installed. */
+            soc->intc_status &= ~(((unsigned __int128) 1) << src);
+            soc->intc_intmap[src] = new_line;
             return;
         }
         switch (o) {
