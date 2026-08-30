@@ -258,8 +258,10 @@ struct esp32c3_soc {
     uint32_t gdma_in_peri_sel[3];
     uint32_t gdma_int_raw[3];  /* channel-level raw (OUT_EOF=bit4,IN_SUC_EOF=1) */
     uint32_t gdma_int_ena[3];
-    uint32_t gdma_out_dscr[3]; /* current OUT descriptor address */
-    uint32_t gdma_in_dscr[3];  /* current IN descriptor address */
+    uint32_t gdma_out_dscr[3];       /* current OUT descriptor address */
+    uint32_t gdma_in_dscr[3];        /* current IN descriptor address */
+    uint32_t gdma_out_eof_des[3];    /* completed OUT descriptor (for eof_des_addr) */
+    uint32_t gdma_in_eof_des[3];     /* completed IN descriptor (for eof_des_addr) */
     uint8_t  gdma_out_run[3];
     uint8_t  gdma_in_run[3];
     uint32_t gdma_out_desc_buf[3];
@@ -285,6 +287,11 @@ struct esp32c3_soc {
 
     /* AES accelerator (0x6003A000): key/text/iv/mode/state registers */
     uint32_t aes_reg[64];     /* 0x100 bytes, mirrors aes_dev_t */
+
+    /* I2S0 (0x6002D000): configuration registers */
+    uint32_t i2s_reg[32];     /* 0x80 bytes, mirrors i2s_dev_t */
+    uint32_t i2s_rx_counter;  /* monotonic counter for synthesized RX data */
+
     int wdt_en[2];
     uint64_t wdt_expire[2];
     int wdt_unlock[2];
@@ -511,6 +518,9 @@ esp32c3_t *esp32c3_new(void)
 /* AES accelerator (0x6003A000): key/text/iv/mode/state registers */
 #define C3_AES_BASE 0x6003A000u
 #define C3_AES_SIZE 0xB4u
+/* I2S0 (0x6002D000): TX/RX serial audio interface */
+#define C3_I2S0_BASE 0x6002D000u
+#define C3_I2S0_SIZE 0x80u
 /* GDMA (0x6003F000): 3 channels, OUT(TX)=source / IN(RX)=dest */
 #define C3_GDMA_BASE 0x6003F000u
 #define C3_GDMA_SIZE 0x2B0u
@@ -999,6 +1009,30 @@ have_seen:
         return soc->aes_reg[a >> 2];
     }
 
+    /* I2S0 (0x6002D000): configuration registers.
+     * The LL driver reads back config registers it wrote, plus interrupt
+     * status and the DATE version register.  All reads just return the
+     * stored value except the ones with special behaviour below. */
+    if (addr >= C3_I2S0_BASE && addr < C3_I2S0_BASE + C3_I2S0_SIZE) {
+        uint32_t o = addr - C3_I2S0_BASE;
+        uint32_t rv;
+        switch (o) {
+        case 0x10u: /* INT_ST = raw & ena */
+            rv = soc->i2s_reg[0x0Cu >> 2] & soc->i2s_reg[0x14u >> 2];
+            break;
+        case 0x6Cu: /* STATE: bit 0 = tx_idle (1 when TX not active) */
+            rv = 1u;
+            break;
+        case 0x80u: /* DATE register — return non-zero so driver init succeeds */
+            rv = 0x26062022u;
+            break;
+        default:
+            rv = soc->i2s_reg[o >> 2];
+            break;
+        }
+        return rv;
+    }
+
     /* TIMG1 WDT_CONFIG0 (0x600260B0): the bootloader's stable-read XORs
      * repeated reads of this register; a constant value yields 0 (even
      * read count) and it retries forever. Rotate a single low bit per
@@ -1115,9 +1149,11 @@ have_seen:
             switch (r) {
             case 0x00: return soc->gdma_in_conf0[c];
             case 0x04: return soc->gdma_in_conf1[c];
+            case 0x08: return 0x02u; /* INFIFO_STATUS: empty (bit1=1) */
+            case 0x0C: return 0;    /* IN_POP: pop trigger, return 0 */
             case 0x10: return soc->gdma_in_link[c];
             case 0x14: return soc->gdma_in_run[c] ? 0x08000000u : 0; /* state */
-            case 0x18: return soc->gdma_in_dscr[c]; /* suc_eof des addr */
+            case 0x18: return soc->gdma_in_eof_des[c]; /* suc_eof des addr */
             case 0x20: return soc->gdma_in_dscr[c];
             case 0x24: return soc->gdma_in_desc_buf[c]; /* dscr_bf0 */
             case 0x30: return soc->gdma_in_peri_sel[c];
@@ -1128,9 +1164,11 @@ have_seen:
             switch (r2) {
             case 0x00: return soc->gdma_out_conf0[c];
             case 0x04: return soc->gdma_out_conf1[c];
+            case 0x08: return 0x02u; /* OUTFIFO_STATUS: empty (bit1=1) */
+            case 0x0C: return 0;    /* OUT_PUSH: push trigger */
             case 0x10: return soc->gdma_out_link[c];
             case 0x14: return soc->gdma_out_run[c] ? 0x08000000u : 0; /* state */
-            case 0x18: return soc->gdma_out_dscr[c]; /* eof des addr */
+            case 0x18: return soc->gdma_out_eof_des[c]; /* eof des addr */
             case 0x20: return soc->gdma_out_dscr[c];
             case 0x24: return soc->gdma_out_desc_buf[c]; /* dscr_bf0 */
             case 0x30: return soc->gdma_out_peri_sel[c];
@@ -1386,6 +1424,25 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         return;
     }
 
+    /* I2S0 (0x6002D000): store all configuration writes.
+     * INT_CLR (0x18) is write-1-to-clear.
+     * rx_update (bit 8 of 0x20) and tx_update (bit 8 of 0x24) are
+     * self-clearing: the LL driver polls them until HW clears them. */
+    if (addr >= C3_I2S0_BASE && addr < C3_I2S0_BASE + C3_I2S0_SIZE) {
+        uint32_t o = addr - C3_I2S0_BASE;
+        if (o == 0x18u) { /* INT_CLR: W1C */
+            soc->i2s_reg[0x0Cu >> 2] &= ~val; /* clear raw */
+            return;
+        }
+        soc->i2s_reg[o >> 2] = val;
+        /* Auto-clear self-clearing update bits */
+        if (o == 0x20u) /* RX_CONF: clear rx_update (bit 8) */
+            soc->i2s_reg[0x20u >> 2] &= ~(1u << 8);
+        if (o == 0x24u) /* TX_CONF: clear tx_update (bit 8) */
+            soc->i2s_reg[0x24u >> 2] &= ~(1u << 8);
+        return;
+    }
+
     /* UART0/1 (0x60000000 / 0x60010000) */
     for (int p = 0; p < 2; p++) {
         uint32_t base = C3_PERIPH_BASE + 0x10000u * p;
@@ -1551,6 +1608,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             uint32_t ch = o >> 4;
             if ((o & 0xFu) == 0x08u) { /* ena */
                 soc->gdma_int_ena[ch] = val;
+                /* Re-check pending interrupts: if raw bits are set and now
+                 * enabled, deliver the INTC line immediately. */
+                if (soc->gdma_int_raw[ch] & soc->gdma_int_ena[ch])
+                    soc->intc_status |= ((unsigned __int128) 1) << (C3_DMA_CH0_INTR_SOURCE + ch);
             } else if ((o & 0xFu) == 0x0Cu) { /* clr: W1C */
                 soc->gdma_int_raw[ch] &= ~val;
                 if (!(soc->gdma_int_raw[ch] & soc->gdma_int_ena[ch]))
@@ -1589,6 +1650,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     if (soc->gdma_out_run[c]) { /* mem2mem pair ready */
                         soc->gdma_m2m_pending[c] = 1;
                         soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
+                    } else {
+                        /* Unpaired peripheral DMA: schedule completion */
+                        soc->gdma_m2m_pending[c] = 1;
+                        soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
                     }
                 } else if (val & (1u << GDMA_INLINK_STOP_BIT)) {
                     soc->gdma_in_run[c] = 0;
@@ -1622,6 +1687,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
                     soc->gdma_out_conf0[c] &= ~(1u << 31);
                     if (soc->gdma_in_run[c]) { /* mem2mem pair ready */
+                        soc->gdma_m2m_pending[c] = 1;
+                        soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
+                    } else {
+                        /* Unpaired peripheral DMA: schedule completion */
                         soc->gdma_m2m_pending[c] = 1;
                         soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
                     }
@@ -2763,73 +2832,105 @@ void esp32c3_periodic(riscv_t *rv)
         uint32_t out_addr = soc->gdma_out_dscr[ch];
         uint32_t in_addr = soc->gdma_in_dscr[ch];
         int paired = soc->gdma_out_run[ch] && soc->gdma_in_run[ch];
-        while (out_addr && in_addr) {
-            uint8_t *src = esp32c3_dma_ptr(soc, soc->gdma_out_desc_buf[ch]);
-            uint8_t *dst = esp32c3_dma_ptr(soc, soc->gdma_in_desc_buf[ch]);
-            uint32_t n = soc->gdma_out_desc_len[ch];
-            if (n > soc->gdma_in_desc_len[ch])
-                n = soc->gdma_in_desc_len[ch];
-            if (src && dst && n) {
-                if (soc->gdma_out_peri_sel[ch] == C3_GDMA_PERI_AES ||
-                    soc->gdma_in_peri_sel[ch] == C3_GDMA_PERI_AES) {
-                    /* AES accelerator: feed the source buffer through the
-                     * cipher (key/mode/IV taken from the AES registers) and
-                     * deliver the ciphertext to the destination buffer. */
-                    int nblk = (int)(n / 16u);
-                    if (nblk > 0) {
-                        uint8_t *enc = malloc(n);
-                        esp32c3_aes_process_buf(soc, src, enc, nblk);
-                        memcpy(dst, enc, n);
-                        free(enc);
-                    }
-                     /* Firmware polls AES_STATE_REG==2 and dw0.owner==0
-                      * (no ISR needed for short AES DMA transfers). */
-                     soc->aes_reg[0x4cu >> 2] = 2u; /* AES_STATE = DONE */
-                } else {
-                    memcpy(dst, src, n);
-                }
-            }
-            /* write-back: clear descriptor owner bits (CPU owns them) */
-            uint8_t *od = esp32c3_dma_ptr(soc, out_addr);
-            if (od) {
-                uint32_t dw0;
-                memcpy(&dw0, od, 4);
-                dw0 &= ~(1u << 31);
-                memcpy(od, &dw0, 4);
-            }
-            /* Also clear the IN descriptor owner bit — the firmware's
-             * esp_aes_dma_done() polls the output (result) descriptor. */
-            uint8_t *id = esp32c3_dma_ptr(soc, in_addr);
-            if (id) {
-                uint32_t dw0;
-                memcpy(&dw0, id, 4);
-                dw0 &= ~(1u << 31);
-                memcpy(id, &dw0, 4);
-            }
-            if (!soc->gdma_out_next_addr[ch] || !soc->gdma_in_next_addr[ch])
-                break;
-            out_addr = soc->gdma_out_next_addr[ch];
-            in_addr = soc->gdma_in_next_addr[ch];
-            if (!esp32c3_gdma_load_desc(soc, out_addr,
-                    &soc->gdma_out_desc_buf[ch], &soc->gdma_out_desc_len[ch],
-                    &soc->gdma_out_next_addr[ch]))
-                break;
-            if (!esp32c3_gdma_load_desc(soc, in_addr,
-                    &soc->gdma_in_desc_buf[ch], &soc->gdma_in_desc_len[ch],
-                    &soc->gdma_in_next_addr[ch]))
-                break;
-        }
+
+        /* Paired (mem2mem) or peripheral TX/RX: walk the descriptor chains
+         * and process each descriptor. */
         if (paired) {
+            /* Paired mem2mem: walk both chains in lockstep */
+            while (out_addr && in_addr) {
+                uint8_t *src = esp32c3_dma_ptr(soc, soc->gdma_out_desc_buf[ch]);
+                uint8_t *dst = esp32c3_dma_ptr(soc, soc->gdma_in_desc_buf[ch]);
+                uint32_t n = soc->gdma_out_desc_len[ch];
+                if (n > soc->gdma_in_desc_len[ch])
+                    n = soc->gdma_in_desc_len[ch];
+                if (src && dst && n) {
+                    if (soc->gdma_out_peri_sel[ch] == C3_GDMA_PERI_AES ||
+                        soc->gdma_in_peri_sel[ch] == C3_GDMA_PERI_AES) {
+                        int nblk = (int)(n / 16u);
+                        if (nblk > 0) {
+                            uint8_t *enc = malloc(n);
+                            esp32c3_aes_process_buf(soc, src, enc, nblk);
+                            memcpy(dst, enc, n);
+                            free(enc);
+                        }
+                        soc->aes_reg[0x4cu >> 2] = 2u;
+                    } else {
+                        memcpy(dst, src, n);
+                    }
+                }
+                uint8_t *od = esp32c3_dma_ptr(soc, out_addr);
+                if (od) { uint32_t dw0; memcpy(&dw0, od, 4); dw0 &= ~(1u << 31); memcpy(od, &dw0, 4); }
+                uint8_t *id = esp32c3_dma_ptr(soc, in_addr);
+                if (id) { uint32_t dw0; memcpy(&dw0, id, 4); dw0 &= ~(1u << 31); memcpy(id, &dw0, 4); }
+                if (!soc->gdma_out_next_addr[ch] || !soc->gdma_in_next_addr[ch])
+                    break;
+                out_addr = soc->gdma_out_next_addr[ch];
+                in_addr = soc->gdma_in_next_addr[ch];
+                if (!esp32c3_gdma_load_desc(soc, out_addr,
+                        &soc->gdma_out_desc_buf[ch], &soc->gdma_out_desc_len[ch],
+                        &soc->gdma_out_next_addr[ch]))
+                    break;
+                if (!esp32c3_gdma_load_desc(soc, in_addr,
+                        &soc->gdma_in_desc_buf[ch], &soc->gdma_in_desc_len[ch],
+                        &soc->gdma_in_next_addr[ch]))
+                    break;
+            }
             soc->gdma_int_raw[ch] |=
                 (1u << GDMA_OUT_EOF_BIT) | (1u << GDMA_IN_SUC_EOF_BIT);
             soc->gdma_out_run[ch] = 0;
             soc->gdma_in_run[ch] = 0;
         } else if (soc->gdma_out_run[ch]) {
+            /* Unpaired OUT (I2S TX): save completed descriptor, clear
+             * owner, fire OUT_EOF, advance to the next descriptor
+             * and re-arm. */
+            soc->gdma_out_eof_des[ch] = out_addr;
+            uint8_t *od = esp32c3_dma_ptr(soc, out_addr);
+            if (od) { uint32_t dw0; memcpy(&dw0, od, 4); dw0 &= ~(1u << 31); memcpy(od, &dw0, 4); }
             soc->gdma_int_raw[ch] |= (1u << GDMA_OUT_EOF_BIT);
-            soc->gdma_out_run[ch] = 0;
+            if (soc->gdma_out_next_addr[ch]) {
+                uint32_t next = soc->gdma_out_next_addr[ch];
+                if (esp32c3_gdma_load_desc(soc, next,
+                        &soc->gdma_out_desc_buf[ch], &soc->gdma_out_desc_len[ch],
+                        &soc->gdma_out_next_addr[ch])) {
+                    soc->gdma_out_dscr[ch] = next;
+                    soc->gdma_m2m_pending[ch] = 1;
+                    soc->gdma_m2m_done_cycle[ch] = rv->csr_cycle + 20000u;
+                }
+            } else {
+                soc->gdma_out_run[ch] = 0;
+            }
         } else if (soc->gdma_in_run[ch]) {
+            /* Unpaired IN (I2S RX): synthesize a monotonic counter into the
+             * current descriptor buffer, save the completed descriptor address,
+             * clear owner, fire IN_SUC_EOF, advance to the next descriptor
+             * and re-arm. */
+            soc->gdma_in_eof_des[ch] = in_addr;
+            {
+                uint8_t *dst = esp32c3_dma_ptr(soc, soc->gdma_in_desc_buf[ch]);
+                uint32_t n = soc->gdma_in_desc_len[ch];
+                if (dst && n) {
+                    uint32_t nw = n / 4u;
+                    for (uint32_t i = 0; i < nw; i++) {
+                        uint32_t v = soc->i2s_rx_counter++;
+                        memcpy(dst + i * 4, &v, 4);
+                    }
+                }
+            }
+            uint8_t *id = esp32c3_dma_ptr(soc, in_addr);
+            if (id) { uint32_t dw0; memcpy(&dw0, id, 4); dw0 &= ~(1u << 31); memcpy(id, &dw0, 4); }
             soc->gdma_int_raw[ch] |= (1u << GDMA_IN_SUC_EOF_BIT);
-            soc->gdma_in_run[ch] = 0;
+            if (soc->gdma_in_next_addr[ch]) {
+                uint32_t next = soc->gdma_in_next_addr[ch];
+                if (esp32c3_gdma_load_desc(soc, next,
+                        &soc->gdma_in_desc_buf[ch], &soc->gdma_in_desc_len[ch],
+                        &soc->gdma_in_next_addr[ch])) {
+                    soc->gdma_in_dscr[ch] = next;
+                    soc->gdma_m2m_pending[ch] = 1;
+                    soc->gdma_m2m_done_cycle[ch] = rv->csr_cycle + 20000u;
+                }
+            } else {
+                soc->gdma_in_run[ch] = 0;
+            }
         }
         if (soc->gdma_int_raw[ch] & soc->gdma_int_ena[ch])
             soc->intc_status |= ((unsigned __int128) 1) << (C3_DMA_CH0_INTR_SOURCE + ch);
