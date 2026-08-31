@@ -1386,6 +1386,58 @@ have_seen:
             return 0x8; /* SPI0_STATUS: ready */
         if (addr == C3_PERIPH_BASE + 0xC40B0u)
             return 0x1; /* SPI0: wait condition met */
+        /* UHCI0 (0x60014000): stub - return 0 for status reads */
+        if (addr >= C3_PERIPH_BASE + 0x14000u &&
+            addr < C3_PERIPH_BASE + 0x15000u) {
+            if (addr == C3_PERIPH_BASE + 0x140E8u)
+                return 0x02000000u; /* UHCI_STATE: idle */
+            return 0;
+        }
+        /* RSA accelerator (0x6003C000): stub */
+        if (addr >= C3_PERIPH_BASE + 0x3C000u &&
+            addr < C3_PERIPH_BASE + 0x3D000u)
+            return 0;
+        /* Digital Signature (0x6003D000): stub */
+        if (addr >= C3_PERIPH_BASE + 0x3D000u &&
+            addr < C3_PERIPH_BASE + 0x3E000u)
+            return 0;
+        /* HMAC (0x6003E000): stub */
+        if (addr >= C3_PERIPH_BASE + 0x3E000u &&
+            addr < C3_PERIPH_BASE + 0x3F000u)
+            return 0;
+        /* USB-Serial JTAG (0x60043000): stub with DATE register */
+        if (addr >= C3_PERIPH_BASE + 0x43000u &&
+            addr < C3_PERIPH_BASE + 0x44000u) {
+            if (addr == C3_PERIPH_BASE + 0x43080u)
+                return 0xFFFFFFFFu; /* USB_SERIAL_JTAG_DATE */
+            return 0;
+        }
+        /* XTS-AES (0x600CC000): stub with DATE register */
+        if (addr >= C3_PERIPH_BASE + 0xCC000u &&
+            addr < C3_PERIPH_BASE + 0xCD000u) {
+            if (addr == C3_PERIPH_BASE + 0xCC05Cu)
+                return 0x3FFFFFFFu; /* XTS_AES_DATE */
+            return 0;
+        }
+        /* Assist Debug (0x600CE000): stub with DATE register */
+        if (addr >= C3_PERIPH_BASE + 0xCE000u &&
+            addr < C3_PERIPH_BASE + 0xCF000u) {
+            if (addr == C3_PERIPH_BASE + 0xCE1FCu)
+                return 0x0FFFFFFFu; /* ASSIST_DEBUG_DATE */
+            return 0;
+        }
+        /* Dedicated GPIO (0x600CF000): stub */
+        if (addr >= C3_PERIPH_BASE + 0xCF000u &&
+            addr < C3_PERIPH_BASE + 0xD0000u)
+            return 0;
+        /* World Controller (0x600D0000): stub */
+        if (addr >= C3_PERIPH_BASE + 0xD0000u &&
+            addr < C3_PERIPH_BASE + 0xD1000u)
+            return 0;
+        /* Sensitive/PMS (0x600C1000): stub */
+        if (addr >= C3_PERIPH_BASE + 0xC1000u &&
+            addr < C3_PERIPH_BASE + 0xC2000u)
+            return 0;
         return mmio32[off >> 2];
     }
     return mmio32[off >> 2];
