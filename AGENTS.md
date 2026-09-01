@@ -289,6 +289,29 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
       `esp_aes` driver feeds the peripheral via **GDMA** (the AES GDMA trigger
       exists but is not modeled); only software/poll-mode (register) access
       works. Verified at the register level only.
+    - **I2S0 (ESP32-C3) TX + RX via GDMA modeled & verified 2026-08-30.**
+      I2S0 at `0x6002D000` (`DR_REG_I2S_BASE`), interrupt source 38.
+        * Register model: `i2s_reg[32]` + `i2s_rx_counter` for synthesized RX.
+        * MMIO read: INT_ST = raw & ena, STATE = 1 (tx_idle), DATE = 0x26062022.
+        * MMIO write: INT_CLR W1C at 0x18, self-clearing `tx_update` (bit 8 of
+          TX_CONF 0x24) and `rx_update` (bit 8 of RX_CONF 0x20).
+        * GDMA FIFO status: INFIFO_STATUS/OUTFIFO_STATUS at block offset 0x08
+          return 0x02 (empty); IN_POP/OUT_PUSH at 0x0C return 0.
+        * GDMA unpaired peripheral DMA: INLINK_START and OUTLINK_START schedule
+          `gdma_m2m_pending` + `gdma_m2m_done_cycle` when paired channel isn't
+          running. Completion fires IN_SUC_EOF or OUT_EOF, advances descriptor
+          chain, re-arms for circular DMA.
+        * I2S0 GDMA peripheral select = 3 (confirmed via debug traces).
+        * Critical fix: `gdma_in_dscr`/`gdma_out_dscr` must be updated on each
+          descriptor advance; otherwise `in_suc_eof_des_addr` returns the wrong
+          address and the driver's ISR reads stale data.
+        * Critical fix: `gdma_int_ena` write re-checks pending raw bits so
+          interrupts set before ENA is enabled are not lost.
+        * GDMA FIFO status registers (INFIFO_STATUS at IN block 0x08, OUTFIFO
+          at OUT block 0x08) added so the I2S driver's channel init doesn't hang.
+      Sketches: `i2stest` (4×960 B TX writes) and `i2srxtest` (4×960 B RX
+      reads checking monotonic counter 0,1,2,...,959). Both pass headless:
+      `i2stest: OK`, `i2srxtest: OK`, `DEMO_DONE`. Committed `abfb4f5`.
 
 - [x] **ESP32-C6 peripheral bring-up — verified via arduino-cli sketches on the WASM emulator** (2026-08-22):
       - **AES** (`aestest`): ECB/CBC enc+dec for 128/192/256 → `aestest: OK`. Hang

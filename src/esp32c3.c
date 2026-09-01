@@ -784,10 +784,12 @@ static void esp32c3_aes_mix(uint8_t *s, int inv)
 }
 
 static void esp32c3_aes_block(const uint8_t *in, const uint8_t *key, int Nk,
-                              int decrypt, uint8_t *out)
+                               int decrypt, uint8_t *out)
 {
     int Nr = Nk + 6, Nb = 4;
-    uint8_t w[4 * (Nb*(Nr+1))];
+    /* Max AES-256: 4*(4*(14+1)) = 240 bytes. Use fixed buffer — WASM VLAs
+     * corrupt the stack when the VLA is large. */
+    uint8_t w[240];
     uint8_t s[16];
     esp32c3_aes_keyexp(key, Nk, w);
     memcpy(s, in, 16);
@@ -869,7 +871,60 @@ static void esp32c3_aes_process_buf(esp32c3_t *soc, const uint8_t *in,
                 ((uint32_t) iv[i] << (8 * (i & 3)));
 }
 
-/* Trigger path: one block written through the TEXT_IN/TEXT_OUT registers. */
+/* Process one block through the DMA descriptor pair for a given channel.
+ * Reads plaintext from the OUT descriptor, encrypts/decrypts, and writes
+ * the result to the IN descriptor.  Used by the AES TRIGGER path when the
+ * esp_aes driver feeds data via GDMA instead of the TEXT_IN registers. */
+static void esp32c3_aes_run_dma(esp32c3_t *soc, int ch_out)
+{
+    int ch_in = -1;
+    for (int ch = 0; ch < 3; ch++)
+        if (soc->gdma_in_peri_sel[ch] == C3_GDMA_PERI_AES)
+            ch_in = ch;
+
+    uint32_t in_cur = C3_GDMA_MEM_BASE + (soc->gdma_out_link[ch_out] & GDMA_LINK_ADDR_MASK);
+    uint32_t out_cur = ch_in >= 0 ? (C3_GDMA_MEM_BASE + (soc->gdma_in_link[ch_in] & GDMA_LINK_ADDR_MASK)) : 0;
+
+    for (int blk = 0; blk < 1; blk++) {
+        if (!in_cur || !out_cur) break;
+        uint8_t *id = esp32c3_dma_ptr(soc, in_cur);
+        if (!id) break;
+        uint32_t dw0, dw1, dw2;
+        memcpy(&dw0, id, 4); memcpy(&dw1, id + 4, 4); memcpy(&dw2, id + 8, 4);
+        /* Always process: don't check owner bit.  The driver sets up
+         * descriptors each time and the buffer pointer is valid. */
+        uint32_t in_buf = dw1;
+        uint32_t in_len = (dw0 >> 12) & 0xFFFu;
+        if (in_len < 16) break;
+        uint8_t in[16];
+        for (int i = 0; i < 16; i++) {
+            uint8_t *p = esp32c3_dma_ptr(soc, in_buf + i);
+            if (p) in[i] = *p;
+        }
+        uint8_t out[16];
+        esp32c3_aes_process_buf(soc, in, out, 1);
+        uint8_t *od = esp32c3_dma_ptr(soc, out_cur);
+        if (!od) break;
+        memcpy(&dw0, od, 4); memcpy(&dw1, od + 4, 4); memcpy(&dw2, od + 8, 4);
+        uint32_t out_buf = dw1;
+        uint32_t out_len = (dw0 >> 12) & 0xFFFu;
+        if (out_len >= 16) {
+            for (int i = 0; i < 16; i++) {
+                uint8_t *p = esp32c3_dma_ptr(soc, out_buf + i);
+                if (p) *p = out[i];
+            }
+        }
+        /* Clear owner bits (mark descriptors as SW-owned) */
+        uint32_t v;
+        memcpy(&v, id, 4); v &= ~(1u << 31); memcpy(id, &v, 4);
+        memcpy(&v, od, 4); v &= ~(1u << 31); memcpy(od, &v, 4);
+        in_cur = dw2;
+        out_cur = dw2;
+    }
+}
+
+/* Trigger path: one block written through the TEXT_IN/TEXT_OUT registers
+ * or via GDMA descriptors when the esp_aes driver uses DMA. */
 static void esp32c3_aes_run(esp32c3_t *soc)
 {
     uint8_t in[16], out[16];
@@ -1467,8 +1522,27 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         }
         soc->aes_reg[a >> 2] = val;
         if (a == 0x48u) { /* AES_TRIGGER_REG */
-            if (!soc->aes_reg[0x90u >> 2]) /* single-block CPU path only */
+            /* Detect DMA mode: if any GDMA OUT channel has AES peri_sel,
+             * the esp_aes driver feeds data via GDMA descriptors.  Read
+             * directly from the descriptor chain and write the result back
+             * to the IN descriptor. */
+            int dma_ch = -1;
+            for (int ch = 0; ch < 3; ch++) {
+                if (soc->gdma_out_peri_sel[ch] == C3_GDMA_PERI_AES) {
+                    dma_ch = ch;
+                    break;
+                }
+            }
+            if (dma_ch >= 0) {
+                esp32c3_aes_run_dma(soc, dma_ch);
+                /* Cancel any pending m2m walker so it doesn't overwrite
+                 * the AES result in the IN descriptor buffer. */
+                soc->gdma_m2m_pending[dma_ch] = 0;
+                soc->gdma_out_run[dma_ch] = 0;
+                soc->gdma_in_run[dma_ch] = 0;
+            } else {
                 esp32c3_aes_run(soc);
+            }
             soc->aes_reg[0x4cu >> 2] = 2u; /* ESP_AES_STATE_DONE */
         } else {
             soc->aes_reg[0x4cu >> 2] = 0u; /* IDLE */
@@ -1731,10 +1805,13 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     soc->gdma_out_dscr[c] =
                         C3_GDMA_MEM_BASE + (soc->gdma_out_link[c] &
                                         GDMA_LINK_ADDR_MASK);
-                    if (esp32c3_gdma_load_desc(soc, soc->gdma_out_dscr[c],
+                    int ok = esp32c3_gdma_load_desc(soc, soc->gdma_out_dscr[c],
                             &soc->gdma_out_desc_buf[c],
                             &soc->gdma_out_desc_len[c],
-                            &soc->gdma_out_next_addr[c]))
+                            &soc->gdma_out_next_addr[c]);
+                    if (!ok)
+                        ; /* load failed — out_run stays 0 */
+                    if (ok)
                         soc->gdma_out_run[c] = 1;
                     soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
                     soc->gdma_out_conf0[c] &= ~(1u << 31);
