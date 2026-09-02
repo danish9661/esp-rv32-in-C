@@ -1369,6 +1369,8 @@ have_seen:
                 return soc->systimer_int_ena;
             case SYSTIMER_INT_RAW:
                 return soc->systimer_int_raw;
+            case 0x70u: /* INT_ST = INT_RAW & INT_ENA */
+                return soc->systimer_int_raw & soc->systimer_int_ena;
             default:
                 return mmio32[off >> 2];
             }
@@ -2136,14 +2138,14 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             mmio32[off >> 2] = val;
             if (val & 0x40000000u) { /* UPDATE: latch counter, set VALUE_VALID */
                 soc->systimer_unit0_val = soc->systimer_counter;
-                mmio32[off >> 2] |= 0x20000000u; /* bit29 VALUE_VALID */
+                mmio32[off >> 2] = 0x20000000u; /* bit29 VALUE_VALID, clear UPDATE */
             }
             return;
         case SYSTIMER_UNIT1_OP:
             mmio32[off >> 2] = val;
             if (val & 0x40000000u) { /* UPDATE: latch counter, set VALUE_VALID */
-                soc->systimer_unit1_val = soc->systimer_counter;
-                mmio32[off >> 2] |= 0x20000000u; /* bit29 VALUE_VALID */
+                soc->systimer_unit1_val = soc->systimer_unit1_counter;
+                mmio32[off >> 2] = 0x20000000u; /* bit29 VALUE_VALID, clear UPDATE */
             }
             return;
         case SYSTIMER_TARGET0_LO:
@@ -2175,8 +2177,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             return;
         case SYSTIMER_INT_CLR:
             soc->systimer_int_raw &= ~val;
-            soc->intc_status &= ~((((unsigned __int128)1) << SYSTIMER_T0_SOURCE) |
-                                  (((unsigned __int128)1) << SYSTIMER_T2_SOURCE));
+            /* Only clear intc_status bits that correspond to val */
+            if (val & 1u)
+                soc->intc_status &= ~(((unsigned __int128)1) << SYSTIMER_T0_SOURCE);
+            if (val & 4u)
+                soc->intc_status &= ~(((unsigned __int128)1) << SYSTIMER_T2_SOURCE);
             return;
         default:
             mmio32[off >> 2] = val;
@@ -2204,7 +2209,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         switch (o) {
         case INTC_INT_ENABLE:
             soc->intc_enable = val;
-            fprintf(stderr, "DBG: intc-enable pc=0x%08x val=%08x\n", rv->PC, val);
             return;
         case INTC_INT_TYPE:
             soc->intc_type = val;
@@ -2233,12 +2237,6 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             else
                 soc->intc_status &= ~(((unsigned __int128)1) << 50u);
             mmio32[off >> 2] = val;
-            {
-                static unsigned long cc;
-                if ((cc++ & 0xFFFu) == 0)
-                    fprintf(stderr, "DBG: crosscore-trigger val=%u pc=0x%08x cycle=%llu\n",
-                            val, rv->PC, (unsigned long long) rv->csr_cycle);
-            }
             return;
         }
         /* SHA accelerator (0x6003B000) */
