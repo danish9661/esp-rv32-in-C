@@ -4264,9 +4264,9 @@ void esp32p4_periodic(riscv_t *rv)
 
     /* LEDC output drive: enabled channels drive their routed pads. The
      * GPIO matrix FUNCx_OUT_SEL (0x60091554 + 4*pin) picks the signal
-     * index; LEDC channels 0-5 are signals 0-5. The pad level follows
-     * the PWM phase (high for DUTY_R ticks starting at HPOINT within
-     * the 2^DUTY_RES period). */
+     * index; P4 low-speed channels 0-5 are signals 126-131. The pad level
+     * follows the PWM phase (high for DUTY_R ticks starting at HPOINT
+     * within the 2^DUTY_RES period). */
     for (int c = 0; c < 6; c++) {
         uint32_t conf0 = soc->ledc_reg[LEDC_CH_CONF0(c) >> 2];
         int level;
@@ -4303,8 +4303,8 @@ void esp32p4_periodic(riscv_t *rv)
             level = (conf0 & LEDC_IDLE_LV) ? 1 : 0;
         }
         for (int p = 0; p < 30; p++) {
-            uint32_t sel = mmio32[(0x91558u + 4u * p) >> 2] & 0xFFu;
-            if (sel == (uint32_t) c) {
+            uint32_t sel = mmio32[(0x91558u + 4u * p) >> 2] & 0x1FFu;
+            if (sel == 126u + (uint32_t) c) { /* LEDC_LS_SIG_OUT_PAD_OUTn */
                 if (level)
                     soc->gpio_in |= 1u << p;
                 else
