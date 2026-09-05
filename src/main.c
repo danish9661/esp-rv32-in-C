@@ -58,8 +58,8 @@ static bool opt_quiet_outputs = false;
 /* target executable */
 static char *opt_prog_name;
 
-#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6)
-/* ESP32 chip selection (-C esp32c3 / -C esp32c6) */
+#if RV32_HAS(ESP32_C3) || RV32_HAS(ESP32_C6) || RV32_HAS(ESP32_H2) || RV32_HAS(ESP32_P4)
+/* ESP32 chip selection (-C esp32c3 / -C esp32c6 / -C esp32h2 / -C esp32p4) */
 static char *opt_esp32_chip;
 #endif
 
@@ -166,6 +166,12 @@ static void print_usage(const char *filename)
         "  -C esp32c6 : run the ELF as an ESP32-C6 application\n"
         "  -U <fifo> : ESP32-C6 UART RX injection source (host writes "
         "command bytes here)\n"
+#endif
+#if RV32_HAS(ESP32_H2)
+        "  -C esp32h2 : run the ELF as an ESP32-H2 application\n"
+#endif
+#if RV32_HAS(ESP32_P4)
+        "  -C esp32p4 : run the ELF as an ESP32-P4 application\n"
 #endif
         "  -q : Suppress outputs other than `dump-registers`\n"
         "  -a [filename] : dump signature to the given file, "

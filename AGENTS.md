@@ -360,10 +360,33 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
          the SARADC peripheral still has a 2nd converter (SAR2, bit30 of 0x20).
          Exercised directly: onetime start with bit30 sets 0x30 to 1024+ch*128
          and int_raw bit30 → `adc2test: raw=1024 OK`.
-       NOTE: full `esp_light_sleep_start()` (PMU power-down) is NOT yet emulated —
-       the firmware busy-waits on an unmodeled PMU FSM status register and hangs.
-       The GPIO *interrupt* path (the actual wake mechanism) is verified above;
-       PMU/RTC sleep + WFI resume is a separate, larger feature.
+        NOTE: full `esp_light_sleep_start()` (PMU power-down) is NOT yet emulated —
+        the firmware busy-waits on an unmodeled PMU FSM status register and hangs.
+        The GPIO *interrupt* path (the actual wake mechanism) is verified above;
+        PMU/RTC sleep + WFI resume is a separate, larger feature.
+- [x] Phase 4: H2 SoC layer (`src/esp32h2.c`, new) — 2026-09-04.
+  - C6-style dispatch with corrected H2 bases (RMT 0x7000, LEDC 0x8000, TIMG0
+    0x9000, TIMG1 0xA000, SYSTIMER 0xB000, TWAI 0xC000, I2S 0xD000) and H2
+    interrupt sources (SYSTIMER_T0 45/T2 47). Added missing
+    `esp32h2_periodic`/`check_interrupt` hooks in `src/emulate.c`.
+  - Verified headless (node): arduino-cli hello (`esp32:esp32:esp32h2`) boots:
+    `rst:0x1 (POWERON)`, `entry 0x4083c2d0`, `HELLO_UART_OK`, then `TICK`.
+- [x] Phase 5: P4 SoC layer (`src/esp32p4.c`, new) to Arduino HELLO+TICK — 2026-09-04.
+  - Real P4 ROM linked (`src/esp32p4_rom.h`, wokwi dump, alias 0x4FC00000);
+    P4 map (SRAM 0x4FF00000, flash window 0x40000000, MMIO 0x50000000) with
+    `p4_xlate()` onto the C6-style dispatch; MCYCLE/MINSTRET CSRs; cache/QIO/
+    SHA/AES/GDMA stubs sufficient for boot.
+  - Interrupt fixes: INTMTX MAP holds `line+16` (ROM adds 0x10; 0=unmapped);
+    CLIC model at 0x20800000 (all-vectored via MTVT address table, deliver
+    when level>=threshold); crosscore/yield source 79 cleared on delivery.
+  - Core fix (`src/emulate.c`): enforce `X[0]=0` after each block — unguarded
+    RVOP handlers (e.g. MUL) clobbered x0 and tripped the constopt assert.
+  - Unicore test scaffold (`tools/p4_mkunicore.py`, re-signs SHA256): nops
+    CPU1 boot/rendezvous waits, flash-stall IPC retry, pins loopTask to CPU0.
+    (Real SMP is future work; unpatched dual-core images still wait on CPU1.)
+  - Verified headless (node, `-C esp32p4`, postv3 variant + patched image):
+    `rst:0x1 (POWERON)`, `entry 0x4ffac2c0`, `HELLO_UART_OK`, then steady
+    `TICK` (FreeRTOS tick + yield interrupts delivering, tasks switching).
 
 ## Known issues / gotchas
 

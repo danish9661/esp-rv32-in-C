@@ -41,6 +41,9 @@
 #if RV32_HAS(ESP32_H2)
 #include "esp32h2.h"
 #endif
+#if RV32_HAS(ESP32_P4)
+#include "esp32p4.h"
+#endif
 #include "mpool.h"
 #include "riscv.h"
 #include "riscv_private.h"
@@ -687,7 +690,10 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     #endif
     #if RV32_HAS(ESP32_H2)
     if (!attr->esp32h2) {
-    #endif
+#endif
+    #if RV32_HAS(ESP32_P4)
+    if (!attr->esp32p4) {
+#endif
     elf_t *elf = elf_new();
     assert(elf);
 
@@ -726,6 +732,9 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     assert(rv_set_pc(rv, hdr->e_entry));
 
     elf_delete(elf);
+#if RV32_HAS(ESP32_P4)
+    }
+#endif
 #if RV32_HAS(ESP32_H2)
     }
 #endif
@@ -1033,6 +1042,16 @@ riscv_t *rv_create(riscv_user_t rv_attr)
         return rv;
     }
     #endif /* RV32_HAS(ESP32_H2) */
+
+    #if RV32_HAS(ESP32_P4)
+    if (attr->esp32p4) {
+        /* ESP32-P4 machine: shares the C6-class peripheral IP (HP core). */
+        rv->PC = esp32p4_boot(attr->esp32p4, attr->data.user.elf_program);
+        PRIV(rv)->allow_misalign = true;
+        esp32p4_install_io(rv);
+        return rv;
+    }
+    #endif /* RV32_HAS(ESP32_P4) */
 
     return rv;
 
@@ -1430,6 +1449,14 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
         rv->priv_mode = RV_PRIV_M_MODE;
     }
 #endif /* RV32_HAS(ESP32_H2) */
+#if RV32_HAS(ESP32_P4)
+    if (attr->esp32p4) {
+        /* ESP32-P4 bare-metal firmware runs in M-mode; HP core uses same
+         * boot flow as C6/H2. */
+        rv->priv_mode = RV_PRIV_M_MODE;
+        rv->X[rv_reg_sp] = P4_SRAM_BASE + P4_SRAM_SIZE;
+    }
+#endif /* RV32_HAS(ESP32_P4) */
 #else
     /* ISA simulation defaults to M-mode */
     rv->priv_mode = RV_PRIV_M_MODE;

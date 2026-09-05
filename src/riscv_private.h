@@ -86,6 +86,16 @@ enum {
     CSR_TIMEH = 0xC81,
     CSR_INSTRETH = 0xC82,
 
+    /* machine counter/timers (read-only mirrors of cycle/instret) */
+    CSR_MCYCLE = 0xB00,
+    CSR_MINSTRET = 0xB02,
+    CSR_MCYCLEH = 0xB80,
+    CSR_MINSTRETH = 0xB82,
+
+    /* CLIC (ESP32-P4): trap-vector table + next-interrupt CSRs */
+    CSR_MTVT = 0x307,
+    CSR_MNXTI = 0x345,
+
     /* vector extension */
     CSR_VSTART = 0x008,
     CSR_VXSAT = 0x009,
@@ -330,6 +340,12 @@ struct riscv_internal {
     uint32_t csr_mepc;      /* Machine exception program counter */
     uint32_t csr_mip;       /* Machine interrupt pending */
     uint32_t csr_mie;       /* Machine interrupt enable */
+    uint32_t csr_mtvt;      /* Machine trap-vector table base (CLIC) */
+    uint32_t csr_mnxti;     /* Machine next-interrupt handler (CLIC) */
+    /* CLIC vectored-trap request (set by SoC layer before trapping when
+     * mtvec mode == 3; consumed by the trap handler). */
+    uint32_t clic_vector_pc;
+    bool clic_vector_valid;
     uint32_t csr_mideleg;   /* Machine interrupt delegation register */
     uint32_t csr_medeleg;   /* Machine exception delegation register */
     uint32_t csr_mvendorid; /* vendor ID */

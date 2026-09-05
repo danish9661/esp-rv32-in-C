@@ -36,6 +36,12 @@ extern struct target_ops gdbstub_ops;
 #if RV32_HAS(ESP32_C6)
 #include "esp32c6.h"
 #endif
+#if RV32_HAS(ESP32_H2)
+#include "esp32h2.h"
+#endif
+#if RV32_HAS(ESP32_P4)
+#include "esp32p4.h"
+#endif
 
 #if RV32_HAS(JIT)
 #include "cache.h"
@@ -364,6 +370,11 @@ static uint32_t *csr_get_ptr(riscv_t *rv, uint32_t csr)
         return (uint32_t *) (&rv->csr_mstatus);
     case CSR_MTVEC: /* Machine Trap Handler */
         return (uint32_t *) (&rv->csr_mtvec);
+    case CSR_MTVT: /* Machine trap-vector table base (CLIC) */
+        return (uint32_t *) (&rv->csr_mtvt);
+    case CSR_MNXTI: /* Machine next-interrupt (CLIC; read claims nothing here,
+                     * writes are ignored) */
+        return (uint32_t *) (&rv->csr_mnxti);
     case CSR_MISA: /* Machine ISA and Extensions */
         return (uint32_t *) (&rv->csr_misa);
 
@@ -401,6 +412,14 @@ static uint32_t *csr_get_ptr(riscv_t *rv, uint32_t csr)
     case CSR_INSTRET: /* Number of Instructions Retired Counter */
         return (uint32_t *) (&rv->csr_cycle);
     case CSR_INSTRETH: /* Upper 32 bits of instructions retired */
+        return &((uint32_t *) &rv->csr_cycle)[1];
+    case CSR_MCYCLE: /* Machine cycle counter (ESP32-P4 ROM ets_delay_us) */
+        return (uint32_t *) &rv->csr_cycle;
+    case CSR_MCYCLEH: /* Upper 32 bits of machine cycle counter */
+        return &((uint32_t *) &rv->csr_cycle)[1];
+    case CSR_MINSTRET: /* Machine instructions-retired counter */
+        return (uint32_t *) (&rv->csr_cycle);
+    case CSR_MINSTRETH: /* Upper 32 bits of minstret */
         return &((uint32_t *) &rv->csr_cycle)[1];
     case 0x802: /* ESP32-C3 ROM uses custom CSR 0x802 as cycle counter */
         return (uint32_t *) &rv->csr_cycle;
@@ -447,6 +466,10 @@ static inline void csr_sync_cycle(riscv_t *rv, uint32_t csr, uint64_t cycle)
     case CSR_CYCLEH:
     case CSR_INSTRET:
     case CSR_INSTRETH:
+    case CSR_MCYCLE:
+    case CSR_MCYCLEH:
+    case CSR_MINSTRET:
+    case CSR_MINSTRETH:
     case CSR_TIME:
     case CSR_TIMEH:
     case 0x802: /* ESP32-C3 ROM cycle counter */
@@ -2406,6 +2429,20 @@ void rv_step(void *arg)
             esp32c6_check_interrupt(rv);
         }
 #endif
+#if RV32_HAS(ESP32_H2)
+        if (PRIV(rv)->esp32h2) {
+            /* advance ESP32 peripherals and deliver M-mode interrupts */
+            esp32h2_periodic(rv);
+            esp32h2_check_interrupt(rv);
+        }
+#endif
+#if RV32_HAS(ESP32_P4)
+        if (PRIV(rv)->esp32p4) {
+            /* advance ESP32 peripherals and deliver M-mode interrupts */
+            esp32p4_periodic(rv);
+            esp32p4_check_interrupt(rv);
+        }
+#endif
 
 #ifdef __EMSCRIPTEN__
         // Resume from saved instruction after stack unwind
@@ -2445,8 +2482,18 @@ void rv_step(void *arg)
                 continue;
             }
 #endif
-            rv_log_fatal("Failed to allocate or translate block at PC=0x%08x",
+             rv_log_fatal("Failed to allocate or translate block at PC=0x%08x",
                          rv->PC);
+            fprintf(stderr, "DBG: pre-crash: sp=0x%08x ra=0x%08x mepc=0x%08x mstatus=0x%08x mcause=%u\n",
+                    rv->X[2], rv->X[1], rv->csr_mepc, rv->csr_mstatus, rv->csr_mcause);
+            fprintf(stderr, "DBG: registers: ");
+            for (int i = 0; i < 32; i++)
+                fprintf(stderr, "x%d=0x%08x ", i, rv->X[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "DBG: stack dump (sp-32 to sp+64):");
+            for (uint32_t a = rv->X[2] - 32; a <= rv->X[2] + 64; a += 4)
+                fprintf(stderr, "\n  [%08x] = %08x", a, rv->io.mem_read_w(rv, a));
+            fprintf(stderr, "\n");
             rv->halt = true;
             return;
         }
@@ -2616,6 +2663,12 @@ void rv_step(void *arg)
             prev = NULL;
             break;
         }
+        /* Architectural safeguard: x0 is hardwired to zero. A few RVOP
+         * handlers (e.g. MUL) miss the rd==0 guard and can clobber X[0]
+         * when guest code uses x0 as a destination; enforce the invariant
+         * here so later block translation (which asserts it) stays valid.
+         */
+        rv->X[0] = 0;
 #if RV32_HAS(JIT)
         if (has_loops && !block->has_loops)
             block->has_loops = true;
@@ -2870,6 +2923,16 @@ static void _trap_handler(riscv_t *rv)
         /* MSB of code is used to indicate whether the trap is interrupt
          * or exception, so it is not considered as the 'real' code */
         rv->PC = base + 4 * (cause & MASK(31));
+        break;
+    /* CLIC (ESP32-P4): vectored traps go through MTVT when the SoC layer
+     * resolved a vectored target; otherwise fall back to base. */
+    case 3:
+        if (rv->clic_vector_valid) {
+            rv->PC = rv->clic_vector_pc;
+            rv->clic_vector_valid = false;
+        } else {
+            rv->PC = base;
+        }
         break;
     }
     IIF(RV32_HAS(SYSTEM))(if (rv->is_trapped) __trap_handler(rv);, )
