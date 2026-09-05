@@ -562,11 +562,11 @@ esp32p4_t *esp32p4_new(void)
 
     esp32_add_region(soc, P4_MMIO_BASE, P4_MMIO_SIZE, ESP32_REG_MMIO);
 
-    /* GPIO matrix output select resets to 0x80 (SIG_GPIO_OUT): every pad
-     * is a plain GPIO output until a peripheral signal is routed to it.
-     * (P4 FUNC_OUT_SEL_CFG is at GPIO+0x558.) */
+    /* GPIO matrix output select resets to 256 (SIG_GPIO_OUT_IDX on P4;
+     * OUT_SEL is 9 bits): every pad is a plain GPIO until a peripheral
+     * signal is routed to it. (P4 FUNC_OUT_SEL_CFG is at GPIO+0x558.) */
     for (int p = 0; p < 57; p++)
-        ((uint32_t *) soc->mmio)[(0x91558u + 4u * p) >> 2] = 0x80u;
+        ((uint32_t *) soc->mmio)[(0x91558u + 4u * p) >> 2] = 256u;
 
     /* flash cache MMU defaults to invalid (unmapped -> ROM fallback) */
     for (int i = 0; i < 1024; i++)
@@ -1036,11 +1036,11 @@ static void aes_block(const uint8_t *in, const uint8_t *key, int nk, int nr,
 }
 
 /* Effective pad output for output-enabled pins: when the GPIO matrix routes a
- * peripheral signal (OUT_SEL set in FUNCn_OUT_SEL_CFG), the level is the one the
- * peripheral model already maintains in gpio_in; otherwise it is the GPIO
- * output register. This lets digitalRead() on a peripheral-driven pin (e.g. an
- * LEDC PWM output) report the live peripheral level instead of the static
- * gpio_out value. */
+ * peripheral signal (OUT_SEL differs from SIG_GPIO_OUT_IDX = 256; P4
+ * OUT_SEL is 9 bits) the level is the one the peripheral model already
+ * maintains in gpio_in; otherwise it is the GPIO output register. This
+ * lets digitalRead() on a peripheral-driven pin (e.g. an LEDC PWM output)
+ * report the live peripheral level instead of the static gpio_out value. */
 static uint32_t esp32p4_gpio_eff_out(esp32p4_t *soc, uint32_t *mmio32)
 {
     uint32_t out = 0;
@@ -1048,7 +1048,7 @@ static uint32_t esp32p4_gpio_eff_out(esp32p4_t *soc, uint32_t *mmio32)
         if (!(soc->gpio_enable & (1u << p)))
             continue;
         uint32_t sel = mmio32[(0x91558u + 4u * p) >> 2];
-        if (sel & 0x100u)            /* peripheral signal drives the pad */
+        if ((sel & 0x1FFu) != 256u)  /* peripheral signal drives the pad */
             out |= (soc->gpio_in & (1u << p));
         else
             out |= (soc->gpio_out & (1u << p));
