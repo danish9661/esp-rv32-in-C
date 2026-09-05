@@ -387,6 +387,28 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - Verified headless (node, `-C esp32p4`, postv3 variant + patched image):
     `rst:0x1 (POWERON)`, `entry 0x4ffac2c0`, `HELLO_UART_OK`, then steady
     `TICK` (FreeRTOS tick + yield interrupts delivering, tasks switching).
+  - Unicore patcher rewritten ELF/symbol-driven (`tools/p4_mkunicore.py` v2):
+    CPU-sync waits found as backward branches (or do-while `j`-loops)
+    testing flag-derived regs for s_cpu_up/s_cpu_inited/s_system_inited/
+    s_other_cpu_startup_done/s_flash_op_can_start; loopTask affinity via
+    the xTaskCreateUniversal site in app_main; flash IPC-stall retry via
+    beqz->c.j (encode/decode roundtrip-checked). Verified by regenerating
+    hello + gpio/uart/gptimer/i2c/spi images (commit 3abd2de).
+- [x] Phase 6: P4 peripheral verification with arduino-cli test sketches
+  (`esp32:esp32:esp32p4:ChipVariant=postv3`, each unicore-patched) — in progress.
+  - **GPIO** (`p4gpio`): `GPIO_OUT 1 0` (echo readback), `GPIO_INT 1`
+    (self-loopback rising edge), `GPIO_DONE`. Model fix: P4 OUT_SEL is
+    9 bits, SIG_GPIO_OUT_IDX=256 (was treated as 8-bit/0x80).
+  - **UART** (`p4uart`): TX prints plus RX of MEMFS-preloaded bytes
+    (`P4_RX_FILE` env -> `/uartrx`, `-U /uartrx`): `UART_GOT 4 PING`.
+    (Host fifos are invisible to WASM; run_p4.js preloads instead.)
+  - **GPTIMER** (`p4gptimer`): 1 MHz periodic 100 ms alarm ISR fires 5x,
+    no model change needed.
+  - **I2C** (`p4i2c`): scan finds `0x50`, write 8 + readback `11..88`
+    exact, no model change needed.
+  - **SPI** (`p4spi`): JEDEC `EF 40 15` (manuf clocks out during `0x9F`,
+    as on C6), no model change needed.
+  Sketches live under `/home/danish1075/fw/p4{hello,gpio,uart,gptimer,i2c,spi}/`.
 
 ## Known issues / gotchas
 
