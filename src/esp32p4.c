@@ -186,6 +186,7 @@ struct esp32p4_soc {
     uint64_t systimer_t2_crossed;
     uint64_t systimer_unit0_val; /* latched by UNIT0_OP UPDATE */
     uint64_t systimer_unit1_val; /* latched by UNIT1_OP UPDATE */
+    uint32_t lp_adc_data[2];     /* LP_ADC MEASn DATA (channel model) */
     uint64_t last_cycle;
 
     /* LP_TIMER (0x600B0C00): RTC slow-clock 64-bit main timer */
@@ -1097,6 +1098,8 @@ static uint32_t p4_xlate(uint32_t addr)
         return addr - 0x500C9000u + 0x12000u; /* PCNT */
     if (addr >= 0x500C0000u && addr < 0x500C0200u)
         return addr - 0x500C0000u + 0x14000u; /* MCPWM0 */
+    if (addr >= 0x50127000u && addr < 0x50128000u)
+        return addr - 0x50127000u + 0x15000u; /* LP_ADC (RTC cali) */
     if (addr >= 0x50081000u && addr < 0x500812B0u)
         return addr - 0x50081000u + 0x80000u; /* AHB_GDMA */
     if (addr >= 0x500D0000u && addr < 0x500D0100u)
@@ -1449,6 +1452,20 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return soc->twai_reg[off >> 2];
     }
 
+    /* LP_ADC MEASn_CTRL2: DATA follows the selected channel. */
+    if (addr >= P4_PERIPH_BASE + 0x15000u &&
+        addr < P4_PERIPH_BASE + 0x16000u) {
+        uint32_t o = off - 0x15000u;
+        if (o == 0xCu || o == 0x30u) {
+            unsigned u = (o == 0xCu) ? 0u : 1u;
+            uint32_t data = soc->lp_adc_data[u];
+            if (!data)
+                data = 0x0800u;
+            return (mmio32[off >> 2] & 0xFFFF0000u) | 0x10000u |
+                   (data & 0xFFFFu);
+        }
+        return mmio32[off >> 2];
+    }
     /* SARADC (0x6000E000-0x6000E404): oneshot conversion state */
     if (addr >= P4_PERIPH_BASE + 0xE000u &&
         addr < P4_PERIPH_BASE + 0xE404u) {
@@ -2596,6 +2613,28 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         } else {
             mmio32[off >> 2] = val;
         }
+        return;
+    }
+
+    /* LP_ADC (translated 0x60015000, RTC calibration unit). MEAS1_CTRL2
+     * (+0xC) and MEAS2_CTRL2 (+0x30): bit17 START, bit16 DONE, DATA in
+     * bits[15:0], channel bitmap in bits[30:19]. Conversions complete
+     * instantly; DATA follows the selected channel (1024+ch*128) so both
+     * the ADC line-fitting calibration and oneshot reads converge. */
+    if (addr >= P4_PERIPH_BASE + 0x15000u &&
+        addr < P4_PERIPH_BASE + 0x16000u) {
+        uint32_t o = off - 0x15000u;
+        if (o == 0xCu || o == 0x30u) {
+            unsigned u = (o == 0xCu) ? 0u : 1u;
+            uint32_t map = (val >> 19) & 0xFFFu;
+            if (map) {
+                unsigned ch = __builtin_ctz(map);
+                soc->lp_adc_data[u] = (ch < 8) ? 1024u + ch * 128u : 2048u;
+            }
+            mmio32[off >> 2] = val | 0x10000u; /* DONE follows instantly */
+            return;
+        }
+        mmio32[off >> 2] = val;
         return;
     }
 
