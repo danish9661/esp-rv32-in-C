@@ -1100,6 +1100,8 @@ static uint32_t p4_xlate(uint32_t addr)
         return addr - 0x500C0000u + 0x14000u; /* MCPWM0 */
     if (addr >= 0x50127000u && addr < 0x50128000u)
         return addr - 0x50127000u + 0x15000u; /* LP_ADC (RTC cali) */
+    if (addr >= 0x5012F000u && addr < 0x50130000u)
+        return addr - 0x5012F000u + 0x16000u; /* LP_TSENSOR */
     if (addr >= 0x50081000u && addr < 0x500812B0u)
         return addr - 0x50081000u + 0x80000u; /* AHB_GDMA */
     if (addr >= 0x500D0000u && addr < 0x500D0100u)
@@ -1452,8 +1454,18 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return soc->twai_reg[off >> 2];
     }
 
-    /* LP_ADC MEASn_CTRL2: DATA follows the selected channel. */
-    if (addr >= P4_PERIPH_BASE + 0x15000u &&
+    /* LP_TSENSOR (translated 0x60016000): CTRL (+0x0) holds OUT[7:0] and
+     * READY[8]. Conversions are instant: always report ready with raw
+     * 120 (~32 C via the driver curve). */
+    if (addr >= P4_PERIPH_BASE + 0x16000u &&
+        addr < P4_PERIPH_BASE + 0x17000u) {
+        uint32_t o = off - 0x16000u;
+        if (o == 0x0u)
+            return (mmio32[off >> 2] & ~0x1FFu) | 0x100u | 120u;
+        return mmio32[off >> 2];
+    }
+
+    /* LP_ADC MEASn_CTRL2: DATA follows the selected channel. */    if (addr >= P4_PERIPH_BASE + 0x15000u &&
         addr < P4_PERIPH_BASE + 0x16000u) {
         uint32_t o = off - 0x15000u;
         if (o == 0xCu || o == 0x30u) {
