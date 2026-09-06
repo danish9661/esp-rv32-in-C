@@ -3662,8 +3662,8 @@ static void esp32p4_gpio_edge_check(esp32p4_t *soc, uint32_t *mmio32,
         /* PCNT: any edge on a pin that the GPIO matrix routes to a PCNT
          * unit/channel is counted here. Matrix input select for signal s
          * lives at 0x60091000 + 0x154 + 4*s; its low 6 bits are the source
-         * GPIO. ESP32-C6 PCNT signal indices are unit u channel ch ->
-         * 101 + 4*ch + u (CH0_IN0=101, CH0_IN1=105, CH1_IN0=102, ...). */
+         * GPIO. P4 PCNT signal indices are unit u channel ch ->
+         * 141 + 4*u + 2*ch (CHn_IN0..IN3 = edge/level pairs). */
         if (level != prev) {
             for (int u = 0; u < 4; u++) {
                 if (soc->pcnt_reg[0x60 >> 2] & (1u << (2 * u + 1)))
@@ -3672,7 +3672,7 @@ static void esp32p4_gpio_edge_check(esp32p4_t *soc, uint32_t *mmio32,
                 uint32_t conf1 = soc->pcnt_reg[(0x04 + 0x0c * u) >> 2];
                 uint32_t conf2 = soc->pcnt_reg[(0x08 + 0x0c * u) >> 2];
                 for (int ch = 0; ch < 2; ch++) {
-                    uint32_t sig = 101u + 4u * ch + u;
+                    uint32_t sig = 141u + 4u * u + 2u * ch;
                     uint32_t insel =
                         mmio32[(0x91000u + 0x158u + 4u * sig) >> 2];
                     if ((insel & 0x3Fu) != (uint32_t) pin)
