@@ -303,7 +303,7 @@ struct esp32p4_soc {
     /* MCPWM (0x60014000): 0x130 bytes, mirrors mcpwm_dev_t. Timers count
      * 0..period at (timer_prescale+1)*(clk_prescale+1) 40 MHz source
      * cycles; generator events (zero/period/compare A/B) update the
-     * levels that drive pads routed to signals 87..92
+     * levels that drive pads routed to signals 89..94
      * (PWM0_OUT{0,1,2}{A,B}). */
     uint32_t mcpwm_reg[128]; /* 0x200 bytes; covers int_st/ena at 0x194/0x198 */
     uint64_t mcpwm_anchor[3];   /* cycle anchor per timer */
@@ -4320,7 +4320,7 @@ void esp32p4_periodic(riscv_t *rv)
      * peak-1), 2 down, 3 up/down (register period is the peak). Generator
      * events (zero, period, compare A/B) apply the action fields; the
      * resulting level drives any pad whose matrix output select is the
-     * MCPWM signal (87..92 = PWM0_OUT{0,1,2}{A,B}). */
+     * MCPWM signal (89..94 = PWM0_OUT{0,1,2}{A,B}). */
     {
         uint32_t clkps = (soc->mcpwm_reg[0x00 >> 2] & 0xFFu) + 1u;
         for (int t = 0; t < 3; t++) {
@@ -4374,11 +4374,11 @@ void esp32p4_periodic(riscv_t *rv)
         /* drive pads routed to MCPWM signals; continuous force (cntuforce
          * mode) pins the level, one-shot force (nciforce) lasts one event */
         for (int p = 0; p < 30; p++) {
-            uint32_t sel = mmio32[(0x91558u + 4u * p) >> 2] & 0xFFu;
-            if (sel < 87u || sel > 92u)
+            uint32_t sel = mmio32[(0x91558u + 4u * p) >> 2] & 0x1FFu;
+            if (sel < 89u || sel > 94u)
                 continue;
-            int op = (int) (sel - 87u) >> 1;
-            int g = (int) (sel - 87u) & 1;
+            int op = (int) (sel - 89u) >> 1;
+            int g = (int) (sel - 89u) & 1;
             uint32_t gf = soc->mcpwm_reg[(0x3cu + 0x38u * op + 0x10u) >> 2];
             uint32_t cmode = (g == 0) ? ((gf >> 6) & 0x3u) : ((gf >> 8) & 0x3u);
             uint32_t nmode = (g == 0) ? ((gf >> 11) & 0x3u) : ((gf >> 14) & 0x3u);
