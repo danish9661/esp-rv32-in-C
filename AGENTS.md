@@ -409,6 +409,25 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - **SPI** (`p4spi`): JEDEC `EF 40 15` (manuf clocks out during `0x9F`,
     as on C6), no model change needed.
   Sketches live under `/home/danish1075/fw/p4{hello,gpio,uart,gptimer,i2c,spi}/`.
+- [x] Phase 6 (cont.): more P4 peripherals — 2026-09-06.
+  - **ADC** (`p4adc`): LP_ADC (0x50127000) was unmodeled so calinit hung
+    polling MEAS DONE; now instant-complete with channel DATA
+    (1024+ch*128). `ADC_READ 0=1024 3=1408`, `ADC_DONE`.
+  - **LEDC** (`p4ledc`): P4 output signals are 126-131 (not 0-5);
+    `LEDC_DUTY 128`, LO ~49% at 1 kHz/8-bit.
+  - **TWAI** (`p4twai`): virtual RX frame + TX, no model change:
+    `TWAI_RX 123 2 DE AD`, `TWAI_TX OK`.
+  - **PCNT** (`p4pcnt`): input signals are 141+4u+2ch (not 101+);
+    `PCNT_COUNT 8`, `PCNT_DONE`.
+  - **MCPWM** (`p4mcpwm`): outputs are signals 89-94 (not 87-92), 9-bit
+    OUT_SEL mask; `MCPWM_LO ~50%`, `MCPWM_DONE`.
+  - **TSENS** (`p4tsens`): LP_TSENSOR (0x5012F000) instant-ready, raw 120:
+    `TSENS_READ OK 32.0`.
+  - Parked (need dedicated passes): **RMT TX** (driver stalls before
+    tx_start; GDMA handoff not understood; WIP on branch `p4-rmt-rework`
+    with correct CHnCONF0/INT offsets + per-channel done) and **I2S RX**
+    (driver never sets RX_START nor programs GDMA; I2S0 remapped to the
+    0x6000C000 block with self-clearing UPDATE).
 
 ## Known issues / gotchas
 

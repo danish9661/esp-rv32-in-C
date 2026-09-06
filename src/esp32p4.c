@@ -1089,7 +1089,7 @@ static uint32_t p4_xlate(uint32_t addr)
     if (addr >= 0x500D7000u && addr < 0x500D7100u)
         return addr - 0x500D7000u + 0xB000u; /* TWAI0 */
     if (addr >= 0x500C6000u && addr < 0x500C6100u)
-        return addr - 0x500C6000u + 0xD000u; /* I2S0 */
+        return addr - 0x500C6000u + 0xC000u; /* I2S0 */
     if (addr >= 0x500DE000u && addr < 0x500DE404u)
         return addr - 0x500DE000u + 0xE000u; /* ADC */
     if (addr >= 0x500D6000u && addr < 0x500D6220u)
