@@ -428,6 +428,21 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     with correct CHnCONF0/INT offsets + per-channel done) and **I2S RX**
     (driver never sets RX_START nor programs GDMA; I2S0 remapped to the
     0x6000C000 block with self-clearing UPDATE).
+- [x] Phase 7: H2 peripheral matrix (no unicore patch needed, single-core
+  chip) + browser demo — 2026-09-08.
+  - H2 verified headless, all first-try green: GPIO (`OUT 1 0`, `INT 1`),
+    UART RX (`GOT 4 PING` via `H2_RX_FILE` MEMFS preload in run_h2.js),
+    I2C (scan `0x50`, rd `11..88`), SPI (`JEDEC EF 40 15`), ADC
+    (`0=1024 1=1152`), GPTIMER (5 alarms), LEDC (`DUTY 128`, LO ~49%),
+    PCNT (`COUNT 8`), TSENS (`32.0`), MCPWM (`LO ~50%`). RMT TX same
+    stall as P4 (`TX OK`, `WAIT FAIL`); parked with P4 RMT.
+  - Browser demo: `run_esp32h2`/`run_esp32p4` glue (system-pre.js), buttons
+    + handlers (system.html; P4 flash is the unicore-patched image),
+    firmware under demo/system/esp32h2 + esp32p4. printErr now goes to
+    the browser console only (was corrupting the guest UART terminal).
+    `tools/cdp_boot_test.py` drives headless Chrome over CDP
+    (click-to-boot, xterm scrollback match via `window.__espTerm`).
+    Verified: page loads clean, P4 boots in-browser with TICKs.
 
 ## Known issues / gotchas
 

@@ -5,4 +5,4 @@ const el=new Proxy(function(){},{get:(t,p)=>p==='style'?el:el,set:()=>true,apply
 global.document={getElementById:()=>el,querySelector:()=>el,addEventListener:()=>{},createElement:()=>el};
 const M=require('/home/danish1075/Documents/esp-rv32emu/build/rv32emu.js');
 M.locateFile=p=>p==='rv32emu.wasm'?'/home/danish1075/Documents/esp-rv32emu/build/rv32emu.wasm':p;
-M.onRuntimeInitialized=()=>{M.FS.writeFile('/merged.bin',bin);M.run_system(args);};
+M.onRuntimeInitialized=()=>{M.FS.writeFile('/merged.bin',bin);if(process.env.H2_RX_FILE){M.FS.writeFile('/uartrx',fs.readFileSync(path.resolve(process.env.H2_RX_FILE)));}M.run_system(args);};
