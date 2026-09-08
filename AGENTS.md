@@ -387,6 +387,25 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - Verified headless (node, `-C esp32p4`, postv3 variant + patched image):
     `rst:0x1 (POWERON)`, `entry 0x4ffac2c0`, `HELLO_UART_OK`, then steady
     `TICK` (FreeRTOS tick + yield interrupts delivering, tasks switching).
+- [ ] Phase 8: dual-core SMP for P4 (design agreed 2026-09-08, not started).
+  - Goal: boot UNPATCHED dual-core images (retire p4_mkunicore.py).
+  - Core: second `riscv_t` time-sliced with hart0 in `rv_step`
+    (deterministic interleave, e.g. 1K-cycle quanta; no threads needed
+    for WASM). Separate CSRs/mtvec/mhartid per hart come free with a
+    second instance.
+  - SoC sharing: `esp32p4_t` is currently per-`rv` (`PRIV(rv)->esp32p4`).
+    Split into shared (RAM/flash/MMIO/GDMA/most peripherals) + per-hart
+    (CLIC ie/ip/ctl/thresh/mtvt views). Biggest refactor item.
+  - Interrupts: INTMTX needs per-CPU MAP (CPU0 @0x500D6000, CPU1
+    @0x500D6800 — the ROM route fn already selects by cpu arg);
+    CLIC x2; FROM_CPU_INT0/INT1 (0x500E5010/0x500E5014) routed to their
+    own hart (today only INT0->hart0 exists).
+  - Boot: honor `ets_set_appcpu_boot_addr` + CPU1 unstall (currently
+    ignored); start hart1 parked, release on unstall.
+  - Validation: unpatched postv3 hello prints HELLO+TICK with main and
+    loopTask on different cores (check `pxCurrentTCBs[0/1]`).
+  - Perf note: two harts roughly halve throughput (~5M cycles/s each
+    in node/WASM); acceptable for tests.
   - Unicore patcher rewritten ELF/symbol-driven (`tools/p4_mkunicore.py` v2):
     CPU-sync waits found as backward branches (or do-while `j`-loops)
     testing flag-derived regs for s_cpu_up/s_cpu_inited/s_system_inited/
