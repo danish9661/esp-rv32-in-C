@@ -442,11 +442,10 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     OUT_SEL mask; `MCPWM_LO ~50%`, `MCPWM_DONE`.
   - **TSENS** (`p4tsens`): LP_TSENSOR (0x5012F000) instant-ready, raw 120:
     `TSENS_READ OK 32.0`.
-  - Parked (need dedicated passes): **RMT TX** (driver stalls before
-    tx_start; GDMA handoff not understood; WIP on branch `p4-rmt-rework`
-    with correct CHnCONF0/INT offsets + per-channel done) and **I2S RX**
-    (driver never sets RX_START nor programs GDMA; I2S0 remapped to the
-    0x6000C000 block with self-clearing UPDATE).
+  - Parked (need dedicated passes): **RMT TX** — RESOLVED 2026-09-08,
+    see below (test sketches were missing `rmt_enable()`, not a model
+    bug) — and **I2S RX** (driver never sets RX_START nor programs GDMA;
+    I2S0 remapped to the 0x6000C000 block with self-clearing UPDATE).
   - RMT/I2S deep-dive findings 2026-09-08: new-driver `rmt_transmit`
     returns OK having only enqueued (polls an event queue, takes the
     empty path); `rmt_tx_do_transaction` runs ONLY from TX ISRs, so the
@@ -458,6 +457,10 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     first DMA/START programming (likely a clock/reset/event handshake
     the model doesn't satisfy, not the register offsets which are now
     correct per TRM headers).
+    (Update 2026-09-08: both premises were wrong — RMT TX was a missing
+    `rmt_enable()` in the sketches, and I2S RX was three model bugs:
+    I2S handler at `0xC000` vs xlate `0xD000`, AHB_GDMA at `0x50085000`
+    not `0x50081000`, AHB link START/ADDR regs. See fix entry below.)
 - [x] Phase 7: H2 peripheral matrix (no unicore patch needed, single-core
   chip) + browser demo — 2026-09-08.
   - H2 verified headless, all first-try green: GPIO (`OUT 1 0`, `INT 1`),
@@ -473,6 +476,38 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     `tools/cdp_boot_test.py` drives headless Chrome over CDP
     (click-to-boot, xterm scrollback match via `window.__espTerm`).
     Verified: page loads clean, P4 boots in-browser with TICKs.
+- [x] Phase 6 (cont.): RMT TX + I2S RX root-caused and fixed — 2026-09-08.
+  - **RMT TX was a sketch bug, not a model bug.** Both `p4rmt` and `h2rmt`
+    sketches called `rmt_transmit()` without `rmt_enable()`; IDF queues
+    the transaction and returns OK but the FSM never leaves ENABLE so
+    `rmt_tx_do_transaction` never runs (no CONF0/GDMA writes — the
+    "parked" trace). Fix: one line `ESP_ERROR_CHECK(rmt_enable(ch))`
+    in `/home/danish1075/fw/p4rmt/p4rmt.ino` + `h2rmt/h2rmt.ino`
+    (rebuilt + re-patched). Now `RMT_TX OK`, `RMT_WAIT OK` on P4 and H2;
+    direct-HAL `p4rmtdir` still `TXEND SET`; `p4rmtrx` still `DONE n=32`.
+    No emulator change needed. Legacy `p4rmtleg` driver still parked.
+  - **P4 I2S RX: three model bugs, all in `src/esp32p4.c`.**
+    1. I2S0 handler lived at translated `0x6000C000` but `p4_xlate()`
+       maps `0x500C6000` → `0x6000D000`, so RX_CONF writes (incl.
+       rx_update self-clear) landed in plain storage and
+       `i2s_rx_channel_start` spun forever polling UPDATE. Fix: handler
+       moved to `0xD000` (INT_CLR `0xD00C`, engine checks `0xD020/0xD024`).
+    2. AHB_GDMA mapped at `0x50081000` (that is DW_GDMA, now explicitly
+       unmapped); the I2S driver uses AHB_DMA at **`0x50085000`**
+       (confirmed via `DW_GDMA`/`AHB_DMA`/`AXI_DMA` ELF symbols +
+       `esp-pacs` PAC offsets). Fix: `p4_xlate()` maps
+       `0x50085000-0x50085400` → `0x80000` (covers `IN_LINK_ADDR_CH`
+       `0x3AC` / `OUT_LINK_ADDR_CH` `0x3B8`).
+    3. AHB_GDMA register mismatch: IN_LINK.START is bit 2 (not 22),
+       OUT_LINK.START bit 1 (not 21); descriptor addresses live in the
+       separate `IN/OUT_LINK_ADDR_CH` regs as full 32-bit addresses (link
+       reg low bits unused). Fix: new `gdma_{in,out}_link_addr[3]` state,
+       START/STOP/RESTART bits per the HAL disassembly
+       (`gdma_ahb_hal_start_with_desc`/`_reset`/`_stop`), full-addr
+       walker arming with 20-bit fallback.
+    Verified: `p4i2s` → `I2S_READ OK 960`, `WORDS 0 1` (monotonic
+    counter, 6-desc ring `...e700→...f4c0→e700`). Regression: P4 hello,
+    GPIO, I2C, RMT TX/RX, RMTRX; H2 hello + RMT TX — all green.
 
 ## Known issues / gotchas
 

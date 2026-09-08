@@ -339,6 +339,8 @@ struct esp32p4_soc {
     uint32_t gdma_in_conf0[3];
     uint32_t gdma_in_conf1[3];
     uint32_t gdma_in_link[3];
+    uint32_t gdma_in_link_addr[3]; /* IN_LINK_ADDR_CH: full desc addr */
+    uint32_t gdma_out_link_addr[3]; /* OUT_LINK_ADDR_CH: full desc addr */
     uint32_t gdma_in_eof_des_addr[3];
     uint32_t gdma_in_dscr[3];
     uint32_t gdma_in_pri[3];
@@ -1109,8 +1111,11 @@ static uint32_t p4_xlate(uint32_t addr)
         return addr - 0x5012F000u + 0x16000u; /* LP_TSENSOR */
     if (addr >= 0x500A2800u && addr < 0x500A2E00u)
         return addr - 0x500A2800u + 0x17000u; /* RMTMEM (384 words) */
-    if (addr >= 0x50081000u && addr < 0x500812B0u)
-        return addr - 0x50081000u + 0x80000u; /* AHB_GDMA */
+    if (addr >= 0x50085000u && addr < 0x50085400u)
+        return addr - 0x50085000u + 0x80000u; /* AHB_GDMA (I2S uses this) */
+    /* NOTE: 0x50081000 is DW_GDMA, a separate peripheral that shares no
+     * state with AHB_GDMA above; it is intentionally left unmapped
+     * (writes ignored, reads idle) until a driver needs it. */
     if (addr >= 0x500D0000u && addr < 0x500D0100u)
         return addr - 0x500D0000u + 0x81000u; /* SPI2 (GPSPI2) */
     if (addr >= 0x50090000u && addr < 0x50090100u)
@@ -2476,14 +2481,37 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         return;
     }
 
-    /* GDMA (0x60080000-0x600802B0): IN + OUT channel control. in_intr[ch]
+    /* GDMA (0x60080000-0x60080400): IN + OUT channel control. in_intr[ch]
      * at 0x00 + 16*ch; out_intr[ch] at 0x30 + 16*ch. channel[ch] at
      * 0x70 + 0xC0*ch with the IN block at +0x00 and OUT block at +0x60.
-     * IN_LINK.start (bit 22) / OUT_LINK.start (bit 21) arm the descriptor
-     * walker; *_conf0.*_rst (bit 0) is write-only and resets FIFO+walker. */
+     * P4 AHB_DMA (0x50085000) layout: IN_LINK.start is bit 2 (bit 22 is
+     * the legacy C6/DW position, also accepted); OUT_LINK.start is bit 1
+     * (bit 21 legacy). Descriptor addresses live in the separate
+     * IN_LINK_ADDR_CH (0x3AC+4ch) / OUT_LINK_ADDR_CH (0x3B8+4ch)
+     * registers as full 32-bit addresses (link reg low bits are NOT
+     * used on this HW revision). *_conf0.*_rst (bit 0) is write-only and
+     * resets FIFO+walker. */
     if (addr >= P4_PERIPH_BASE + 0x80000u &&
-        addr < P4_PERIPH_BASE + 0x802B0u) {
+        addr < P4_PERIPH_BASE + 0x80400u) {
         uint32_t o = addr - P4_PERIPH_BASE - 0x80000u;
+        if (o >= 0x3ACu && o < 0x3B8u) { /* IN_LINK_ADDR_CH[3] */
+            uint32_t c = (o - 0x3ACu) >> 2;
+            if (c < 3u) {
+                soc->gdma_in_link_addr[c] = val;
+                mmio32[off >> 2] = val;
+            }
+            return;
+        }
+        if (o >= 0x3B8u && o < 0x3C4u) { /* OUT_LINK_ADDR_CH[3] */
+            uint32_t c = (o - 0x3B8u) >> 2;
+            if (c < 3u) {
+                soc->gdma_out_link_addr[c] = val;
+                mmio32[off >> 2] = val;
+            }
+            return;
+        }
+        if (o >= 0x3C4u)
+            return; /* intr_mem/arb/weight/clk/done regs: ignore */
         if (o < 0x30u) { /* in_intr[3]: 0x00..0x2F */
             uint32_t ch = o >> 4;
             switch (o & 0xFu) {
@@ -2543,16 +2571,20 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 case 0x10: /* in_link */
                     soc->gdma_in_link[c] =
                         val & ~0xF00000u; /* start/stop/restart/park WT */
-                    if (val & (1u << 22)) { /* start */
-                        soc->gdma_rx_desc_addr[c] = P4_SRAM_BASE +
-                            (soc->gdma_in_link[c] & 0xFFFFFu);
+                    if ((val & (1u << 2)) || (val & (1u << 22))) { /* start */
+                        if (soc->gdma_in_link_addr[c])
+                            soc->gdma_rx_desc_addr[c] =
+                                soc->gdma_in_link_addr[c];
+                        else
+                            soc->gdma_rx_desc_addr[c] = P4_SRAM_BASE +
+                                (soc->gdma_in_link[c] & 0xFFFFFu);
                         soc->gdma_rx_sample[c] = 0;
                         esp32p4_gdma_load_rx_desc(soc, c);
                         soc->gdma_rx_run[c] = 1;
                         soc->gdma_rx_fill_cyc[c] = rv->csr_cycle + 256u;
-                    } else if (val & (1u << 21)) { /* stop */
+                    } else if ((val & (1u << 1)) || (val & (1u << 21))) { /* stop */
                         soc->gdma_rx_run[c] = 0;
-                    } else if (val & (1u << 23)) { /* restart */
+                    } else if ((val & (1u << 3)) || (val & (1u << 23))) { /* restart */
                         soc->gdma_rx_run[c] = 1;
                         soc->gdma_rx_fill_cyc[c] = rv->csr_cycle + 256u;
                     }
@@ -2583,15 +2615,19 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             case 0x70: /* out_link */
                 soc->gdma_out_link[c] =
                     val & ~0x700000u; /* start/stop/restart are WT */
-                if (val & (1u << 21)) { /* start */
-                    soc->gdma_tx_desc_addr[c] = P4_SRAM_BASE +
-                        (soc->gdma_out_link[c] & 0xFFFFFu);
+                if ((val & (1u << 1)) || (val & (1u << 21))) { /* start */
+                    if (soc->gdma_out_link_addr[c])
+                        soc->gdma_tx_desc_addr[c] =
+                            soc->gdma_out_link_addr[c];
+                    else
+                        soc->gdma_tx_desc_addr[c] = P4_SRAM_BASE +
+                            (soc->gdma_out_link[c] & 0xFFFFFu);
                     esp32p4_gdma_load_desc(soc, c);
                     soc->gdma_tx_run[c] = 1;
                     soc->gdma_tx_drain_cyc[c] = rv->csr_cycle + 256u;
-                } else if (val & (1u << 20)) { /* stop */
+                } else if ((val & (1u << 0)) || (val & (1u << 20))) { /* stop */
                     soc->gdma_tx_run[c] = 0;
-                } else if (val & (1u << 22)) { /* restart */
+                } else if ((val & (1u << 2)) || (val & (1u << 22))) { /* restart */
                     soc->gdma_tx_run[c] = 1;
                     soc->gdma_tx_drain_cyc[c] = rv->csr_cycle + 256u;
                 }
@@ -2609,19 +2645,20 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         return;
     }
 
-    /* I2S (0x6000C000-0x6000C100): TX_CONF/RX_CONF self-clearing bits. The
-     * reset bits (0,1) are write-only and *_update (8) clears itself once
-     * the configuration has been applied (the driver polls it). rx_start /
-     * tx_start (bit 2) are kept set so the engine knows the stream runs. */
-    if (addr >= P4_PERIPH_BASE + 0xC000u &&
-        addr < P4_PERIPH_BASE + 0xC100u) {
-        uint32_t o = addr - P4_PERIPH_BASE - 0xC000u;
+    /* I2S0 (translated 0x6000D000 from 0x500C6000): TX_CONF/RX_CONF
+     * self-clearing bits. The reset bits (0,1) are write-only and
+     * *_update (8) clears itself once the configuration has been applied
+     * (the driver polls it). rx_start / tx_start (bit 2) are kept set so
+     * the engine knows the stream runs. */
+    if (addr >= P4_PERIPH_BASE + 0xD000u &&
+        addr < P4_PERIPH_BASE + 0xD100u) {
+        uint32_t o = addr - P4_PERIPH_BASE - 0xD000u;
         if (o == 0x24u) {
             mmio32[off >> 2] = val & ~0x103u;
         } else if (o == 0x20u) { /* RX_CONF */
             mmio32[off >> 2] = val & ~0x103u;
         } else if (o == 0x18u) { /* INT_CLR: W1C */
-            mmio32[(0xC00Cu) >> 2] &= ~val;
+            mmio32[(0xD00Cu) >> 2] &= ~val;
         } else {
             mmio32[off >> 2] = val;
         }
@@ -4149,7 +4186,7 @@ void esp32p4_periodic(riscv_t *rv)
             continue;
         if (soc->gdma_out_peri_sel[ch] == 6)
             continue; /* AES0: data is consumed by the AES trigger, not I2S */
-        if (!(mmio32[0xC024u >> 2] & (1u << 2))) /* I2S TX not started */
+        if (!(mmio32[0xD024u >> 2] & (1u << 2))) /* I2S TX not started */
             continue;
         if (rv->csr_cycle < soc->gdma_tx_drain_cyc[ch])
             continue;
@@ -4207,7 +4244,7 @@ void esp32p4_periodic(riscv_t *rv)
             continue;
         if (soc->gdma_in_peri_sel[ch] == 6)
             continue; /* AES0: data is produced by the AES trigger, not I2S */
-        if (!(mmio32[0xC020u >> 2] & (1u << 2))) /* I2S RX not started */
+        if (!(mmio32[0xD020u >> 2] & (1u << 2))) /* I2S RX not started */
             continue;
         if (rv->csr_cycle < soc->gdma_rx_fill_cyc[ch])
             continue;
