@@ -266,8 +266,8 @@ struct esp32p4_soc {
      * result immediately. */
     uint32_t aes_reg[64]; /* 0x100 bytes, mirrors aes_dev_t */
 
-    /* RMT (0x60006000): TX completion model */
-    uint64_t rmt_tx_done_cycle; /* cycle at which the TX completes */
+    /* RMT (0x60006000): TX completion model (per channel) */
+    uint64_t rmt_tx_done_cycle[8]; /* cycle at which each TX completes */
     /* RMT RX (HW channels 2/3, input signals 71/72): pulse-width capture.
      * The channel memory holds symbols {level, duration}; the driver's ISR
      * copies them straight out of the channel memory after RX_END. */
@@ -1089,7 +1089,7 @@ static uint32_t p4_xlate(uint32_t addr)
     if (addr >= 0x500D7000u && addr < 0x500D7100u)
         return addr - 0x500D7000u + 0xB000u; /* TWAI0 */
     if (addr >= 0x500C6000u && addr < 0x500C6100u)
-        return addr - 0x500C6000u + 0xC000u; /* I2S0 */
+        return addr - 0x500C6000u + 0xD000u; /* I2S0 */
     if (addr >= 0x500DE000u && addr < 0x500DE404u)
         return addr - 0x500DE000u + 0xE000u; /* ADC */
     if (addr >= 0x500D6000u && addr < 0x500D6220u)
@@ -1100,8 +1100,6 @@ static uint32_t p4_xlate(uint32_t addr)
         return addr - 0x500C0000u + 0x14000u; /* MCPWM0 */
     if (addr >= 0x50127000u && addr < 0x50128000u)
         return addr - 0x50127000u + 0x15000u; /* LP_ADC (RTC cali) */
-    if (addr >= 0x5012F000u && addr < 0x50130000u)
-        return addr - 0x5012F000u + 0x16000u; /* LP_TSENSOR */
     if (addr >= 0x50081000u && addr < 0x500812B0u)
         return addr - 0x50081000u + 0x80000u; /* AHB_GDMA */
     if (addr >= 0x500D0000u && addr < 0x500D0100u)
@@ -1454,18 +1452,8 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return soc->twai_reg[off >> 2];
     }
 
-    /* LP_TSENSOR (translated 0x60016000): CTRL (+0x0) holds OUT[7:0] and
-     * READY[8]. Conversions are instant: always report ready with raw
-     * 120 (~32 C via the driver curve). */
-    if (addr >= P4_PERIPH_BASE + 0x16000u &&
-        addr < P4_PERIPH_BASE + 0x17000u) {
-        uint32_t o = off - 0x16000u;
-        if (o == 0x0u)
-            return (mmio32[off >> 2] & ~0x1FFu) | 0x100u | 120u;
-        return mmio32[off >> 2];
-    }
-
-    /* LP_ADC MEASn_CTRL2: DATA follows the selected channel. */    if (addr >= P4_PERIPH_BASE + 0x15000u &&
+    /* LP_ADC MEASn_CTRL2: DATA follows the selected channel. */
+    if (addr >= P4_PERIPH_BASE + 0x15000u &&
         addr < P4_PERIPH_BASE + 0x16000u) {
         uint32_t o = off - 0x15000u;
         if (o == 0xCu || o == 0x30u) {
@@ -1601,9 +1589,11 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         }
         return mmio32[off >> 2];
     }
-    /* RMT: INT_ST (0x3C) is the raw status masked by INT_ENA */
-    if (addr == P4_PERIPH_BASE + 0x603Cu)
-        return mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2];
+    /* RMT: INT_ST (0x74) is the raw status (0x70) masked by INT_ENA (0x78) */
+    if (addr == P4_PERIPH_BASE + 0x6074u)
+        return mmio32[0x6070u >> 2] & mmio32[0x6078u >> 2];
+    if (addr == P4_PERIPH_BASE + 0x6070u)
+        return mmio32[0x6070u >> 2];
     /* LEDC (0x60007000-0x60007200) */
     if (addr >= P4_PERIPH_BASE + 0x7000u &&
         addr < P4_PERIPH_BASE + 0x7200u) {
@@ -2206,62 +2196,29 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         return;
     }
 
-    /* RMT (0x60006000-0x60006B00): registers + 4x48-word channel memory
-     * at 0x400. TX completes (TX_DONE interrupt, source 49) a while after
-     * conf0.tx_start is written; the driver's ISR clears INT_CLR. */
+    /* RMT (0x60006000-0x60006B00): P4 has 8 channels; CHnCONF0 at
+     * 0x20,0x24,0x28,0x2C,0x30,0x38,0x40,0x48, INT_RAW/ST/ENA/CLR at
+     * 0x70/0x74/0x78/0x7C with per-channel TX_END bits 0-7. TX completes
+     * (TX_END interrupt, source 43) shortly after conf0.tx_start is
+     * written; the driver's ISR clears INT_CLR. */
     if (addr >= P4_PERIPH_BASE + 0x6000u &&
         addr < P4_PERIPH_BASE + 0x6B00u) {
+        static const uint32_t conf0_off[8] = {
+            0x20u, 0x24u, 0x28u, 0x2Cu, 0x30u, 0x38u, 0x40u, 0x48u
+        };
         uint32_t roff = addr - P4_PERIPH_BASE - 0x6000u;
         mmio32[off >> 2] = val;
-        if (roff == 0x10u || roff == 0x14u) { /* CH0/CH1 CONF0 */
-            uint32_t ch = (roff - 0x10u) >> 2;
-            if (val & 0x1u) { /* tx_start */
-                uint32_t div = (val >> 8) & 0xFFu;
-                uint32_t mem_words =
-                    (((val >> 16) & 0x7u) ?: 1u) * 48u;
-                uint32_t *mem = mmio32 + (0x6400u >> 2) + ch * 48u;
-                uint64_t ticks = 0;
-                for (uint32_t i = 0; i < mem_words; i++) {
-                    uint32_t w = mem[i];
-                    if ((w & 0x7FFFu) == 0u) /* end marker */
-                        break;
-                    ticks += (w & 0x7FFFu) + ((w >> 16) & 0x7FFFu);
-                }
-                soc->rmt_tx_done_cycle =
-                    rv->csr_cycle + (ticks * (div ? div : 1u)) / 8u + 1024u;
+        for (int c = 0; c < 8; c++) {
+            if (roff == conf0_off[c] && (val & 0x1u)) { /* tx_start */
+                soc->rmt_tx_done_cycle[c] = rv->csr_cycle + 8192u;
+                return;
             }
-            if (val & 0x80u) /* tx_stop */
-                soc->rmt_tx_done_cycle = 0;
         }
-        if (roff == 0x1cu || roff == 0x24u) { /* CH0/CH1 RX CONF1 */
-            uint32_t ch = (roff - 0x1cu) >> 2;
-            /* WT bits (mem_wr_rst bit1, apb_mem_rst bit2) self-clear and
-             * reset the channel memory write pointer */
-            if (val & 0x6u) {
-                soc->rmt_rx_wptr[ch] = 0;
-                mmio32[((0x6030u + 4u * ch) >> 2)] = (ch + 2u) * 48u;
-                uint32_t *mem = mmio32 + (0x6400u >> 2) + (ch + 2u) * 48u;
-                for (int i = 0; i < 48; i++)
-                    mem[i] = 0;
-            }
-            mmio32[off >> 2] = val & ~0x6u;
-            soc->rmt_rx_en[ch] = (val & 0x1u) ? 1 : 0;
-            if (soc->rmt_rx_en[ch]) {
-                /* arm at the current input level so the first duration is
-                 * measured from the next transition */
-                uint32_t insel = mmio32[(0x91274u + 4u * ch) >> 2] & 0x3Fu;
-                soc->rmt_rx_last_level[ch] =
-                    (soc->gpio_in >> insel) & 1u;
-                soc->rmt_rx_trans_cycle[ch] = rv->csr_cycle;
-                soc->rmt_rx_last_cycle[ch] = rv->csr_cycle;
-            }
-        } else if (roff == 0x44u) { /* INT_CLR: clear raw status */
-            mmio32[0x6038u >> 2] &= ~val;
-            soc->intc_status &= ~(((__uint128_t)1) << P4_RMT_INTR_SOURCE);
-            if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
-                soc->intc_status |= ((__uint128_t)1) << P4_RMT_INTR_SOURCE;
-        } else {
-            mmio32[off >> 2] = val;
+        if (roff == 0x7Cu) { /* INT_CLR: W1C */
+            mmio32[0x6070u >> 2] &= ~val;
+            if (!(mmio32[0x6070u >> 2] & mmio32[0x6078u >> 2]))
+                soc->intc_status &= ~(((__uint128_t)1) << P4_RMT_INTR_SOURCE);
+            return;
         }
         return;
     }
@@ -4059,14 +4016,16 @@ void esp32p4_periodic(riscv_t *rv)
         }
     }
 
-    /* RMT TX completion: set TX_DONE (raw bit 0) and raise the source
-     * (INTMTX source 49); the driver ISR clears it via INT_CLR. */
-    if (soc->rmt_tx_done_cycle &&
-        rv->csr_cycle >= soc->rmt_tx_done_cycle) {
-        soc->rmt_tx_done_cycle = 0;
-        mmio32[0x6038u >> 2] |= 0x1u;
-        if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
-            soc->intc_status |= ((__uint128_t)1) << P4_RMT_INTR_SOURCE;
+    /* RMT TX completion: set TX_END (raw bit c) and raise the source
+     * (INTMTX source 43); the driver ISR clears it via INT_CLR. */
+    for (int c = 0; c < 8; c++) {
+        if (soc->rmt_tx_done_cycle[c] &&
+            rv->csr_cycle >= soc->rmt_tx_done_cycle[c]) {
+            soc->rmt_tx_done_cycle[c] = 0;
+            mmio32[0x6070u >> 2] |= 1u << c;
+            if (mmio32[0x6070u >> 2] & mmio32[0x6078u >> 2])
+                soc->intc_status |= ((__uint128_t)1) << P4_RMT_INTR_SOURCE;
+        }
     }
 
     /* RMT RX: pulse capture on the channel input (GPIO matrix FUNC71/72_
