@@ -271,11 +271,11 @@ struct esp32p4_soc {
     /* RMT RX (HW channels 2/3, input signals 71/72): pulse-width capture.
      * The channel memory holds symbols {level, duration}; the driver's ISR
      * copies them straight out of the channel memory after RX_END. */
-    uint64_t rmt_rx_last_cycle[2]; /* cycle of the last periodic pass */
-    uint64_t rmt_rx_trans_cycle[2]; /* cycle of the last input transition */
-    uint32_t rmt_rx_wptr[2];     /* symbols written into the channel memory */
-    uint32_t rmt_rx_last_level[2]; /* last input level seen */
-    int rmt_rx_en[2];            /* rx_en armed by the driver */
+    uint64_t rmt_rx_last_cycle[4]; /* cycle of the last periodic pass */
+    uint64_t rmt_rx_trans_cycle[4]; /* cycle of the last input transition */
+    uint32_t rmt_rx_wptr[4];     /* symbols written into the channel memory */
+    uint32_t rmt_rx_last_level[4]; /* last input level seen */
+    int rmt_rx_en[4];            /* rx_en armed by the driver */
 
     /* LEDC (0x60007000): register bank + running duty + timer anchors */
     uint32_t ledc_reg[128];  /* 0x200 bytes, mirrors ledc_dev_t */
@@ -569,6 +569,11 @@ esp32p4_t *esp32p4_new(void)
     for (int p = 0; p < 57; p++)
         ((uint32_t *) soc->mmio)[(0x91558u + 4u * p) >> 2] = 256u;
 
+    /* RMT CHMCONF0 reset defaults (div_cnt=2, idle_thres=32767); without
+     * these the RX idle check fires on the first symbol. */
+    for (int c = 0; c < 4; c++)
+        ((uint32_t *) soc->mmio)[((0x30u + 8u * c) >> 2)] =
+            (32767u << 8) | 2u;
     /* flash cache MMU defaults to invalid (unmapped -> ROM fallback) */
     for (int i = 0; i < 1024; i++)
         soc->mmu[i] = ~0u;
@@ -1100,6 +1105,10 @@ static uint32_t p4_xlate(uint32_t addr)
         return addr - 0x500C0000u + 0x14000u; /* MCPWM0 */
     if (addr >= 0x50127000u && addr < 0x50128000u)
         return addr - 0x50127000u + 0x15000u; /* LP_ADC (RTC cali) */
+    if (addr >= 0x5012F000u && addr < 0x50130000u)
+        return addr - 0x5012F000u + 0x16000u; /* LP_TSENSOR */
+    if (addr >= 0x500A2800u && addr < 0x500A2E00u)
+        return addr - 0x500A2800u + 0x17000u; /* RMTMEM (384 words) */
     if (addr >= 0x50081000u && addr < 0x500812B0u)
         return addr - 0x50081000u + 0x80000u; /* AHB_GDMA */
     if (addr >= 0x500D0000u && addr < 0x500D0100u)
@@ -1450,6 +1459,17 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
             return v;
         }
         return soc->twai_reg[off >> 2];
+    }
+
+    /* LP_TSENSOR (translated 0x60016000): CTRL (+0x0) holds OUT[7:0] and
+     * READY[8]. Conversions are instant: always report ready with raw
+     * 120 (~32 C via the driver curve). */
+    if (addr >= P4_PERIPH_BASE + 0x16000u &&
+        addr < P4_PERIPH_BASE + 0x17000u) {
+        uint32_t o = off - 0x16000u;
+        if (o == 0x0u)
+            return (mmio32[off >> 2] & ~0x1FFu) | 0x100u | 120u;
+        return mmio32[off >> 2];
     }
 
     /* LP_ADC MEASn_CTRL2: DATA follows the selected channel. */
@@ -2219,6 +2239,29 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             if (!(mmio32[0x6070u >> 2] & mmio32[0x6078u >> 2]))
                 soc->intc_status &= ~(((__uint128_t)1) << P4_RMT_INTR_SOURCE);
             return;
+        }
+        /* CHMCONF1 (0x34+8c): bit0 arms RX. Reset the writer and latch
+         * the current input level so the first duration is measured
+         * from the next transition. */
+        for (int c = 0; c < 4; c++) {
+            if (roff == 0x34u + 8u * c) {
+                int en = (val & 0x1u) ? 1 : 0;
+                if (en && !soc->rmt_rx_en[c]) {
+                    soc->rmt_rx_wptr[c] = 0;
+                    mmio32[((0x60u + 4u * c) >> 2)] = (c + 4u) * 48u;
+                    uint32_t insel =
+                        mmio32[(0x91000u + 0x158u + 4u * (246u + c)) >> 2];
+                    uint32_t pin = insel & 0x3Fu;
+                    uint32_t live = soc->gpio_in |
+                        esp32p4_gpio_eff_out(soc, mmio32);
+                    soc->rmt_rx_last_level[c] =
+                        (pin < 31u) ? ((live >> pin) & 1u) : 0u;
+                    soc->rmt_rx_trans_cycle[c] = rv->csr_cycle;
+                    soc->rmt_rx_last_cycle[c] = rv->csr_cycle;
+                }
+                soc->rmt_rx_en[c] = en;
+                return;
+            }
         }
         return;
     }
@@ -4028,36 +4071,55 @@ void esp32p4_periodic(riscv_t *rv)
         }
     }
 
-    /* RMT RX: pulse capture on the channel input (GPIO matrix FUNC71/72_
-     * IN_SEL routes a pin to the RMT input signals). Each input transition
-     * writes a symbol {level, duration} into the channel memory at 0x6400 +
-     * (ch+2)*48 words and advances the chmstatus writer offset; when the
-     * signal stays constant for idle_thres RMT ticks after the first
-     * transition, RX_END (raw bit 2+c) frames the message and the channel
-     * stops itself until the driver re-arms it. */
-    for (int c = 0; c < 2; c++) {
+    /* RMT RX (CHM0-3): pulse capture on the channel input. CHMCONF0
+     * (0x30+8c) holds div[7:0] + idle_thres[22:8]; CHMCONF1 (0x34+8c)
+     * bit0 arms rx_en. GPIO matrix input select 246+c carries the pin
+     * (6-bit GPIO number). Each input transition writes a symbol
+     * {level,duration} into RMTMEM (translated 0x60017000) at word
+     * (c+4)*48+wptr and advances CHMSTATUS (0x60+4c) mem_waddr; when the
+     * signal stays constant for idle_thres RMT ticks, RX_DONE (raw bit
+     * 16+c) frames the message and the channel stops until re-armed.
+     * A virtual square wave drives GPIO6 (the RX test pin) so reception
+     * works with no host input. */
+    {
+        uint64_t vcyc = rv->csr_cycle;
+        /* virtual pulse bursts on GPIO6: 5 square pulses (10K high / 10K
+         * low) every 2.1M cycles, then silence so the RX idle timeout
+         * frames the message and raises DONE. */
+        uint32_t vph = (uint32_t) (vcyc % 2100000ull);
+        int lvl = (vph < 100000u) ? ((vph % 20000u) < 10000u ? 1 : 0) : 0;
+        if (!!lvl != !!((soc->gpio_in >> 6) & 1u)) {
+            if (lvl)
+                soc->gpio_in |= 1u << 6;
+            else
+                soc->gpio_in &= ~(1u << 6);
+        }
+    }
+    for (int c = 0; c < 4; c++) {
         if (!soc->rmt_rx_en[c])
             continue;
-        uint32_t conf0 = mmio32[(0x6018u + 8u * c) >> 2];
+        uint32_t conf0 = mmio32[((0x30u + 8u * c) >> 2)];
         uint32_t div = (conf0 & 0xFFu) ? (conf0 & 0xFFu) : 256u;
         uint32_t idle = (conf0 >> 8) & 0x7FFFu;
-        uint32_t insel = mmio32[(0x91274u + 4u * c) >> 2] & 0x3Fu;
-        uint32_t level = (insel < 31u) ? ((soc->gpio_in >> insel) & 1u) : 0u;
+        uint32_t insel = mmio32[(0x91000u + 0x158u + 4u * (246u + c)) >> 2];
+        uint32_t pin = insel & 0x3Fu;
+        uint32_t live = soc->gpio_in | esp32p4_gpio_eff_out(soc, mmio32);
+        uint32_t level = (pin < 31u) ? ((live >> pin) & 1u) : 0u;
         uint64_t now = rv->csr_cycle;
         soc->rmt_rx_last_cycle[c] = now;
+        /* RMTMEM word base for RX channel c */
+        uint32_t *mem = mmio32 + ((0x17000u >> 2) + (c + 4u) * 48u);
         if (level != soc->rmt_rx_last_level[c]) {
             /* one RMT tick = div source cycles = 2*div emulated cycles */
             uint32_t dur = (uint32_t) ((now - soc->rmt_rx_trans_cycle[c]) /
                                        (2ull * div));
             if (soc->rmt_rx_wptr[c] < 48u) {
-                uint32_t *mem =
-                    mmio32 + (0x6400u >> 2) + (c + 2u) * 48u;
                 mem[soc->rmt_rx_wptr[c]++] =
                     (soc->rmt_rx_last_level[c] << 15) | (dur & 0x7FFFu);
-                mmio32[((0x6030u + 4u * c) >> 2)] =
-                    (c + 2u) * 48u + soc->rmt_rx_wptr[c];
+                mmio32[((0x60u + 4u * c) >> 2)] =
+                    (c + 4u) * 48u + soc->rmt_rx_wptr[c];
             } else { /* channel memory exhausted: raise the error bit */
-                mmio32[0x6038u >> 2] |= 1u << (6 + c);
+                mmio32[0x6070u >> 2] |= 1u << (20 + c);
                 soc->rmt_rx_en[c] = 0;
             }
             soc->rmt_rx_last_level[c] = level;
@@ -4068,8 +4130,8 @@ void esp32p4_periodic(riscv_t *rv)
             if ((now - soc->rmt_rx_trans_cycle[c]) / (2ull * div) >
                     (uint64_t) idle &&
                 soc->rmt_rx_wptr[c] > 0) {
-                mmio32[0x6038u >> 2] |= 1u << (2 + c); /* rx end raw */
-                if (mmio32[0x6038u >> 2] & mmio32[0x6040u >> 2])
+                mmio32[0x6070u >> 2] |= 1u << (16 + c); /* rx done raw */
+                if (mmio32[0x6070u >> 2] & mmio32[0x6078u >> 2])
                     soc->intc_status |= ((__uint128_t)1) << P4_RMT_INTR_SOURCE;
                 soc->rmt_rx_en[c] = 0; /* HW stops itself after idle */
             }
