@@ -1369,6 +1369,8 @@ have_seen:
                 return soc->systimer_int_ena;
             case SYSTIMER_INT_RAW:
                 return soc->systimer_int_raw;
+            case SYSTIMER_INT_CLR:
+                return 0; /* WT, reads as 0 */
             case 0x70u: /* INT_ST = INT_RAW & INT_ENA */
                 return soc->systimer_int_raw & soc->systimer_int_ena;
             default:
@@ -2182,6 +2184,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->intc_status &= ~(((unsigned __int128)1) << SYSTIMER_T0_SOURCE);
             if (val & 4u)
                 soc->intc_status &= ~(((unsigned __int128)1) << SYSTIMER_T2_SOURCE);
+            mmio32[off >> 2] = val;
             return;
         default:
             mmio32[off >> 2] = val;
@@ -3122,6 +3125,31 @@ void esp32c3_periodic(riscv_t *rv)
                     else
                         soc->gpio_in &= ~(1u << p);
                 }
+            }
+        }
+    }
+
+    /* GPIO level interrupt poll: level-triggered interrupts (type 4=low,
+     * 5=high) must remain pending while the level persists. The edge
+     * checker only fires on transitions, so after the ISR clears
+     * GPIO_STATUS the pending bit would be lost. Re-assert it here while
+     * the live level still matches. */
+    {
+        uint32_t *mmio32 = (uint32_t *) soc->mmio;
+        uint32_t live = soc->gpio_in | esp32c3_gpio_eff_out(soc, mmio32);
+        for (int pin = 0; pin < 22; pin++) {
+            uint32_t pr = mmio32[(0x4074u + 4u * pin) >> 2];
+            int type = (pr >> 7) & 0x7u;
+            int ena = (pr >> 13) & 0x1Fu;
+            if (!ena)
+                continue;
+            if (type != 4 && type != 5)
+                continue;
+            int level = (live >> pin) & 1;
+            int fire = (type == 4) ? !level : level;
+            if (fire && !(soc->gpio_status & (1u << pin))) {
+                soc->gpio_status |= 1u << pin;
+                soc->intc_status |= ((unsigned __int128) 1) << C3_GPIO_INTR_SOURCE;
             }
         }
     }
