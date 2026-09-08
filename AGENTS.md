@@ -447,6 +447,17 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     with correct CHnCONF0/INT offsets + per-channel done) and **I2S RX**
     (driver never sets RX_START nor programs GDMA; I2S0 remapped to the
     0x6000C000 block with self-clearing UPDATE).
+  - RMT/I2S deep-dive findings 2026-09-08: new-driver `rmt_transmit`
+    returns OK having only enqueued (polls an event queue, takes the
+    empty path); `rmt_tx_do_transaction` runs ONLY from TX ISRs, so the
+    first kick never happens — no CONF0 writes, no AHB/AXI GDMA writes
+    at all. Legacy RMT driver stalls in config/install (softfloat-heavy
+    retry-looking loop, never reaches transmit). I2S RX: no GDMA writes
+    (AHB 0x50081000 nor AXI 0x5008A000), RX_START bit never set; read
+    times out. Common thread to investigate: what gates the drivers'
+    first DMA/START programming (likely a clock/reset/event handshake
+    the model doesn't satisfy, not the register offsets which are now
+    correct per TRM headers).
 - [x] Phase 7: H2 peripheral matrix (no unicore patch needed, single-core
   chip) + browser demo — 2026-09-08.
   - H2 verified headless, all first-try green: GPIO (`OUT 1 0`, `INT 1`),
