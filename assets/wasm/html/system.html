@@ -505,6 +505,9 @@
       <button class="btn btn-primary" id="runSysButton" disabled>Boot Linux</button>
       <button class="btn btn-secondary" id="runEsp32c3Button" disabled>Run ESP32-C3 App</button>
       <button class="btn btn-secondary" id="runEsp32c6Button" disabled>Run ESP32-C6 App</button>
+      <button class="btn btn-secondary" id="runEsp32h2Button" disabled>Run ESP32-H2 App</button>
+      <button class="btn btn-secondary" id="runEsp32p4Button" disabled>Run ESP32-P4 App</button>
+      <button class="btn btn-secondary" id="runEsp32c6I2SButton" disabled>Run ESP32-C6 I2S/GDMA</button>
     </div>
 
     <div class="canvas-panel progressive-load">
@@ -615,6 +618,7 @@
         cols: 100,
       });
       term.open(document.getElementById('terminal'));
+      window.__espTerm = term; // exposed for automated tests
       term.write('\x1b[32mrv32emu\x1b[0m - RISC-V System Emulator\r\n');
       term.write('Click "Boot Linux" to start...\r\n\r\n');
 
@@ -763,9 +767,10 @@
     });
 
     // ESP32-C6 app mode: same flow as C3, through the esp32c6 machine.
-    // Firmware: pcnttest (pulse-counter demo using the virtual button on pin 7).
-    const ESP32C6_ELF = 'esp32c6/pcnttest.ino.elf';
-    const ESP32C6_FLASH = 'esp32c6/pcnttest.ino.merged.bin';
+    // Firmware: demotest (GPIO/PCNT, LEDC, MCPWM, RMT RX, I2C, SPI, TWAI,
+    // TSENS, ADC — prints a full peripheral report).
+    const ESP32C6_ELF = 'esp32c6/demotest.ino.elf';
+    const ESP32C6_FLASH = 'esp32c6/demotest.ino.merged.bin';
 
     const runEsp32c6Button = document.getElementById('runEsp32c6Button');
 
@@ -800,6 +805,128 @@
         statusBadge.classList.add('loading');
         if (term) term.write(`\x1b[31mError: ${err.message}\x1b[0m\r\n`);
         runEsp32c6Button.disabled = false;
+      }
+    });
+
+    // ESP32-C6 I2S + GDMA demo: same machine as the C6 app, a different
+    // firmware that exercises I2S0 RX/TX through the GDMA engine.
+    const I2S_ELF = 'i2sgdma/i2sgdma.ino.elf';
+    const I2S_FLASH = 'i2sgdma/i2sgdma.ino.merged.bin';
+    const runEsp32c6I2SButton = document.getElementById('runEsp32c6I2SButton');
+
+    runEsp32c6I2SButton?.addEventListener('click', async () => {
+      runEsp32c6I2SButton.disabled = true;
+      statusText.textContent = 'Downloading ESP32-C6 I2S/GDMA firmware...';
+      statusBadge.classList.add('loading');
+      if (term) term.write('\x1b[33mDownloading ESP32-C6 I2S/GDMA firmware...\x1b[0m\r\n');
+
+      try {
+        const [elfData, flashData] = await Promise.all([
+          fetchWithProgress(I2S_ELF, 'App ELF'),
+          fetchWithProgress(I2S_FLASH, 'Flash image'),
+        ]);
+
+        if (term) term.write('\x1b[33mWriting firmware to VFS...\x1b[0m\r\n');
+        try {
+          Module.FS.mkdir('/i2sgdma');
+        } catch (e) { /* already exists */ }
+        Module.FS.writeFile('/' + I2S_ELF, elfData);
+        Module.FS.writeFile('/' + I2S_FLASH, flashData);
+
+        statusText.textContent = 'Booting ESP32-C6 I2S/GDMA app...';
+        statusBadge.classList.remove('loading');
+        if (term) term.write('\x1b[33mBooting ESP32-C6 I2S/GDMA app...\x1b[0m\r\n');
+
+        Module._indirect_rv_halt();
+        Module['run_esp32c6'](I2S_ELF, I2S_FLASH);
+      } catch (err) {
+        console.error('ESP32-C6 I2S/GDMA boot failed:', err);
+        statusText.textContent = 'Download failed';
+        statusBadge.classList.add('loading');
+        if (term) term.write(`\x1b[31mError: ${err.message}\x1b[0m\r\n`);
+        runEsp32c6I2SButton.disabled = false;
+      }
+    });
+
+    // ESP32-H2 app mode: hello sketch (HELLO_UART_OK + TICK) through the
+    // esp32h2 machine.
+    const ESP32H2_ELF = 'esp32h2/h2hello.ino.elf';
+    const ESP32H2_FLASH = 'esp32h2/h2hello.ino.merged.bin';
+    const runEsp32h2Button = document.getElementById('runEsp32h2Button');
+
+    runEsp32h2Button?.addEventListener('click', async () => {
+      runEsp32h2Button.disabled = true;
+      statusText.textContent = 'Downloading ESP32-H2 firmware...';
+      statusBadge.classList.add('loading');
+      if (term) term.write('\x1b[33mDownloading ESP32-H2 firmware...\x1b[0m\r\n');
+
+      try {
+        const [elfData, flashData] = await Promise.all([
+          fetchWithProgress(ESP32H2_ELF, 'App ELF'),
+          fetchWithProgress(ESP32H2_FLASH, 'Flash image'),
+        ]);
+
+        if (term) term.write('\x1b[33mWriting firmware to VFS...\x1b[0m\r\n');
+        try {
+          Module.FS.mkdir('/esp32h2');
+        } catch (e) { /* already exists */ }
+        Module.FS.writeFile('/' + ESP32H2_ELF, elfData);
+        Module.FS.writeFile('/' + ESP32H2_FLASH, flashData);
+
+        statusText.textContent = 'Booting ESP32-H2 app...';
+        statusBadge.classList.remove('loading');
+        if (term) term.write('\x1b[33mBooting ESP32-H2 app...\x1b[0m\r\n');
+
+        Module._indirect_rv_halt();
+        Module['run_esp32h2'](ESP32H2_ELF, ESP32H2_FLASH);
+      } catch (err) {
+        console.error('ESP32-H2 boot failed:', err);
+        statusText.textContent = 'Download failed';
+        statusBadge.classList.add('loading');
+        if (term) term.write(`\x1b[31mError: ${err.message}\x1b[0m\r\n`);
+        runEsp32h2Button.disabled = false;
+      }
+    });
+
+    // ESP32-P4 app mode: hello sketch (HELLO_UART_OK + TICK) through the
+    // esp32p4 machine. NOTE: the flash image is the unicore-patched build
+    // (see tools/p4_mkunicore.py); the stock merged.bin will not boot on
+    // the single-core model.
+    const ESP32P4_ELF = 'esp32p4/p4hello.ino.elf';
+    const ESP32P4_FLASH = 'esp32p4/p4hello.ino.patched.bin';
+    const runEsp32p4Button = document.getElementById('runEsp32p4Button');
+
+    runEsp32p4Button?.addEventListener('click', async () => {
+      runEsp32p4Button.disabled = true;
+      statusText.textContent = 'Downloading ESP32-P4 firmware...';
+      statusBadge.classList.add('loading');
+      if (term) term.write('\x1b[33mDownloading ESP32-P4 firmware...\x1b[0m\r\n');
+
+      try {
+        const [elfData, flashData] = await Promise.all([
+          fetchWithProgress(ESP32P4_ELF, 'App ELF'),
+          fetchWithProgress(ESP32P4_FLASH, 'Flash image'),
+        ]);
+
+        if (term) term.write('\x1b[33mWriting firmware to VFS...\x1b[0m\r\n');
+        try {
+          Module.FS.mkdir('/esp32p4');
+        } catch (e) { /* already exists */ }
+        Module.FS.writeFile('/' + ESP32P4_ELF, elfData);
+        Module.FS.writeFile('/' + ESP32P4_FLASH, flashData);
+
+        statusText.textContent = 'Booting ESP32-P4 app...';
+        statusBadge.classList.remove('loading');
+        if (term) term.write('\x1b[33mBooting ESP32-P4 app...\x1b[0m\r\n');
+
+        Module._indirect_rv_halt();
+        Module['run_esp32p4'](ESP32P4_ELF, ESP32P4_FLASH);
+      } catch (err) {
+        console.error('ESP32-P4 boot failed:', err);
+        statusText.textContent = 'Download failed';
+        statusBadge.classList.add('loading');
+        if (term) term.write(`\x1b[31mError: ${err.message}\x1b[0m\r\n`);
+        runEsp32p4Button.disabled = false;
       }
     });
 
@@ -941,33 +1068,12 @@
       })(),
 
       printErr: (function() {
-        let errBuffer = [];
-        let flushPending = false;
-
-        function flushErr() {
-          if (term && errBuffer.length > 0) {
-            // Process max 1000 lines per frame to prevent UI freeze
-            const chunk = errBuffer.splice(0, 1000);
-            term.write('\x1b[31m' + chunk.join('\r\n') + '\x1b[0m\r\n');
-
-            if (errBuffer.length > 0) {
-              requestAnimationFrame(flushErr);
-              return;
-            }
-          }
-          flushPending = false;
-        }
-
+        // Emulator diagnostics (fprintf(stderr) probes) go to the browser
+        // console only. The terminal shows guest UART output; mixing in
+        // host-side diagnostics would corrupt it.
         return function(text) {
           if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
           console.error(text);
-          if (term) {
-            errBuffer.push(text);
-            if (!flushPending) {
-              flushPending = true;
-              requestAnimationFrame(flushErr);
-            }
-          }
         };
       })(),
 
@@ -1040,6 +1146,9 @@
         if (runSysButton) runSysButton.disabled = false;
         if (runEsp32c3Button) runEsp32c3Button.disabled = false;
         if (runEsp32c6Button) runEsp32c6Button.disabled = false;
+        if (runEsp32c6I2SButton) runEsp32c6I2SButton.disabled = false;
+        if (runEsp32h2Button) runEsp32h2Button.disabled = false;
+        if (runEsp32p4Button) runEsp32p4Button.disabled = false;
         setTimeout(() => ProgressiveLoader.hide(), 300);
       }
     };
