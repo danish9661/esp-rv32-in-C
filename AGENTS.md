@@ -403,18 +403,26 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     regs, APP-CPU boot mailbox 0x50110164 (found by disassembling ROM
     `ets_set_appcpu_boot_addr`), time-sliced alternation in rv_step,
     per-hart block-chaining swap + map-clear guards, WASM halt-epilogue
-    only on hart0.
+    only on hart0, heap-allocated `vm_attr_t` (was stack-use-after-
+    unwind: shared fields flapped nondeterministically once two harts
+    changed stack-reuse patterns).
   - Verified: unpatched postv3 hello boots dual ROM, hart1 parks +
     releases via mailbox, MAP1/CLIC1 program, crosscore ISR delivers
     (line-0 routing), both harts reach scheduler bringup.
-  - NOT YET: unpatched HELLO+TICK (hart1 loses a task-creation race at
-    first scheduler start and aborts; then reboot-loops). Suspect:
-    hart1 outruns hart0's loopTask creation (fair per-block interleave
-    vs HW timing). Next: investigate ordering (e.g. gate hart1's first
-    yield on loopTask existing) or prove benign.
+  - NOT YET: unpatched HELLO+TICK. hart1 aborts at its first scheduler
+    yield (`xPortStartScheduler` returns): its first task switch finds
+    current==next (pxCurrentTCBs[1] preset to the ipc task at creation)
+    so no switch happens. Suspect boot-ordering race: hart1's lean
+    bringup path outruns hart0's loopTask creation under fair per-block
+    alternation (on HW, slow init calibrations likely order it the other
+    way). Holding hart1 for loopTask deadlocks the other way (main_task
+    waits s_other_cpu_startup_done first). Next: find what makes the
+    first switch select a runnable task (IDLE-1 existence? creation
+    order?) or pace hart1 (e.g. realistic init delays) — do NOT paper
+    over with scheduling gates; both directions deadlocked in testing.
   - Perf: INTMTX pending bits are u64 pairs now (was __uint128_t →
-    emcc libcalls in the per-block check, ~100x). Quantum back to 32M
-    default (50K experiment reverted; CDP socket timeout raised to 300
+    emcc libcalls in the per-block check, ~100x). Quantum stays 32M
+    (50K experiment reverted; CDP socket timeout raised to 300
     instead). Demo P4 (patched) still boots in-browser (CDP TICK).
   - Validation (when dual boot lands): unpatched postv3 hello prints
     HELLO+TICK with main and loopTask on different cores (check
