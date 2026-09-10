@@ -172,6 +172,7 @@ static void print_usage(const char *filename)
 #endif
 #if RV32_HAS(ESP32_P4)
         "  -C esp32p4 : run the ELF as an ESP32-P4 application\n"
+        "  -C esp32p4smp : run the ELF on dual-core ESP32-P4 (APP CPU on)\n"
 #endif
         "  -q : Suppress outputs other than `dump-registers`\n"
         "  -a [filename] : dump signature to the given file, "
@@ -434,7 +435,16 @@ int main(int argc, char **args)
 #endif
     run_flag |= opt_prof_data << 2;
 
-    vm_attr_t attr = {
+    /* Heap-allocated: rv instances (both SMP harts) keep a pointer to
+     * this across emscripten main-loop stack unwinds, which invalidate
+     * main's stack frame. A stack local here gets clobbered by later
+     * callback stack reuse (observed as flapping shared fields). */
+    vm_attr_t *attr = calloc(1, sizeof(vm_attr_t));
+    if (!attr) {
+        rv_log_fatal("Unable to allocate vm attributes");
+        return 1;
+    }
+    *attr = (vm_attr_t) {
         .mem_size = MEM_SIZE,
         .stack_size = STACK_SIZE,
         .args_offset_size = ARGS_OFFSET_SIZE,
@@ -453,22 +463,28 @@ int main(int argc, char **args)
     if (opt_esp32_chip) {
 #if RV32_HAS(ESP32_C3)
         if (strcmp(opt_esp32_chip, "esp32c3") == 0) {
-            attr.esp32c3 = esp32c3_new();
+            attr->esp32c3 = esp32c3_new();
         } else
 #endif
 #if RV32_HAS(ESP32_C6)
         if (strcmp(opt_esp32_chip, "esp32c6") == 0) {
-            attr.esp32c6 = esp32c6_new();
+            attr->esp32c6 = esp32c6_new();
         } else
 #endif
 #if RV32_HAS(ESP32_H2)
         if (strcmp(opt_esp32_chip, "esp32h2") == 0) {
-            attr.esp32h2 = esp32h2_new();
+            attr->esp32h2 = esp32h2_new();
         } else
 #endif
 #if RV32_HAS(ESP32_P4)
         if (strcmp(opt_esp32_chip, "esp32p4") == 0) {
-            attr.esp32p4 = esp32p4_new();
+            attr->esp32p4 = esp32p4_new();
+        } else if (strcmp(opt_esp32_chip, "esp32p4smp") == 0) {
+            attr->esp32p4 = esp32p4_new();
+            /* dual-core: the APP CPU boots alongside the PRO CPU (needs
+             * an unpatched dual-core image; unicore-patched images must
+             * keep using -C esp32p4). */
+            esp32p4_set_smp(attr->esp32p4, 1);
         } else
 #endif
         {
@@ -478,28 +494,28 @@ int main(int argc, char **args)
     }
 #endif
 #if RV32_HAS(SYSTEM_MMIO)
-    attr.data.system.kernel = opt_kernel_img;
-    attr.data.system.initrd = opt_rootfs_img;
-    attr.data.system.bootargs = opt_bootargs;
-    attr.data.system.vrng_enabled = opt_virtio_rng;
+    attr->data.system.kernel = opt_kernel_img;
+    attr->data.system.initrd = opt_rootfs_img;
+    attr->data.system.bootargs = opt_bootargs;
+    attr->data.system.vrng_enabled = opt_virtio_rng;
     if (opt_virtio_blk_idx) {
-        attr.data.system.vblk_device = opt_virtio_blk_img;
-        attr.data.system.vblk_device_cnt = opt_virtio_blk_idx;
+        attr->data.system.vblk_device = opt_virtio_blk_img;
+        attr->data.system.vblk_device_cnt = opt_virtio_blk_idx;
     } else {
-        attr.data.system.vblk_device = NULL;
+        attr->data.system.vblk_device = NULL;
     }
 #else
-    attr.data.user.elf_program = opt_prog_name;
+    attr->data.user.elf_program = opt_prog_name;
 #endif
 
     /* enable or disable the logging outputs */
     rv_log_set_quiet(opt_quiet_outputs);
 
     /* create the RISC-V runtime */
-    rv = rv_create(&attr);
+    rv = rv_create(attr);
     if (!rv) {
         rv_log_fatal("Unable to create riscv emulator");
-        attr.exit_code = 1;
+        attr->exit_code = 1;
         goto end;
     }
     rv_log_info("RISC-V emulator is created and ready to run");
@@ -553,5 +569,7 @@ int main(int argc, char **args)
 end:
     free(prof_out_file);
     prof_out_file = NULL;
-    return attr.exit_code;
+    int rc = attr->exit_code;
+    free(attr);
+    return rc;
 }

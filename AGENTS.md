@@ -118,6 +118,11 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
 - [x] **Baseline WASM build complete** (no SDL): wasm 6.6 MB raw / 3.1 MB gzip, js 71 KB. Details above.
 - [x] Baseline sizes recorded → done, see "WASM size" section above.
 - [x] Phase 1: C3 SoC layer (memory map, SYSTIMER, UART, GPIO, SPI0 flash cache, INTC, eFuse, RTC) — native build.
+  - Follow-up 2026-09-10: SYSTIMER `INT_CLR` reads as 0 (WT), GPIO
+    level-triggered interrupts re-assert while the level persists
+    (edge checker only fires transitions). Verified: hello+TICK,
+    gptimer 5 alarms, level IRQ fires once per asserted transition
+    with no storm.
 - [x] Phase 2: C3 boots a real ESP-IDF/Arduino app (`esp32test.ino` blink sketch) to `setup()`/`loop()` — 2026-08-16.
   - Key fixes: MMU table reads (0x600C5000) for `esp_ota_get_running_partition`; SYSTIMER TARGET0/TARGET2 with
     correct INTC sources (37/39), unit1 select, period-mode tick, live counter reads for `esp_timer_get_time`.
@@ -387,32 +392,33 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - Verified headless (node, `-C esp32p4`, postv3 variant + patched image):
     `rst:0x1 (POWERON)`, `entry 0x4ffac2c0`, `HELLO_UART_OK`, then steady
     `TICK` (FreeRTOS tick + yield interrupts delivering, tasks switching).
-- [ ] Phase 8: dual-core SMP for P4 (design agreed 2026-09-08, not started).
-  - Goal: boot UNPATCHED dual-core images (retire p4_mkunicore.py).
-  - Core: second `riscv_t` time-sliced with hart0 in `rv_step`
-    (deterministic interleave, e.g. 1K-cycle quanta; no threads needed
-    for WASM). Separate CSRs/mtvec/mhartid per hart come free with a
-    second instance.
-  - SoC sharing: `esp32p4_t` is currently per-`rv` (`PRIV(rv)->esp32p4`).
-    Split into shared (RAM/flash/MMIO/GDMA/most peripherals) + per-hart
-    (CLIC ie/ip/ctl/thresh/mtvt views). Biggest refactor item.
-  - Interrupts: INTMTX needs per-CPU MAP (CPU0 @0x500D6000, CPU1
-    @0x500D6800 — the ROM route fn already selects by cpu arg);
-    CLIC x2; FROM_CPU_INT0/INT1 (0x500E5010/0x500E5014) routed to their
-    own hart (today only INT0->hart0 exists).
-  - Boot: honor `ets_set_appcpu_boot_addr` + CPU1 unstall (currently
-    ignored); start hart1 parked, release on unstall.
-  - Validation: unpatched postv3 hello prints HELLO+TICK with main and
-    loopTask on different cores (check `pxCurrentTCBs[0/1]`).
-  - Perf note: two harts roughly halve throughput (~5M cycles/s each
-    in node/WASM); acceptable for tests.
-  - Unicore patcher rewritten ELF/symbol-driven (`tools/p4_mkunicore.py` v2):
-    CPU-sync waits found as backward branches (or do-while `j`-loops)
-    testing flag-derived regs for s_cpu_up/s_cpu_inited/s_system_inited/
-    s_other_cpu_startup_done/s_flash_op_can_start; loopTask affinity via
-    the xTaskCreateUniversal site in app_main; flash IPC-stall retry via
-    beqz->c.j (encode/decode roundtrip-checked). Verified by regenerating
-    hello + gpio/uart/gptimer/i2c/spi images (commit 3abd2de).
+- [ ] Phase 8: dual-core SMP for P4 (scaffolding landed 2026-09-10, dual boot WIP).
+  - New chip variant `-C esp32p4smp` (main.c): boots/schedules the APP
+    CPU. Plain `-C esp32p4` is unchanged single-hart (unicore-patched
+    images keep working; full P4/H2/C3 matrix re-verified green).
+  - Landed in src/esp32p4.c + emulate.c + riscv_private.h + main.c:
+    second `riscv_t` (hart1, mhartid CSR now per-hart), shared SoC with
+    per-hart CLIC views / per-CPU INTMTX MAPs (CPU1 @0x500D6800) /
+    per-hart CLINT MSIP/MTIMECMP, FROM_CPU_INT1 (source 80) + INT0/INT1
+    regs, APP-CPU boot mailbox 0x50110164 (found by disassembling ROM
+    `ets_set_appcpu_boot_addr`), time-sliced alternation in rv_step,
+    per-hart block-chaining swap + map-clear guards, WASM halt-epilogue
+    only on hart0.
+  - Verified: unpatched postv3 hello boots dual ROM, hart1 parks +
+    releases via mailbox, MAP1/CLIC1 program, crosscore ISR delivers
+    (line-0 routing), both harts reach scheduler bringup.
+  - NOT YET: unpatched HELLO+TICK (hart1 loses a task-creation race at
+    first scheduler start and aborts; then reboot-loops). Suspect:
+    hart1 outruns hart0's loopTask creation (fair per-block interleave
+    vs HW timing). Next: investigate ordering (e.g. gate hart1's first
+    yield on loopTask existing) or prove benign.
+  - Perf: INTMTX pending bits are u64 pairs now (was __uint128_t →
+    emcc libcalls in the per-block check, ~100x). Quantum back to 32M
+    default (50K experiment reverted; CDP socket timeout raised to 300
+    instead). Demo P4 (patched) still boots in-browser (CDP TICK).
+  - Validation (when dual boot lands): unpatched postv3 hello prints
+    HELLO+TICK with main and loopTask on different cores (check
+    `pxCurrentTCBs[0/1]`).
 - [x] Phase 6: P4 peripheral verification with arduino-cli test sketches
   (`esp32:esp32:esp32p4:ChipVariant=postv3`, each unicore-patched) — in progress.
   - **GPIO** (`p4gpio`): `GPIO_OUT 1 0` (echo readback), `GPIO_INT 1`
@@ -508,6 +514,12 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     Verified: `p4i2s` → `I2S_READ OK 960`, `WORDS 0 1` (monotonic
     counter, 6-desc ring `...e700→...f4c0→e700`). Regression: P4 hello,
     GPIO, I2C, RMT TX/RX, RMTRX; H2 hello + RMT TX — all green.
+  - Follow-up 2026-09-10: P4 I2S TX (`I2S_WRITE OK 960` first try, no
+    model change), legacy RMT driver (`RMT_WR/WAIT OK` — earlier stall
+    resolved by the merged RMT rework), H2 RMT TX green with the same
+    `rmt_enable()` fix. Full P4 matrix re-verified after later SMP +
+    u64 changes (gpio/uart/gptimer/i2c/spi/adc/ledc/twai/pcnt/mcpwm/
+    tsens/rmt/rmtrx/i2s-tx/i2s-rx/legacy, all DONE).
 
 ## Known issues / gotchas
 

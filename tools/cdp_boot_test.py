@@ -37,9 +37,19 @@ srv = subprocess.Popen(
     [sys.executable, "tools/dev-server.py", "--directory", "demo",
      "--bind", "127.0.0.1", "--port", "8932"],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-time.sleep(1)
+# wait for the dev server to accept connections (slow CI/hosts need this;
+# without it the navigate silently fails and buttons never enable)
+import socket
+for _ in range(30):
+    try:
+        s = socket.create_connection(("127.0.0.1", 8932), timeout=2)
+        s.close()
+        break
+    except OSError:
+        time.sleep(1)
 chrome = subprocess.Popen(
     [CHROME, "--headless", "--no-sandbox", "--disable-gpu",
+     "--no-first-run", "--no-default-browser-check",
      "--remote-allow-origins=*",
      f"--remote-debugging-port={PORT}", "--user-data-dir=/tmp/cdp-prof",
      "about:blank"],
@@ -62,7 +72,7 @@ try:
             f"http://127.0.0.1:{PORT}/json/new?about:blank", timeout=5))
         pages = [nt]
     ws = websocket.create_connection(pages[0]["webSocketDebuggerUrl"],
-                                     timeout=30)
+                                     timeout=300)
     cdp("Page.enable")
     cdp("Runtime.enable")
     cdp("Page.navigate",

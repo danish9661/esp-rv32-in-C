@@ -256,6 +256,8 @@ void block_map_clear(riscv_t *rv);
 struct riscv_internal {
     bool halt; /**< indicate whether the core is halted */
 
+    uint32_t hart_id; /**< hardware thread ID (MHARTID CSR; 0 unless SMP) */
+
 #ifdef __EMSCRIPTEN__
 /* Soft limit: yield at block boundaries */
 #ifndef WASM_BLOCK_LIMIT

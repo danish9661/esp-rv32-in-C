@@ -31,6 +31,7 @@
 
 #include "esp32p4.h"
 #include "esp32p4_rom.h"
+#include "io.h" /* memory_new/memory_delete (SMP hart setup) */
 #include "riscv_private.h"
 #include "system.h" /* trap_handler */
 
@@ -202,18 +203,24 @@ struct esp32p4_soc {
      * sleep timer fires so pmu_sleep_start's wakeup-wait loop exits. */
     uint32_t pmu_int_raw;
 
-    /* CLINT (0x20001800): free-running MTIME + MSIP/MTIMECMP */
+    /* CLINT (0x20001800): free-running MTIME (shared) + per-hart
+     * MSIP/MTIMECMP (hart1 has its own timer/IPI view for SMP). */
     uint64_t clint_mtime;
-    uint64_t clint_mtimcmp;
-    uint32_t clint_msip;
+    uint64_t clint_mtimcmp[2];
+    uint32_t clint_msip[2];
 
     /* SPI flash status registers (SR/SR2 incl. WEL and QE bits) */
     uint32_t flash_sr;
     uint32_t flash_sr2;
 
-    /* interrupt matrix (INTERRUPT_CORE0 MAP regs): peripheral source -> CPU line */
-    uint32_t intc_intmap[160];
-    __uint128_t intc_status; /* pending peripheral sources (128-bit: sources 0..127) */
+    /* interrupt matrix MAP regs (INTERRUPT_CORE0 @0x500D6000,
+     * INTERRUPT_CORE1 @0x500D6800): per-CPU peripheral source -> CPU line.
+     * Pending bits live in two u64 words (WASM-fast; __uint128_t lowers to
+     * libcalls in emcc and this state is touched by the per-block
+     * interrupt check). Delivery to hart h routes through intc_intmap[h]. */
+    uint32_t intc_intmap[2][160];
+    uint64_t intc_status_lo; /* pending sources 0..63 */
+    uint64_t intc_status_hi; /* pending sources 64..127 */
 
     /* PLIC (0x20001000) */
     uint32_t plic_enable;
@@ -385,16 +392,26 @@ struct esp32p4_soc {
     /* mask ROM image (P4_ROM_SIZE bytes); served for unmapped reads in
      * the low part of the flash window until the MMU maps flash there. */
     uint8_t *rom;
-    /* CLIC (0x20800000, CPU0): per-ID enable/attr/priority, software
-     * pending latch, threshold. External INTMTX line L drives ID 16+L;
-     * IDs 3/7 are CLINT MSIP/MTIME. Levels default from CTL reset (0x1F).
-     * Delivery: pending && enabled && level > threshold, highest level
-     * wins (ties: lowest ID). Vectored (shv) via MTVT CSR + 4*ID. */
-    uint8_t clic_ie[64];
-    uint8_t clic_attr[64];
-    uint8_t clic_ctl[64];
-    uint8_t clic_ip_sw[64];
-    uint32_t clic_thresh;
+    /* CLIC (0x20800000, per-hart views): per-ID enable/attr/priority,
+     * software pending latch, threshold. External INTMTX line L drives
+     * ID 16+L; IDs 3/7 are CLINT MSIP/MTIME. Levels default from CTL
+     * reset (0x1F). Delivery: pending && enabled && level > threshold,
+     * highest level wins (ties: lowest ID). Vectored (shv) via MTVT
+     * CSR + 4*ID. */
+    uint8_t clic_ie[2][64];
+    uint8_t clic_attr[2][64];
+    uint8_t clic_ctl[2][64];
+    uint8_t clic_ip_sw[2][64];
+    uint32_t clic_thresh[2];
+    /* SMP: second hart (APP CPU) instance + APP-CPU boot-address mailbox
+     * (0x50110164, written by ROM fn ets_set_appcpu_boot_addr, polled by
+     * the ROM park loop on hart1) + per-rv_step hart alternation toggle.
+     * smp_enabled selects dual-core (-C esp32p4smp); the default chip
+     * runs hart0 only (unicore-patched images keep working). */
+    riscv_t *hart[2];
+    uint32_t appcpu_boot_addr;
+    uint8_t smp_enabled;
+    unsigned long smp_toggle;
     /* LP_PERI_CLKRST (0x50120000): clk_en/reset_en are plain storage so
      * clock-gate read-backs (e.g. regi2c ck_en_lp_i2cmst, asserted by the
      * bootloader) see the enabled bit. */
@@ -440,6 +457,30 @@ const char *esp32p4_uart_rx_path = NULL;
 /* ------------------------------------------------------------------ */
 /* Region helpers                                                      */
 /* ------------------------------------------------------------------ */
+
+/* Pending-source bit ops (u64-native; see intc_status_lo/hi comment). */
+static inline void p4_intc_set(esp32p4_t *soc, unsigned s)
+{
+    if (s < 64u)
+        soc->intc_status_lo |= 1ULL << s;
+    else
+        soc->intc_status_hi |= 1ULL << (s - 64u);
+}
+
+static inline void p4_intc_clear(esp32p4_t *soc, unsigned s)
+{
+    if (s < 64u)
+        soc->intc_status_lo &= ~(1ULL << s);
+    else
+        soc->intc_status_hi &= ~(1ULL << (s - 64u));
+}
+
+static inline int p4_intc_test(const esp32p4_t *soc, unsigned s)
+{
+    if (s < 64u)
+        return (int) ((soc->intc_status_lo >> s) & 1u);
+    return (int) ((soc->intc_status_hi >> (s - 64u)) & 1u);
+}
 
 static esp32_region_t *esp32_find_region(esp32p4_t *soc, uint32_t addr)
 {
@@ -608,15 +649,100 @@ esp32p4_t *esp32p4_new(void)
         memcpy(sram->data + (0x4FF3FFE8u - P4_SRAM_BASE), &ptr, 4);
     }
 
-    /* CLIC defaults: CTL reset value 0x1F (level 1); all disabled. */
-    for (int i = 0; i < 64; i++)
-        soc->clic_ctl[i] = 0x1Fu;
+    /* CLIC defaults (both harts): CTL reset value 0x1F (level 1);
+     * all disabled. */
+    for (int h = 0; h < 2; h++)
+        for (int i = 0; i < 64; i++)
+            soc->clic_ctl[h][i] = 0x1Fu;
 
-    /* INTMTX default: source s maps to CPU line s */
-    for (int i = 0; i < 160; i++)
-        soc->intc_intmap[i] = i;
+    /* INTMTX default (both CPUs): source s maps to CPU line s */
+    for (int h = 0; h < 2; h++)
+        for (int i = 0; i < 160; i++)
+            soc->intc_intmap[h][i] = i;
 
     return soc;
+}
+
+/* Hart index of the calling core (0 = PRO, 1 = APP). Set up in rv_step
+ * once the APP hart exists; defaults to 0 before/during early boot. */
+static int p4_hart(riscv_t *rv)
+{
+    esp32p4_t *soc = PRIV(rv)->esp32p4;
+    return (soc && soc->hart[1] == rv) ? 1 : 0;
+}
+
+/* Public hart index for the core (block-chaining swap). */
+int esp32p4_hart_index(riscv_t *rv)
+{
+    return p4_hart(rv);
+}
+
+/* Enable dual-core mode (called once from main for -C esp32p4smp). */
+void esp32p4_set_smp(struct esp32p4_soc *soc, int on)
+{
+    if (soc)
+        soc->smp_enabled = on ? 1u : 0u;
+}
+
+/* Pick the hart to execute the current block iteration. The APP hart is
+ * created on the first call and boots the ROM reset vector like real HW
+ * (both cores run ROM; hart1 parks in its poll loop until IDF releases
+ * it via the mailbox). Alternates per call once both harts run; a hart
+ * with a pending WASM-unwind resume takes precedence and a halted hart
+ * yields. */
+riscv_t *esp32p4_smp_target(riscv_t *rv)
+{
+    esp32p4_t *soc = PRIV(rv)->esp32p4;
+    if (!soc->smp_enabled)
+        return rv;
+    if (!soc->hart[1]) {
+        vm_attr_t *attr = PRIV(rv);
+        memory_t *mem0 = attr->mem;
+        riscv_t *h1 = rv_create(rv->data);
+        /* rv_create installed a fresh riscv mem; P4 memory lives in the
+         * SoC regions, so drop it and keep sharing hart0's. */
+        memory_delete(attr->mem);
+        attr->mem = mem0;
+        if (!h1)
+            return rv;
+        h1->hart_id = 1;
+        soc->hart[0] = rv;
+        soc->hart[1] = h1;
+        return rv;
+    }
+    riscv_t *h0 = soc->hart[0], *h1 = soc->hart[1];
+    bool h0busy = false, h1busy = false;
+#ifdef __EMSCRIPTEN__
+    h0busy = !!h0->next_insn;
+    h1busy = !!h1->next_insn;
+#endif
+    if (h0busy && !h1busy)
+        return h0;
+    if (h1busy && !h0busy)
+        return h1;
+    if (h0busy && h1busy)
+        return h0; /* drain hart0's resume first */
+    if (rv_has_halted(h0))
+        return h1;
+    if (rv_has_halted(h1))
+        return h0;
+    return (soc->smp_toggle++ & 1) ? h1 : h0;
+}
+
+/* Advance shared peripherals once, then deliver pending interrupts to
+ * both harts. Periodic always runs on hart0's cycle counter: the two
+ * harts advance independently, and mixing their counters in the shared
+ * elapsed-time anchors (systimer/rtc) would underflow. */
+void esp32p4_smp_poll(riscv_t *rv)
+{
+    esp32p4_t *soc = PRIV(rv)->esp32p4;
+    esp32p4_periodic(soc->hart[0] ? soc->hart[0] : rv);
+    if (soc->hart[0])
+        esp32p4_check_interrupt(soc->hart[0]);
+    else
+        esp32p4_check_interrupt(rv);
+    if (soc->hart[1])
+        esp32p4_check_interrupt(soc->hart[1]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -666,8 +792,12 @@ esp32p4_t *esp32p4_new(void)
 /* SYSTIMER interrupt sources (interrupts.h enum) */
 #define P4_SYSTIMER_T0_SOURCE 53u
 #define P4_SYSTIMER_T2_SOURCE 55u
-/* Crosscore/yield source: HP_SYSTEM_CPU_INT_FROM_CPU_0 (0x500E5010) */
+/* Crosscore/yield sources: HP_SYSTEM_CPU_INT_FROM_CPU_0 (0x500E5010,
+ * source 79, targets PRO CPU) and _FROM_CPU_1 (0x500E5014, source 80,
+ * targets APP CPU). Separate sources + per-CPU MAPs route each to its
+ * own hart. */
 #define P4_FROM_CPU_INTR_SOURCE 79u
+#define P4_FROM_CPU1_INTR_SOURCE 80u
 
 /* Virtual I2C device: a 16-byte EEPROM at 0x50 that ACKs transfers */
 #define P4_I2C_DEV_ADDR 0x50u
@@ -1101,6 +1231,8 @@ static uint32_t p4_xlate(uint32_t addr)
         return addr - 0x500DE000u + 0xE000u; /* ADC */
     if (addr >= 0x500D6000u && addr < 0x500D6220u)
         return addr - 0x500D6000u + 0x10000u; /* INTERRUPT_CORE0 MAP regs */
+    if (addr >= 0x500D6800u && addr < 0x500D6A20u)
+        return addr - 0x500D6800u + 0x10800u; /* INTERRUPT_CORE1 MAP regs */
     if (addr >= 0x500C9000u && addr < 0x500C9100u)
         return addr - 0x500C9000u + 0x12000u; /* PCNT */
     if (addr >= 0x500C0000u && addr < 0x500C0200u)
@@ -1130,12 +1262,21 @@ static uint32_t p4_xlate(uint32_t addr)
 static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
 {
     (void) rv;
-    /* HP_SYSTEM_CPU_INT_FROM_CPU_0_REG (0x500E5010): the crosscore/yield
-     * pending flag. The SDK raises it (write 1) and then busy-waits reading
-     * this register for 0; the flag must read back as cleared once the
-     * interrupt has been delivered (source 79). */
+    /* HP_SYSTEM_CPU_INT_FROM_CPU_0/1_REG (0x500E5010/0x500E5014): the
+     * crosscore/yield pending flags (sources 79/80). The SDK raises one
+     * (write 1) and then busy-waits reading it back for 0; the flag must
+     * read back as cleared once the interrupt has been delivered to its
+     * hart. */
     if (addr == 0x500E5010u)
-        return (uint32_t)((soc->intc_status >> P4_FROM_CPU_INTR_SOURCE) & 1u);
+        return (uint32_t) p4_intc_test(soc, P4_FROM_CPU_INTR_SOURCE);
+    if (addr == 0x500E5014u)
+        return (uint32_t) p4_intc_test(soc, P4_FROM_CPU1_INTR_SOURCE);
+
+    /* APP-CPU boot-address mailbox (0x50110164): written by the ROM fn
+     * ets_set_appcpu_boot_addr, polled by the ROM park loop on hart1
+     * (nonzero = jump). Power-on default 0 = hart1 spins in ROM. */
+    if (addr == 0x50110164u)
+        return soc->appcpu_boot_addr;
 
     /* LP_CLKRST_RESET_CAUSE_REG (0x50111010): HPCORE0 cause bits[12:7]
      * (6'h1 = POR) + LPCORE cause bits[5:0] (6'h1 = POR). The ROM prints
@@ -1161,19 +1302,21 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return 0;
     }
 
-    /* CLIC model (0x20800000, CPU0): INT_CONFIG (0x0), INT_INFO (0x4),
-     * THRESH (0x8), per-ID word at 0x1000+4*i: bit0=IP, bit8=IE,
-     * bit16=SHV, bits17-18=TRIG, bits24-31=CTL(priority). External
-     * INTMTX line L drives ID 16+L; IDs 3/7 are CLINT MSIP/MTIME.
-     * IP for HW lines is driven live from the matrix (SW writes latch
-     * an ORed bit); CTL defaults to 0x1F. */
+    /* CLIC model (0x20800000, per-hart views): INT_CONFIG (0x0),
+     * INT_INFO (0x4), THRESH (0x8), per-ID word at 0x1000+4*i: bit0=IP,
+     * bit8=IE, bit16=SHV, bits17-18=TRIG, bits24-31=CTL(priority).
+     * External INTMTX line L drives ID 16+L (routed through the calling
+     * hart's MAP); IDs 3/7 are CLINT MSIP/MTIME. IP for HW lines is
+     * driven live from the matrix (SW writes latch an ORed bit);
+     * CTL defaults to 0x1F. */
     if (addr >= 0x20800000u && addr < 0x20802000u) {
+        int h = p4_hart(rv);
         if (addr == 0x20800000u)
             return 1u; /* NVBITS=1 (vectored supported) */
         if (addr == 0x20800004u)
             return (0xFu << 21) | 48u; /* CTLBITS + NUM_INT=48 */
         if (addr == 0x20800008u)
-            return soc->clic_thresh;
+            return soc->clic_thresh[h];
         if (addr >= 0x20801000u && addr < 0x20801000u + 64u * 4u) {
             unsigned id = (addr - 0x20801000u) >> 2;
             uint32_t v = 0;
@@ -1181,24 +1324,24 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
             if (id >= 16u && id < 16u + 32u) {
                 int line = (int) (id - 16u);
                 for (int s = 0; s < 128; s++)
-                    if ((soc->intc_status & (((__uint128_t)1) << s)) &&
-                        soc->intc_intmap[s] != 0xFFFFFFFFu &&
-                        (soc->intc_intmap[s] == (uint32_t) line)) {
+                    if (p4_intc_test(soc, (unsigned) s) &&
+                        soc->intc_intmap[h][s] != 0xFFFFFFFFu &&
+                        (soc->intc_intmap[h][s] == (uint32_t) line)) {
                         hw_ip = 1;
                         break;
                     }
             } else if (id == 3u) {
-                hw_ip = !!soc->clint_msip;
+                hw_ip = !!soc->clint_msip[h];
             } else if (id == 7u) {
-                hw_ip = !!(soc->clint_mtimcmp &&
-                           soc->clint_mtime >= soc->clint_mtimcmp);
+                hw_ip = !!(soc->clint_mtimcmp[h] &&
+                           soc->clint_mtime >= soc->clint_mtimcmp[h]);
             }
-            if (hw_ip || soc->clic_ip_sw[id])
+            if (hw_ip || soc->clic_ip_sw[h][id])
                 v |= 1u;
-            if (soc->clic_ie[id])
+            if (soc->clic_ie[h][id])
                 v |= 1u << 8;
-            v |= ((uint32_t) (soc->clic_attr[id] & 0x7u)) << 16;
-            v |= ((uint32_t) soc->clic_ctl[id]) << 24;
+            v |= ((uint32_t) (soc->clic_attr[h][id] & 0x7u)) << 16;
+            v |= ((uint32_t) soc->clic_ctl[h][id]) << 24;
             return v;
         }
         return 0;
@@ -1293,12 +1436,19 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
     if (addr >= AES_BASE && addr < AES_BASE + 0x100u)
         return soc->aes_reg[(addr - AES_BASE) >> 2];
 
-    /* Interrupt matrix (INTERRUPT_CORE0 MAP regs, translated 0x60010000 +
-     * 4*source, up to 160 sources incl. PCNT at 111). Return HW format. */
+    /* Interrupt matrix MAP regs (INTERRUPT_CORE0 at translated 0x60010000,
+     * CORE1 at 0x60010800; 4*source, up to 160 sources incl. PCNT at 111).
+     * Return HW format. The register range selects the CPU. */
     if (addr >= P4_PERIPH_BASE + 0x10000u &&
         addr < P4_PERIPH_BASE + 0x10000u + 160 * 4u) {
         uint32_t s = (addr - P4_PERIPH_BASE - 0x10000u) >> 2;
-        uint32_t m = soc->intc_intmap[s];
+        uint32_t m = soc->intc_intmap[0][s];
+        return (m == 0xFFFFFFFFu) ? 0u : ((m + 16u) & 0x1Fu);
+    }
+    if (addr >= P4_PERIPH_BASE + 0x10800u &&
+        addr < P4_PERIPH_BASE + 0x10800u + 160 * 4u) {
+        uint32_t s = (addr - P4_PERIPH_BASE - 0x10800u) >> 2;
+        uint32_t m = soc->intc_intmap[1][s];
         return (m == 0xFFFFFFFFu) ? 0u : ((m + 16u) & 0x1Fu);
     }
 
@@ -1313,10 +1463,11 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
             case 0x08: return 0; /* PLIC clear: write-only */
             case 0x0C: { /* EMIP_STATUS: lines with pending + enabled src */
                 uint32_t lines = 0;
+                int h = p4_hart(rv);
                 for (int s = 0; s < 128; s++)
-                    if ((soc->intc_status & (((__uint128_t)1) << s)) &&
-                        soc->intc_intmap[s] != 0xFFFFFFFFu)
-                        lines |= 1u << (soc->intc_intmap[s] & 0x1Fu);
+                    if (p4_intc_test(soc, (unsigned) s) &&
+                        soc->intc_intmap[h][s] != 0xFFFFFFFFu)
+                        lines |= 1u << (soc->intc_intmap[h][s] & 0x1Fu);
                 return lines;
             }
             case 0x90: return soc->plic_threshold;
@@ -1335,9 +1486,9 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         }
         if (off >= 0x1800u && off < 0x1C00u) { /* CLINT_M */
             switch (off - 0x1800u) {
-            case 0x00: return soc->clint_msip;
-            case 0x08: return (uint32_t) soc->clint_mtimcmp;
-            case 0x0C: return (uint32_t) (soc->clint_mtimcmp >> 32);
+            case 0x00: return soc->clint_msip[p4_hart(rv)];
+            case 0x08: return (uint32_t) soc->clint_mtimcmp[p4_hart(rv)];
+            case 0x0C: return (uint32_t) (soc->clint_mtimcmp[p4_hart(rv)] >> 32);
             case 0x10: return (uint32_t) soc->clint_mtime;
             case 0x14: return (uint32_t) (soc->clint_mtime >> 32);
             default: return 0;
@@ -1460,7 +1611,7 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
                 (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI))
                 soc->twai_reg[0x0c >> 2] = TWAI0_INTR_RI;
             if (!soc->twai_reg[0x0c >> 2])
-                soc->intc_status &= ~(((__uint128_t)1) << P4_TWAI0_INTR_SOURCE);
+                p4_intc_clear(soc, P4_TWAI0_INTR_SOURCE);
             return v;
         }
         return soc->twai_reg[off >> 2];
@@ -1857,19 +2008,19 @@ done:
      * (ETS_AES_INTR_SOURCE=73) are latched so the esp_aes_complete_isr
      * (registered by esp_aes_intr_alloc) fires, clears the in-progress flag
      * (*s3) and gives op_complete_sem. */
-    soc->intc_status |= ((__uint128_t)1) << ETS_AES_INTR_SOURCE;
+    p4_intc_set(soc, ETS_AES_INTR_SOURCE);
     if (ch_out >= 0) {
         soc->gdma_out_int_raw[ch_out] |= (1u << 1) | (1u << 3); /* EOF + TOTAL_EOF */
         soc->gdma_out_int_ena[ch_out] |= (1u << 1) | (1u << 3); /* let ISR see+clear it */
         if (soc->gdma_out_int_ena[ch_out] & ((1u << 1) | (1u << 3)))
-            soc->intc_status |= ((__uint128_t)1) << (P4_DMA_OUT_CH0_INTR_SOURCE + ch_out);
+            p4_intc_set(soc, (unsigned) (P4_DMA_OUT_CH0_INTR_SOURCE + ch_out));
         soc->gdma_tx_run[ch_out] = 0;
     }
     if (ch_in >= 0) {
         soc->gdma_in_int_raw[ch_in] |= 1u << 1; /* IN_SUC_EOF */
         soc->gdma_in_int_ena[ch_in] |= 1u << 1;
         if (soc->gdma_in_int_ena[ch_in] & (1u << 1))
-            soc->intc_status |= ((__uint128_t)1) << (P4_DMA_IN_CH0_INTR_SOURCE + ch_in);
+            p4_intc_set(soc, (unsigned) (P4_DMA_IN_CH0_INTR_SOURCE + ch_in));
         soc->gdma_rx_run[ch_in] = 0;
     }
     /* DMA-AES: state transitions busy(1) -> calculation_done(2). The esp_aes
@@ -1902,11 +2053,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         return;
     }
 
-    /* CLIC model writes (0x20800000, CPU0). */
+    /* CLIC model writes (0x20800000, per-hart views). */
     if (addr >= 0x20800000u && addr < 0x20802000u) {
+        int h = p4_hart(rv);
         if (addr == 0x20800008u) {
             if (size == 4)
-                soc->clic_thresh = val;
+                soc->clic_thresh[h] = val;
             return;
         }
         if (addr >= 0x20801000u && addr < 0x20801000u + 64u * 4u) {
@@ -1914,21 +2066,21 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             unsigned sub = (addr - 0x20801000u) & 3u;
             if (size == 4 && sub == 0) {
                 /* word write updates all four byte-fields at once */
-                soc->clic_ip_sw[id] = (val & 0x1u) ? 1u : 0u;
-                soc->clic_ie[id] = (val & (1u << 8)) ? 1u : 0u;
-                soc->clic_attr[id] = (uint8_t) ((val >> 16) & 0x7u);
-                soc->clic_ctl[id] = (uint8_t) (val >> 24);
+                soc->clic_ip_sw[h][id] = (val & 0x1u) ? 1u : 0u;
+                soc->clic_ie[h][id] = (val & (1u << 8)) ? 1u : 0u;
+                soc->clic_attr[h][id] = (uint8_t) ((val >> 16) & 0x7u);
+                soc->clic_ctl[h][id] = (uint8_t) (val >> 24);
             } else if (size == 1) {
                 /* byte write targets one field (IP/IE/ATTR/CTL) */
                 uint8_t b = (uint8_t) val;
                 if (sub == 0)
-                    soc->clic_ip_sw[id] = b & 0x1u;
+                    soc->clic_ip_sw[h][id] = b & 0x1u;
                 else if (sub == 1)
-                    soc->clic_ie[id] = b & 0x1u;
+                    soc->clic_ie[h][id] = b & 0x1u;
                 else if (sub == 2)
-                    soc->clic_attr[id] = b & 0x7u;
+                    soc->clic_attr[h][id] = b & 0x7u;
                 else
-                    soc->clic_ctl[id] = b;
+                    soc->clic_ctl[h][id] = b;
             }
             /* (halfword writes: ignore, unused by the SDK) */
             return;
@@ -1943,13 +2095,33 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
     }
 
     /* HP_SYSTEM_CPU_INT_FROM_CPU_0_REG (0x500E5010): writing 1 raises
-     * INTC source 79 (the FreeRTOS yield line on P4), writing 0 clears
-     * it. (C6 numbers this source 22 at 0x600C5090.) */
+     * INTC source 79 (targets PRO CPU), writing 0 clears it; _1_REG
+     * (0x500E5014) is source 80 (targets APP CPU). (C6 numbers its
+     * single source 22 at 0x600C5090.)
+     * Source 80 is only modeled while the APP hart exists: single-hart
+     * (unicore-patched) images yield across cores with no listener, and
+     * must see the pre-SMP fire-and-forget behavior (writes dropped,
+     * reads 0) instead of hanging in the handshake poll. */
     if (addr == 0x500E5010u) {
         if (val & 1u)
-            soc->intc_status |= ((__uint128_t)1) << P4_FROM_CPU_INTR_SOURCE;
+            p4_intc_set(soc, P4_FROM_CPU_INTR_SOURCE);
         else
-            soc->intc_status &= ~((__uint128_t)1) << P4_FROM_CPU_INTR_SOURCE;
+            p4_intc_clear(soc, P4_FROM_CPU_INTR_SOURCE);
+        return;
+    }
+    if (addr == 0x500E5014u) {
+        if (val & 1u) {
+            if (soc->hart[1])
+                p4_intc_set(soc, P4_FROM_CPU1_INTR_SOURCE);
+        } else {
+            p4_intc_clear(soc, P4_FROM_CPU1_INTR_SOURCE);
+        }
+        return;
+    }
+
+    /* APP-CPU boot-address mailbox (0x50110164). */
+    if (addr == 0x50110164u) {
+        soc->appcpu_boot_addr = val;
         return;
     }
 
@@ -2011,12 +2183,13 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             }
         }
         if (off >= 0x1800u && off < 0x1C00u) { /* CLINT_M */
+            int h = p4_hart(rv);
             switch (off - 0x1800u) {
-            case 0x00: soc->clint_msip = val & 1u; return;
-            case 0x08: soc->clint_mtimcmp =
-                (soc->clint_mtimcmp & ~0xFFFFFFFFull) | val; return;
-            case 0x0C: soc->clint_mtimcmp =
-                (soc->clint_mtimcmp & 0xFFFFFFFFull) |
+            case 0x00: soc->clint_msip[h] = val & 1u; return;
+            case 0x08: soc->clint_mtimcmp[h] =
+                (soc->clint_mtimcmp[h] & ~0xFFFFFFFFull) | val; return;
+            case 0x0C: soc->clint_mtimcmp[h] =
+                (soc->clint_mtimcmp[h] & 0xFFFFFFFFull) |
                 ((uint64_t) val << 32); return;
             default: return;
             }
@@ -2080,7 +2253,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         uint32_t o = addr - AES_BASE;
         soc->aes_reg[o >> 2] = val;
         if (o == 0xB8u) /* AES_INT_CLR: firmware acknowledges the AES IRQ */
-            soc->intc_status &= ~(((__uint128_t)1) << ETS_AES_INTR_SOURCE);
+            p4_intc_clear(soc, ETS_AES_INTR_SOURCE);
         if (o == AES_TRIG_OFF && (val & 1u)) {
             /* DMA mode (esp_aes / mbedtls): the input arrives via the GDMA
              * OUT channel (peri_sel == AES0 = 6) descriptor buffer and the
@@ -2166,7 +2339,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         uint32_t *r = soc->i2c_reg + ((addr - P4_PERIPH_BASE - 0x4000u) >> 2);
         if (addr == P4_PERIPH_BASE + 0x4024u) { /* int_clr */
             soc->i2c_reg[0x20 >> 2] &= ~val; /* clear raw status bits */
-            soc->intc_status &= ~(((__uint128_t)1) << P4_I2C_EXT0_INTR_SOURCE); /* drop the pending IRQ */
+            p4_intc_clear(soc, P4_I2C_EXT0_INTR_SOURCE); /* drop the pending IRQ */
         } else if (addr == P4_PERIPH_BASE + 0x4018u) { /* fifo_conf */
             soc->i2c_reg[0x18 >> 2] = val;
             if (val & (1u << 13)) { /* tx_fifo_rst */
@@ -2242,7 +2415,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         if (roff == 0x7Cu) { /* INT_CLR: W1C */
             mmio32[0x6070u >> 2] &= ~val;
             if (!(mmio32[0x6070u >> 2] & mmio32[0x6078u >> 2]))
-                soc->intc_status &= ~(((__uint128_t)1) << P4_RMT_INTR_SOURCE);
+                p4_intc_clear(soc, P4_RMT_INTR_SOURCE);
             return;
         }
         /* CHMCONF1 (0x34+8c): bit0 arms RX. Reset the writer and latch
@@ -2325,7 +2498,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         } else if (o == TIMG_INT_CLR) {
             r[TIMG_INT_RAW >> 2] &= ~val;
             if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
-                soc->intc_status &= ~(((__uint128_t)1) << P4_TG0_T0_INTR_SOURCE);
+                p4_intc_clear(soc, P4_TG0_T0_INTR_SOURCE);
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
             /* RTC slow-clock calibration: on START the hardware counts the
@@ -2361,8 +2534,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             } else {
                 soc->wdt_en[0] = 0;
                 r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
-                soc->intc_status &=
-                    ~(((__uint128_t)1) << P4_TG0_WDT_INTR_SOURCE);
+                p4_intc_clear(soc, P4_TG0_WDT_INTR_SOURCE);
             }
         } else if (o == TIMG_WDT_CONFIG1 || o == TIMG_WDT_CONFIG2) {
             r[o >> 2] = val;
@@ -2372,8 +2544,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             if (soc->wdt_unlock[0]) {
                 r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
                 if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
-                    soc->intc_status &=
-                        ~(((__uint128_t)1) << P4_TG0_WDT_INTR_SOURCE);
+                    p4_intc_clear(soc, P4_TG0_WDT_INTR_SOURCE);
                 soc->wdt_expire[0] = rv->csr_cycle + esp32p4_wdt_cycles(soc, 0);
             }
             r[o >> 2] = val;
@@ -2401,7 +2572,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         } else if (o == TIMG_INT_CLR) {
             r[TIMG_INT_RAW >> 2] &= ~val;
             if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
-                soc->intc_status &= ~(((__uint128_t)1) << P4_TG1_T0_INTR_SOURCE);
+                p4_intc_clear(soc, P4_TG1_T0_INTR_SOURCE);
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
             r[o >> 2] = val;
@@ -2429,8 +2600,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             } else {
                 soc->wdt_en[1] = 0;
                 r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
-                soc->intc_status &=
-                    ~(((__uint128_t)1) << P4_TG1_WDT_INTR_SOURCE);
+                p4_intc_clear(soc, P4_TG1_WDT_INTR_SOURCE);
             }
         } else if (o == TIMG_WDT_CONFIG1 || o == TIMG_WDT_CONFIG2) {
             r[o >> 2] = val;
@@ -2440,8 +2610,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             if (soc->wdt_unlock[1]) {
                 r[TIMG_INT_RAW >> 2] &= ~TIMG_INT_WDT;
                 if (!(r[TIMG_INT_RAW >> 2] & r[TIMG_INT_ENA >> 2]))
-                    soc->intc_status &=
-                        ~(((__uint128_t)1) << P4_TG1_WDT_INTR_SOURCE);
+                    p4_intc_clear(soc, P4_TG1_WDT_INTR_SOURCE);
                 soc->wdt_expire[1] = rv->csr_cycle + esp32p4_wdt_cycles(soc, 1);
             }
             r[o >> 2] = val;
@@ -2525,8 +2694,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 return; /* raw/st: read-only */
             }
             if (!(soc->gdma_in_int_raw[ch] & soc->gdma_in_int_ena[ch])) {
-                soc->intc_status &=
-                    ~(((__uint128_t)1) << (P4_DMA_IN_CH0_INTR_SOURCE + ch));
+                p4_intc_clear(soc, (P4_DMA_IN_CH0_INTR_SOURCE + ch));
             }
             return;
         }
@@ -2545,8 +2713,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             dbg_gdma_intrwr++;
             if (!(soc->gdma_out_int_raw[ch] & soc->gdma_out_int_ena[ch])) {
                 dbg_gdma_intrwr_clear++;
-                soc->intc_status &=
-                    ~(((__uint128_t)1) << (P4_DMA_OUT_CH0_INTR_SOURCE + ch));
+                p4_intc_clear(soc, (P4_DMA_OUT_CH0_INTR_SOURCE + ch));
             }
             return;
         }
@@ -2723,7 +2890,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         if (o == 0x4cu) { /* int_clr: W1C */
             soc->pcnt_reg[0x40 >> 2] &= ~val;
             if (!(soc->pcnt_reg[0x40 >> 2] & soc->pcnt_reg[0x48 >> 2]))
-                soc->intc_status &= ~(((__uint128_t)1) << P4_PCNT_INTR_SOURCE);
+                p4_intc_clear(soc, P4_PCNT_INTR_SOURCE);
             return;
         }
         if (o == 0x60u) { /* ctrl: pulse_cnt_rst_uN clears the counter */
@@ -2744,7 +2911,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         if (o == 0x1A0u) { /* int_clr: W1C */
             soc->mcpwm_reg[0x198u >> 2] &= ~val;
             if (!(soc->mcpwm_reg[0x198u >> 2] & soc->mcpwm_reg[0x194u >> 2]))
-                soc->intc_status &= ~(((__uint128_t)1) << P4_MCPWM_INTR_SOURCE);
+                p4_intc_clear(soc, P4_MCPWM_INTR_SOURCE);
             return;
         }
         if ((o & 0xFu) == 0x08u && o <= 0x28u) { /* timer_cfg1 */
@@ -2809,8 +2976,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                             if (*ena & (UART_RXFIFO_TOUT_BIT | 0x1u)) {
                                 int src = (p == 0) ? P4_UART0_INTR_SOURCE
                                                    : P4_UART1_INTR_SOURCE;
-                                soc->intc_status |=
-                                    ((__uint128_t)1) << src;
+                                p4_intc_set(soc, (unsigned) src);
                             }
                         }
                     }
@@ -2823,7 +2989,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                               UART_TXFIFO_EMPTY_BIT))) {
                     int src = (p == 0) ? P4_UART0_INTR_SOURCE
                                        : P4_UART1_INTR_SOURCE;
-                    soc->intc_status &= ~(((__uint128_t)1) << src);
+                    p4_intc_clear(soc, src);
                 }
             } else if (o == UART_INT_ENA_REG) {
                 /* The esp-idf uart TX driver drains its software ring buffer
@@ -2967,12 +3133,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             break;
         case GPIO_STATUS_W1TS_REG:
             soc->gpio_status |= val;
-            soc->intc_status |= ((__uint128_t)1) << P4_GPIO_INTR_SOURCE;
+            p4_intc_set(soc, P4_GPIO_INTR_SOURCE);
             return;
         case GPIO_STATUS_W1TC_REG:
             soc->gpio_status &= ~val;
             if (!soc->gpio_status)
-                soc->intc_status &= ~(((__uint128_t)1) << P4_GPIO_INTR_SOURCE);
+                p4_intc_clear(soc, P4_GPIO_INTR_SOURCE);
             return;
         default:
             mmio32[off >> 2] = val;
@@ -2998,13 +3164,20 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         addr < P4_PERIPH_BASE + 0x10000u + 160 * 4u) {
         uint32_t s = (addr - P4_PERIPH_BASE - 0x10000u) >> 2;
         uint32_t v = val & 0x1Fu;
-        soc->intc_intmap[s] = (v == 0u) ? 0xFFFFFFFFu : ((v - 16u) & 0x1Fu);
+        soc->intc_intmap[0][s] = (v == 0u) ? 0xFFFFFFFFu : ((v - 16u) & 0x1Fu);
         if (s == 53 || s == 55 || s == 79) {
             static unsigned long mx = 0;
             if (mx++ < 10)
                 fprintf(stderr, "[MTX] source=%u -> line=%u (pc=%08x)\n", s,
-                        soc->intc_intmap[s], rv->PC);
+                        soc->intc_intmap[0][s], rv->PC);
         }
+        return;
+    }
+    if (addr >= P4_PERIPH_BASE + 0x10800u &&
+        addr < P4_PERIPH_BASE + 0x10800u + 160 * 4u) {
+        uint32_t s = (addr - P4_PERIPH_BASE - 0x10800u) >> 2;
+        uint32_t v = val & 0x1Fu;
+        soc->intc_intmap[1][s] = (v == 0u) ? 0xFFFFFFFFu : ((v - 16u) & 0x1Fu);
         return;
     }
     /* SYSTIMER (0x6000A000) */
@@ -3065,8 +3238,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             return;
         case SYSTIMER_INT_CLR:
             soc->systimer_int_raw &= ~val;
-            soc->intc_status &= ~((((__uint128_t)1) << SYSTIMER_T0_SOURCE) |
-                                  (((__uint128_t)1) << SYSTIMER_T2_SOURCE));
+            p4_intc_clear(soc, SYSTIMER_T0_SOURCE);
+            p4_intc_clear(soc, SYSTIMER_T2_SOURCE);
             return;
         default:
             mmio32[off >> 2] = val;
@@ -3498,23 +3671,43 @@ uint32_t esp32p4_boot(esp32p4_t *soc, const char *elf_path)
 
 /* Route enabled pending peripheral sources to CPU interrupt lines (mip)
  * through the PLIC gate: line must be PLIC-enabled and have a priority
- * above the threshold. */
-static uint32_t esp32_intc_raise(esp32p4_t *soc)
+ * above the threshold. Routed through hart h's MAP. Walks only set bits
+ * (ctz) so the common idle case is two word loads. */
+static uint32_t esp32_intc_raise(esp32p4_t *soc, int h)
 {
     uint32_t lines = 0;
-    for (int s = 0; s < 128; s++) {
-        if (!(soc->intc_status & (((__uint128_t)1) << s)))
-            continue;
-        if (soc->intc_intmap[s] == 0xFFFFFFFFu)
+    uint64_t w = soc->intc_status_lo;
+    while (w) {
+        unsigned s = (unsigned) __builtin_ctzll(w);
+        w &= w - 1u;
+        uint32_t m = soc->intc_intmap[h][s];
+        if (m == 0xFFFFFFFFu)
             continue; /* unmapped source: never raises */
-        int line = soc->intc_intmap[s] & 0x1Fu;
-        if (line >= 1 && line < 32)
+        /* CPU line 0 is live on P4: the ROM routes FROM_CPU_1 (source 80)
+         * to line 0 and IDF enables CLIC ID 16 for it. (Identity-default
+         * MAPs would also put sources 0/32/64/96 on line 0, but none of
+         * those pend in practice.) */
+        int line = m & 0x1Fu;
+        if (line >= 0 && line < 32)
+            lines |= 1u << line;
+    }
+    w = soc->intc_status_hi;
+    while (w) {
+        unsigned s = 64u + (unsigned) __builtin_ctzll(w);
+        w &= w - 1u;
+        if (s >= 128u)
+            break;
+        uint32_t m = soc->intc_intmap[h][s];
+        if (m == 0xFFFFFFFFu)
+            continue; /* unmapped source: never raises */
+        int line = m & 0x1Fu;
+        if (line >= 0 && line < 32)
             lines |= 1u << line;
     }
     /* CLINT: MSIP (line 3) and MTIMECMP (line 7) */
-    if (soc->clint_msip)
+    if (soc->clint_msip[h])
         lines |= 1u << 3;
-    if (soc->clint_mtimcmp && soc->clint_mtime >= soc->clint_mtimcmp)
+    if (soc->clint_mtimcmp[h] && soc->clint_mtime >= soc->clint_mtimcmp[h])
         lines |= 1u << 7;
     return lines;
 }
@@ -3526,14 +3719,15 @@ void esp32p4_check_interrupt(riscv_t *rv)
         return;
     if (!(rv->csr_mstatus & MSTATUS_MIE))
         return;
-    /* CLIC arbitration (CPU0): external INTMTX line L drives ID 16+L;
-     * IDs 3/7 are CLINT MSIP/MTIME. Eligible: pending && enabled &&
-     * level > threshold. Highest level wins, ties go to the lowest ID.
-     * (The legacy mie CSR is unused on P4; kept updated below only for
-     * compatibility with generic CSR reads.) */
-    uint32_t lines = esp32_intc_raise(soc);
+    int h = p4_hart(rv);
+    /* CLIC arbitration: external INTMTX line L drives ID 16+L (routed
+     * through this hart's MAP); IDs 3/7 are CLINT MSIP/MTIME. Eligible:
+     * pending && enabled && level > threshold. Highest level wins, ties
+     * go to the lowest ID. (The legacy mie CSR is unused on P4; kept
+     * updated below only for compatibility with generic CSR reads.) */
+    uint32_t lines = esp32_intc_raise(soc, h);
     rv->csr_mip = (rv->csr_mip & ~0x0FFFFFFEu) | lines;
-    uint32_t thresh = (soc->clic_thresh >> 24) & 0xFFu;
+    uint32_t thresh = (soc->clic_thresh[h] >> 24) & 0xFFu;
     int best_id = -1;
     uint32_t best_level = 0;
     for (int id = 0; id < 64; id++) {
@@ -3542,24 +3736,24 @@ void esp32p4_check_interrupt(riscv_t *rv)
             if (lines & (1u << (id - 16)))
                 ip = 1;
         } else if (id == 3) {
-            ip = !!soc->clint_msip;
+            ip = !!soc->clint_msip[h];
         } else if (id == 7) {
-            ip = !!(soc->clint_mtimcmp &&
-                     soc->clint_mtime >= soc->clint_mtimcmp);
+            ip = !!(soc->clint_mtimcmp[h] &&
+                     soc->clint_mtime >= soc->clint_mtimcmp[h]);
         } else {
-            if (soc->clic_ip_sw[id])
+            if (soc->clic_ip_sw[h][id])
                 ip = 1;
         }
         if (id >= 16 && id < 16 + 32) {
-            if (soc->clic_ip_sw[id])
+            if (soc->clic_ip_sw[h][id])
                 ip = 1;
         }
-        if (!ip || !soc->clic_ie[id])
+        if (!ip || !soc->clic_ie[h][id])
             continue;
         /* NLBITS=3: level = CTL[7:5]. The SDK runs with threshold 0 and
          * default CTL 0x1F (level 0) and expects those lines to fire, so
          * deliver when level >= threshold. */
-        uint32_t level = ((uint32_t) soc->clic_ctl[id]) >> 5;
+        uint32_t level = ((uint32_t) soc->clic_ctl[h][id]) >> 5;
         if (level < thresh)
             continue;
         if (best_id < 0 || level > best_level ||
@@ -3582,12 +3776,15 @@ void esp32p4_check_interrupt(riscv_t *rv)
         rv->clic_vector_pc = (vp) ? *(uint32_t *) vp : rv->csr_mtvt;
     }
     rv->clic_vector_valid = true;
-    /* The crosscore/yield source (P4 source 79) is edge-triggered and has
-     * no explicit clear write from the SDK; clear its pending flag once its
-     * mapped line is delivered so the SDK's busy-wait on
-     * HP_SYSTEM_CPU_INT_FROM_CPU_0_REG (0x500E5010) reads back as cleared. */
-    if (best_id == 16 + (soc->intc_intmap[P4_FROM_CPU_INTR_SOURCE] & 0x1Fu))
-        soc->intc_status &= ~(((__uint128_t)1) << P4_FROM_CPU_INTR_SOURCE);
+    /* The crosscore/yield sources (79 = FROM_CPU_0 for hart0, 80 =
+     * FROM_CPU_1 for hart1) are edge-triggered with no explicit clear
+     * write from the SDK; clear the pending flag once its mapped line is
+     * delivered so the SDK's busy-wait on the FROM_CPU reg reads back
+     * as cleared. */
+    if (best_id == 16 + (soc->intc_intmap[h][P4_FROM_CPU_INTR_SOURCE] & 0x1Fu))
+        p4_intc_clear(soc, P4_FROM_CPU_INTR_SOURCE);
+    if (best_id == 16 + (soc->intc_intmap[h][P4_FROM_CPU1_INTR_SOURCE] & 0x1Fu))
+        p4_intc_clear(soc, P4_FROM_CPU1_INTR_SOURCE);
     SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ((1u << 31) | (uint32_t) best_id), 0);
 }
 
@@ -3706,7 +3903,7 @@ static void esp32p4_gpio_edge_check(esp32p4_t *soc, uint32_t *mmio32,
         }
         if (fire && ena) {
             soc->gpio_status |= 1u << pin;
-            soc->intc_status |= ((__uint128_t)1) << P4_GPIO_INTR_SOURCE;
+            p4_intc_set(soc, P4_GPIO_INTR_SOURCE);
         }
         /* PCNT: any edge on a pin that the GPIO matrix routes to a PCNT
          * unit/channel is counted here. Matrix input select for signal s
@@ -3755,7 +3952,7 @@ static void esp32p4_gpio_edge_check(esp32p4_t *soc, uint32_t *mmio32,
                         soc->pcnt_reg[0x40 >> 2] |= 1u << u;
                         if (soc->pcnt_reg[0x40 >> 2] &
                             soc->pcnt_reg[0x48 >> 2])
-                            soc->intc_status |= ((__uint128_t)1) << P4_PCNT_INTR_SOURCE;
+                            p4_intc_set(soc, P4_PCNT_INTR_SOURCE);
                     }
                 }
             }
@@ -3917,7 +4114,7 @@ void esp32p4_periodic(riscv_t *rv)
             int level = (soc->gpio_in >> pin) & 1;
             if (ena && ((type == 4 && !level) || (type == 5 && level))) {
                 soc->gpio_status |= 1u << pin;
-                soc->intc_status |= ((__uint128_t)1) << P4_GPIO_INTR_SOURCE;
+                p4_intc_set(soc, P4_GPIO_INTR_SOURCE);
             }
         }
     }
@@ -3995,7 +4192,7 @@ void esp32p4_periodic(riscv_t *rv)
         soc->i2c_reg[0x4 >> 2] &= ~(1u << 5); /* trans_start self-clears */
         soc->i2c_tx_len = 0;
         if (soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2])
-            soc->intc_status |= ((__uint128_t)1) << P4_I2C_EXT0_INTR_SOURCE;
+            p4_intc_set(soc, P4_I2C_EXT0_INTR_SOURCE);
     }
 
     /* SPI2 transfer completion: cmd.usr was set. The virtual device (a
@@ -4068,7 +4265,7 @@ void esp32p4_periodic(riscv_t *rv)
         soc->twai_reg[0x04 >> 2] &= ~TWAI0_CMD_TX_REQUEST;
         soc->twai_reg[0x08 >> 2] |= TWAI0_STATUS_TCS;
         soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_TI;
-        soc->intc_status |= ((__uint128_t)1) << P4_TWAI0_INTR_SOURCE;
+        p4_intc_set(soc, P4_TWAI0_INTR_SOURCE);
     }
 
     /* TWAI0 RX delivery: a virtual node on the bus sends one frame
@@ -4092,7 +4289,7 @@ void esp32p4_periodic(riscv_t *rv)
         soc->twai_reg[0x74 >> 2]++;
         if (soc->twai_reg[0x10 >> 2] & TWAI0_INTR_RI) {
             soc->twai_reg[0x0c >> 2] |= TWAI0_INTR_RI;
-            soc->intc_status |= ((__uint128_t)1) << P4_TWAI0_INTR_SOURCE;
+            p4_intc_set(soc, P4_TWAI0_INTR_SOURCE);
         }
     }
 
@@ -4104,7 +4301,7 @@ void esp32p4_periodic(riscv_t *rv)
             soc->rmt_tx_done_cycle[c] = 0;
             mmio32[0x6070u >> 2] |= 1u << c;
             if (mmio32[0x6070u >> 2] & mmio32[0x6078u >> 2])
-                soc->intc_status |= ((__uint128_t)1) << P4_RMT_INTR_SOURCE;
+                p4_intc_set(soc, P4_RMT_INTR_SOURCE);
         }
     }
 
@@ -4169,7 +4366,7 @@ void esp32p4_periodic(riscv_t *rv)
                 soc->rmt_rx_wptr[c] > 0) {
                 mmio32[0x6070u >> 2] |= 1u << (16 + c); /* rx done raw */
                 if (mmio32[0x6070u >> 2] & mmio32[0x6078u >> 2])
-                    soc->intc_status |= ((__uint128_t)1) << P4_RMT_INTR_SOURCE;
+                    p4_intc_set(soc, P4_RMT_INTR_SOURCE);
                 soc->rmt_rx_en[c] = 0; /* HW stops itself after idle */
             }
         }
@@ -4223,7 +4420,7 @@ void esp32p4_periodic(riscv_t *rv)
         }
         soc->gdma_out_int_raw[ch] |= 1u << 1; /* TX_EOF */
         if (soc->gdma_out_int_raw[ch] & soc->gdma_out_int_ena[ch]) {
-            soc->intc_status |= ((__uint128_t)1) << (P4_DMA_OUT_CH0_INTR_SOURCE + ch);
+            p4_intc_set(soc, (unsigned) (P4_DMA_OUT_CH0_INTR_SOURCE + ch));
         }
         if (!soc->gdma_tx_next_addr[ch]) {
             soc->gdma_tx_run[ch] = 0; /* park after the last descriptor */
@@ -4280,7 +4477,7 @@ void esp32p4_periodic(riscv_t *rv)
         soc->gdma_in_eof_des_addr[ch] = soc->gdma_rx_desc_addr[ch];
         soc->gdma_in_int_raw[ch] |= 1u << 1; /* IN_SUC_EOF */
         if (soc->gdma_in_int_raw[ch] & soc->gdma_in_int_ena[ch]) {
-            soc->intc_status |= ((__uint128_t)1) << (P4_DMA_IN_CH0_INTR_SOURCE + ch);
+            p4_intc_set(soc, (unsigned) (P4_DMA_IN_CH0_INTR_SOURCE + ch));
         }
         if (!soc->gdma_rx_next_addr[ch]) {
             soc->gdma_rx_run[ch] = 0; /* park after the last descriptor */
@@ -4302,7 +4499,7 @@ void esp32p4_periodic(riscv_t *rv)
         if ((mmio32[UART_INT_ENA_REG >> 2] & UART_RXFIFO_TOUT_BIT) &&
             !(*raw & UART_RXFIFO_TOUT_BIT)) {
             *raw |= UART_RXFIFO_TOUT_BIT;
-            soc->intc_status |= ((__uint128_t)1) << P4_UART0_INTR_SOURCE;
+            p4_intc_set(soc, P4_UART0_INTR_SOURCE);
         }
     }
 
@@ -4327,7 +4524,7 @@ void esp32p4_periodic(riscv_t *rv)
             !(*raw & UART_TXFIFO_EMPTY_BIT)) {
             *raw |= UART_TXFIFO_EMPTY_BIT;
             int src = (p == 0) ? P4_UART0_INTR_SOURCE : P4_UART1_INTR_SOURCE;
-            soc->intc_status |= ((__uint128_t)1) << src;
+            p4_intc_set(soc, src);
         }
     }
     */
@@ -4503,7 +4700,7 @@ void esp32p4_periodic(riscv_t *rv)
             soc->timg_reg[g][TIMG_INT_RAW >> 2] |= TIMG_INT_T0_ALARM;
             if (soc->timg_reg[g][TIMG_INT_RAW >> 2] &
                 soc->timg_reg[g][TIMG_INT_ENA >> 2])
-                soc->intc_status |= ((__uint128_t)1) << src;
+                p4_intc_set(soc, src);
             if (cfg & TIMG_T0_AUTORELOAD) {
                 uint64_t reload =
                     ((uint64_t) soc->timg_reg[g][TIMG_T0LOADHI >> 2] << 32) |
@@ -4528,7 +4725,7 @@ void esp32p4_periodic(riscv_t *rv)
             soc->timg_reg[g][TIMG_INT_ENA >> 2]) {
             uint32_t src = (g == 0) ? P4_TG0_WDT_INTR_SOURCE
                                     : P4_TG1_WDT_INTR_SOURCE;
-            soc->intc_status |= ((__uint128_t)1) << src;
+            p4_intc_set(soc, src);
         }
     }
 
@@ -4563,11 +4760,11 @@ void esp32p4_periodic(riscv_t *rv)
                 if (crossed > soc->systimer_t0_crossed) {
                     soc->systimer_t0_crossed = crossed;
                     soc->systimer_int_raw |= 1u;
-                    soc->intc_status |= ((__uint128_t)1) << SYSTIMER_T0_SOURCE;
+                    p4_intc_set(soc, SYSTIMER_T0_SOURCE);
                 }
             } else if (soc->systimer_comp0 && cnt0 >= soc->systimer_comp0) {
                 soc->systimer_int_raw |= 1u;
-                soc->intc_status |= ((__uint128_t)1) << SYSTIMER_T0_SOURCE;
+                p4_intc_set(soc, SYSTIMER_T0_SOURCE);
             }
         }
         uint64_t cnt2 = (soc->systimer_target2_conf & 0x80000000u)
@@ -4580,11 +4777,11 @@ void esp32p4_periodic(riscv_t *rv)
                 if (crossed > soc->systimer_t2_crossed) {
                     soc->systimer_t2_crossed = crossed;
                     soc->systimer_int_raw |= 4u;
-                    soc->intc_status |= ((__uint128_t)1) << SYSTIMER_T2_SOURCE;
+                    p4_intc_set(soc, SYSTIMER_T2_SOURCE);
                 }
             } else if (soc->systimer_comp2 && cnt2 >= soc->systimer_comp2) {
                 soc->systimer_int_raw |= 4u;
-                soc->intc_status |= ((__uint128_t)1) << SYSTIMER_T2_SOURCE;
+                p4_intc_set(soc, SYSTIMER_T2_SOURCE);
             }
         }
     }

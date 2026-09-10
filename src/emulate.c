@@ -372,6 +372,8 @@ static uint32_t *csr_get_ptr(riscv_t *rv, uint32_t csr)
         return (uint32_t *) (&rv->csr_mtvec);
     case CSR_MTVT: /* Machine trap-vector table base (CLIC) */
         return (uint32_t *) (&rv->csr_mtvt);
+    case CSR_MHARTID: /* Hardware thread ID (P4 SMP: 0 = PRO, 1 = APP) */
+        return (uint32_t *) (&rv->hart_id);
     case CSR_MNXTI: /* Machine next-interrupt (CLIC; read claims nothing here,
                      * writes are ignored) */
         return (uint32_t *) (&rv->csr_mnxti);
@@ -815,6 +817,15 @@ static bool is_branch_taken = false;
 static uint32_t last_pc = 0;
 static block_t *prev = NULL;
 
+#if RV32_HAS(ESP32_P4)
+/* P4 SMP: the three chaining globals above assume a single hart. Saved
+ * per-hart copies, swapped in esp32p4_smp_target's caller. */
+static bool smp_taken[2] = {false, false};
+static uint32_t smp_last_pc[2] = {0, 0};
+static block_t *smp_prev[2] = {NULL, NULL};
+static int smp_cur = -1;
+#endif
+
 #if RV32_HAS(JIT)
 static set_t pc_set;
 static bool has_loops = false;
@@ -825,6 +836,12 @@ void reset_rv_run_state()
     prev = NULL;
     is_branch_taken = false;
     last_pc = 0;
+#if RV32_HAS(ESP32_P4)
+    smp_prev[0] = smp_prev[1] = NULL;
+    smp_taken[0] = smp_taken[1] = false;
+    smp_last_pc[0] = smp_last_pc[1] = 0;
+    smp_cur = -1;
+#endif
 #if RV32_HAS(JIT)
     set_reset(&pc_set);
     has_loops = false;
@@ -920,7 +937,7 @@ FORCE_INLINE bool insn_is_branch(uint16_t opcode)
 #define RVOP_TAIL_INTER(rv, target, cycle, PC)                         \
     do {                                                               \
         int depth = --(rv)->wasm_block_depth;                          \
-        /* Yield at soft limit (0) because we're at a safe boundary */ \
+        /* Only yield at soft limit (0) because we're at a safe boundary */ \
         if (unlikely(depth <= 0)) {                                    \
             WASM_DEBUG_YIELD_SOFT(rv, depth);                          \
             (rv)->wasm_block_depth = WASM_BLOCK_LIMIT;                 \
@@ -929,8 +946,27 @@ FORCE_INLINE bool insn_is_branch(uint16_t opcode)
             (rv)->PC = (PC);                                           \
             return true;                                               \
         }                                                              \
+        RVOP_TAIL_INTER_P4KICK(rv, target, cycle, PC);                 \
         MUST_TAIL return (target)->impl(rv, target, cycle, PC);        \
     } while (0)
+#if defined(__EMSCRIPTEN__) && RV32_HAS(ESP32_P4)
+/* P4 SMP: a raised interrupt must interpose before the waiter polls it,
+ * but tail-chained runs only check at outer-loop iterations (up to 20K
+ * blocks apart). Unwind to the outer loop when a raise is pending so
+ * delivery happens promptly (same action as a depth-limit yield). */
+#define RVOP_TAIL_INTER_P4KICK(rv, target, cycle, PC)                  \
+    do {                                                               \
+        if (unlikely(esp32p4_irq_pending(rv))) {                       \
+            (rv)->wasm_block_depth = WASM_BLOCK_LIMIT;                 \
+            (rv)->next_insn = (target);                                \
+            (rv)->csr_cycle = (cycle);                                 \
+            (rv)->PC = (PC);                                           \
+            return true;                                               \
+        }                                                              \
+    } while (0)
+#else
+#define RVOP_TAIL_INTER_P4KICK(rv, target, cycle, PC) ((void) 0)
+#endif
 
 /* Backward compatibility: RVOP_TAIL maps to INTER for block boundaries */
 #define RVOP_TAIL(rv, target, cycle, PC) RVOP_TAIL_INTER(rv, target, cycle, PC)
@@ -2157,6 +2193,14 @@ static block_t *block_find_or_translate(riscv_t *rv)
     if (map->size * 1.25 > map->block_capacity) {
         block_map_clear(rv);
         prev = NULL;
+#if RV32_HAS(ESP32_P4)
+        /* cached blocks were freed: drop per-hart chaining copies too,
+         * they would otherwise dangle into freed IR (use-after-free). */
+        smp_prev[0] = smp_prev[1] = NULL;
+        smp_taken[0] = smp_taken[1] = false;
+        smp_last_pc[0] = smp_last_pc[1] = 0;
+        smp_cur = -1;
+#endif
     }
 #endif
     /* allocate a new block */
@@ -2438,9 +2482,24 @@ void rv_step(void *arg)
 #endif
 #if RV32_HAS(ESP32_P4)
         if (PRIV(rv)->esp32p4) {
-            /* advance ESP32 peripherals and deliver M-mode interrupts */
-            esp32p4_periodic(rv);
-            esp32p4_check_interrupt(rv);
+            /* P4 SMP: pick the hart for this iteration (creates hart1
+             * lazily), then advance peripherals + deliver to both harts */
+            rv = esp32p4_smp_target(rv);
+            esp32p4_smp_poll(rv);
+            /* per-hart block-chaining state (the three globals below
+             * assume one hart; swap in this hart's saved copy) */
+            int smp_hi = esp32p4_hart_index(rv);
+            if (smp_cur != smp_hi) {
+                if (smp_cur >= 0) {
+                    smp_prev[smp_cur] = prev;
+                    smp_last_pc[smp_cur] = last_pc;
+                    smp_taken[smp_cur] = is_branch_taken;
+                }
+                prev = smp_prev[smp_hi];
+                last_pc = smp_last_pc[smp_hi];
+                is_branch_taken = smp_taken[smp_hi];
+                smp_cur = smp_hi;
+            }
         }
 #endif
 
@@ -2684,7 +2743,9 @@ void rv_step(void *arg)
         memory_gc();
 
 #ifdef __EMSCRIPTEN__
-    if (rv_has_halted(rv)) {
+    /* P4 SMP: only hart0 (the main-loop arg) governs shutdown; hart1 may
+     * halt independently (e.g. park/debug) without stopping the system. */
+    if (rv_has_halted((riscv_t *) arg)) {
         bool stop_requested = indirect_rv_stop_requested();
         emscripten_cancel_main_loop();
         reset_rv_run_state();

@@ -50,6 +50,23 @@ uint32_t esp32p4_boot(esp32p4_t *soc, const char *elf_path);
 /* Install the ESP32-P4 memory/io handlers on the core. */
 void esp32p4_install_io(riscv_t *rv);
 
+/* SMP (dual-core): pick the hart to execute the current block iteration
+ * (creates the APP hart lazily on first call). */
+riscv_t *esp32p4_smp_target(riscv_t *rv);
+
+/* SMP: advance shared peripherals, deliver interrupts to both harts. */
+void esp32p4_smp_poll(riscv_t *rv);
+
+/* SMP: hart index of an instance (0 = PRO, 1 = APP). */
+int esp32p4_hart_index(riscv_t *rv);
+
+/* SMP: enable (1) dual-core APP-CPU boot (used by -C esp32p4smp). */
+void esp32p4_set_smp(struct esp32p4_soc *soc, int on);
+
+/* SMP: true if a raised interrupt may be awaiting delivery (outer-loop
+ * pass requested). Used by the block tail-call path. */
+bool esp32p4_irq_pending(riscv_t *rv);
+
 /* Called from rv_step to deliver pending M-mode interrupts. */
 void esp32p4_check_interrupt(riscv_t *rv);
 
