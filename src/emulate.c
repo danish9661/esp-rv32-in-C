@@ -937,7 +937,7 @@ FORCE_INLINE bool insn_is_branch(uint16_t opcode)
 #define RVOP_TAIL_INTER(rv, target, cycle, PC)                         \
     do {                                                               \
         int depth = --(rv)->wasm_block_depth;                          \
-        /* Only yield at soft limit (0) because we're at a safe boundary */ \
+        /* Yield at soft limit (0) because we're at a safe boundary */ \
         if (unlikely(depth <= 0)) {                                    \
             WASM_DEBUG_YIELD_SOFT(rv, depth);                          \
             (rv)->wasm_block_depth = WASM_BLOCK_LIMIT;                 \
@@ -946,27 +946,8 @@ FORCE_INLINE bool insn_is_branch(uint16_t opcode)
             (rv)->PC = (PC);                                           \
             return true;                                               \
         }                                                              \
-        RVOP_TAIL_INTER_P4KICK(rv, target, cycle, PC);                 \
         MUST_TAIL return (target)->impl(rv, target, cycle, PC);        \
     } while (0)
-#if defined(__EMSCRIPTEN__) && RV32_HAS(ESP32_P4)
-/* P4 SMP: a raised interrupt must interpose before the waiter polls it,
- * but tail-chained runs only check at outer-loop iterations (up to 20K
- * blocks apart). Unwind to the outer loop when a raise is pending so
- * delivery happens promptly (same action as a depth-limit yield). */
-#define RVOP_TAIL_INTER_P4KICK(rv, target, cycle, PC)                  \
-    do {                                                               \
-        if (unlikely(esp32p4_irq_pending(rv))) {                       \
-            (rv)->wasm_block_depth = WASM_BLOCK_LIMIT;                 \
-            (rv)->next_insn = (target);                                \
-            (rv)->csr_cycle = (cycle);                                 \
-            (rv)->PC = (PC);                                           \
-            return true;                                               \
-        }                                                              \
-    } while (0)
-#else
-#define RVOP_TAIL_INTER_P4KICK(rv, target, cycle, PC) ((void) 0)
-#endif
 
 /* Backward compatibility: RVOP_TAIL maps to INTER for block boundaries */
 #define RVOP_TAIL(rv, target, cycle, PC) RVOP_TAIL_INTER(rv, target, cycle, PC)
