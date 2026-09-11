@@ -427,6 +427,19 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - Validation (when dual boot lands): unpatched postv3 hello prints
     HELLO+TICK with main and loopTask on different cores (check
     `pxCurrentTCBs[0/1]`).
+  - LANDED 2026-09-11: unpatched dual boot works on the fixed emulator
+    (`fw/p4smp/unpatched.bin`, no F1/S7'): 1 HELLO + 46 TICKs over
+    5 min, zero faults. The old blockers (ipc0 portMAX_DELAY lock wedge
+    vs hart1's first switch; main_task self-delete lock leak) do not
+    manifest — with TARGET1 ticks, real critical-section masking, and
+    working LR/SC, hart1 makes progress and main's self-delete
+    completes (a main abort would park hart0, stop T0 ticks, and freeze
+    TICKs; TICKs continue linearly). Functional proof of split: TICKs
+    print (loopTask is core-1-affined, runs only on hart1) while T0
+    ticks advance delays (hart0); DIAG shows per-core IDLEs
+    (tcb=[IDLE-0, IDLE-1]). No emulator or patcher change was needed —
+    F1/S7' remain a faster bringup scaffold only. Next: WASM SMP demo
+    entry, then peripherals on SMP / real IPC.
   - Breakthrough 2026-09-11: dual HELLO+TICK on `-C esp32p4smp` with the
     scaffolded image (`tools/p4_mksmp.py` F1+S7', `fw/p4smp/smp.bin`):
     hart0 runs main_task (parks after setup), hart1 runs IDLE-1 + ipc1 +
