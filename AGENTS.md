@@ -427,6 +427,52 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - Validation (when dual boot lands): unpatched postv3 hello prints
     HELLO+TICK with main and loopTask on different cores (check
     `pxCurrentTCBs[0/1]`).
+  - Breakthrough 2026-09-11: dual HELLO+TICK on `-C esp32p4smp` with the
+    scaffolded image (`tools/p4_mksmp.py` F1+S7', `fw/p4smp/smp.bin`):
+    hart0 runs main_task (parks after setup), hart1 runs IDLE-1 + ipc1 +
+    loopTask (TICKs via delay). Native HELLO + steady TICKs, no panics;
+    WASM boots to HELLO with main parked (slower, no crash yet). Real
+    emulator bugs fixed (all in normal code paths, TEMP tracing since
+    removed): (1) core ignored CLIC MINTTHRESH (0x347 — the SMP port's
+    critical-section mask), so ticks preempted takes and register spills
+    smashed tick_cb/idle_cb with wild hook pointers (0x03ffffff,
+    data addrs); new `csr_mintthresh` per hart, honored in P4 CLIC
+    arbitration. (2) CLIC level was `CTL>>5` compared against raw
+    threshold bytes, so take()'s 127 never masked anything; compare in
+    level domain (`>>5` both sides: idle 31→0 fires-all like baseline,
+    take 127→3 masks levels 0-3 incl. tick/yield). (3) SYSTIMER TARGET1
+    unmodeled (hart1's tick; guest enables T0+T1, ena=0x3) → hart1 never
+    ticked, hart0's crosscore handshake waited full s6 timeout every
+    tick (~1 Hz); added comp1/conf/crossed state, source 54, INT_CLR
+    bit1, with the CPU interrupt gated on INT_ENA like HW (guest arms
+    T1's comparator while enabling only T0 — ungated T1 spuriously
+    wedged unicore gptimer/i2c). (4) LR/SC had no reservation: `sc.w`
+    always succeeded, so both harts held xKernelLock at once; now
+    value-based (`lr_value`/`lr_valid` in riscv_private.h). (5) trap
+    handler never yields spinning SMP traps: 20000-insn pause budget in
+    `__trap_handler` (resume next schedule). Scaffolding kept in the FW
+    patcher only: F1 ipc wait -1→31 ticks (1 tick overloaded the lock
+    into per-tick full handshake timeouts), S7' main suicide→park
+    (self-delete wins a same-block race vs the pending yield ISR and
+    main "returns" into `panic_abort`; also fixed S7' byte order —
+    `01a00100`, the old `a0010100` decoded as addi4spn+nop and fell
+    through). Also fixed: native `-Werror` breakage (H2_SRAM_SIZE
+    rename, AES/`Nb` cleanups) and a `.config` footgun (wasm defconfig
+    + native make silently misbuilds; always `rm -rf
+    build/softfloat build/devices` + re-apply defconfig when switching
+    toolchains; plain `make` needs `CC=gcc` once `.config` says WASM).
+    Follow-up: peripheral matrix re-verified green on current code
+    (native hello/gpio/gptimer/i2c DONE, node hello+TICKs/uart+RX/gpio,
+    node SMP HELLO) after regenerating all `patched.bin` with the
+    current unicore patcher (Sep-5 images were stale). Methodology: this
+    box runs other tenants' emulators at ~100% CPU (load 3-6); wall-time
+    test windows flake — use 40-100 s timeouts and confirm by log
+    content, and always verify the binary is fresh (`strings` check)
+    after toolchain switches. Still scaffolded, not upstream-clean:
+    S7'/F1 guest patches, trap-pause budget, no WASM SMP demo entry
+    yet. Next: rate (~1 TICK/20-30 s native; batching periodic 8-64x was
+    tried and reverted — unsafe), then unpatched dual boot (needs real
+    IPC progress, not F1 polling).
 - [x] Phase 6: P4 peripheral verification with arduino-cli test sketches
   (`esp32:esp32:esp32p4:ChipVariant=postv3`, each unicore-patched) — in progress.
   - **GPIO** (`p4gpio`): `GPIO_OUT 1 0` (echo readback), `GPIO_INT 1`

@@ -13,7 +13,7 @@
 #define C6_ROM_BASE 0x40000000u
 #define H2_ROM_SIZE 0x20000u /* 128 KB H2 mask ROM (wokwi/esp32-roms) */
 #define C6_SRAM_BASE 0x40800000u
-#define C6_SRAM_SIZE 0x50000u /* 320 KB HP-SRAM (I- and D-bus same address) */
+#define H2_SRAM_SIZE 0x50000u /* 320 KB HP-SRAM (I- and D-bus same address) */
 #define C6_LP_SRAM_BASE 0x50000000u
 #define C6_LP_SRAM_SIZE 0x4000u /* 16 KB */
 #define C6_FLASH_I_BASE 0x42000000u /* i/d-cache window (16 MB) */

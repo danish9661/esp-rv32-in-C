@@ -95,6 +95,8 @@ enum {
     /* CLIC (ESP32-P4): trap-vector table + next-interrupt CSRs */
     CSR_MTVT = 0x307,
     CSR_MNXTI = 0x345,
+    CSR_MINTSTATUS = 0x346,
+    CSR_MINTTHRESH = 0x347,
 
     /* vector extension */
     CSR_VSTART = 0x008,
@@ -258,6 +260,14 @@ struct riscv_internal {
 
     uint32_t hart_id; /**< hardware thread ID (MHARTID CSR; 0 unless SMP) */
 
+    /* LR/SC reservation (value-based, SMP-safe): lrw records the loaded
+     * value; scw succeeds only if memory still holds it. This restores
+     * mutual exclusion when two harts interleave LR/SC pairs (the old
+     * always-succeed SC let both harts hold a spinlock). ABA matches
+     * are benign for lock words (free->owned->free still means free). */
+    uint32_t lr_value;
+    bool lr_valid;
+
 #ifdef __EMSCRIPTEN__
 /* Soft limit: yield at block boundaries */
 #ifndef WASM_BLOCK_LIMIT
@@ -344,6 +354,10 @@ struct riscv_internal {
     uint32_t csr_mie;       /* Machine interrupt enable */
     uint32_t csr_mtvt;      /* Machine trap-vector table base (CLIC) */
     uint32_t csr_mnxti;     /* Machine next-interrupt handler (CLIC) */
+    uint32_t csr_mintstatus; /* CLIC interrupt status (P4: R/O, reads 0) */
+    uint32_t csr_mintthresh; /* CLIC interrupt threshold (P4 SMP port's
+                              * critical-section mask via xPortEnterCritical;
+                              * default 0 = all levels pass) */
     /* CLIC vectored-trap request (set by SoC layer before trapping when
      * mtvec mode == 3; consumed by the trap handler). */
     uint32_t clic_vector_pc;

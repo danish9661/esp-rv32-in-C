@@ -190,7 +190,8 @@ def nop_for(length):
     if length == 2:
         return bytes.fromhex("0100")  # c.nop
     if length == 4:
-        return bytes.fromhex("00000013")  # addi x0,x0,0
+        # addi x0,x0,0 = word 0x00000013, little-endian bytes
+        return bytes.fromhex("13000000")
     raise SystemExit(f"cannot nop insn of length {length}")
 
 
@@ -220,11 +221,6 @@ def dec_c_j(word, pc):
     if imm & (1 << 11):
         imm -= 1 << 12
     return pc + imm
-    if length == 2:
-        return bytes.fromhex("0100")  # c.nop
-    if length == 4:
-        return bytes.fromhex("00000013")  # addi x0,x0,0
-    raise SystemExit(f"cannot nop insn of length {length}")
 
 
 def main():

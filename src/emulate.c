@@ -377,6 +377,10 @@ static uint32_t *csr_get_ptr(riscv_t *rv, uint32_t csr)
     case CSR_MNXTI: /* Machine next-interrupt (CLIC; read claims nothing here,
                      * writes are ignored) */
         return (uint32_t *) (&rv->csr_mnxti);
+    case CSR_MINTSTATUS: /* CLIC status (P4 port reads only; model as 0) */
+        return (uint32_t *) (&rv->csr_mintstatus);
+    case CSR_MINTTHRESH: /* CLIC threshold (P4 SMP critical sections) */
+        return (uint32_t *) (&rv->csr_mintthresh);
     case CSR_MISA: /* Machine ISA and Extensions */
         return (uint32_t *) (&rv->csr_misa);
 
@@ -2801,6 +2805,17 @@ static void __trap_handler(riscv_t *rv)
     assert(ir);
 
     /* set to false by sret implementation */
+    /* Pause budget: a trap that executes this many instructions without
+     * completing (e.g. a spinlock take-loop inside an ISR on dual-core
+     * SMP) yields back to the outer loop INSTEAD of wedging it.
+     * is_trapped stays set, so the trap resumes when this hart is
+     * scheduled again; meanwhile the other hart and the periodic
+     * peripheral tick run, letting time flow so the holder can release
+     * and the spinner can acquire (mirrors HW concurrency). Normal ISRs
+     * are far shorter and never hit the budget. */
+#if 1 /* trap pause: yield on spinning traps (SMP bringup) */
+    unsigned trap_budget = 20000;
+#endif
     while (rv->is_trapped && !rv_has_halted(rv)) {
         uint32_t insn;
     retry_fetch:
@@ -2838,6 +2853,10 @@ static void __trap_handler(riscv_t *rv)
         ir->impl = dispatch_table[ir->opcode];
         rv->compressed = is_compressed(insn);
         ir->impl(rv, ir, rv->csr_cycle, rv->PC);
+#if 1 /* trap pause (see above) */
+        if (--trap_budget == 0)
+            break; /* pause a spinning trap; resume on next schedule */
+#endif
     }
 
     mpool_free(rv->block_ir_mp, ir);

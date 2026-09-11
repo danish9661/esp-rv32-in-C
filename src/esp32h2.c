@@ -504,7 +504,7 @@ esp32h2_t *esp32h2_new(void)
     uint8_t *flash = calloc(1, C6_FLASH_SIZE);
     assert(flash);
 
-    esp32_add_region(soc, C6_SRAM_BASE, C6_SRAM_SIZE, ESP32_REG_RAM);
+    esp32_add_region(soc, C6_SRAM_BASE, H2_SRAM_SIZE, ESP32_REG_RAM);
     esp32_add_region(soc, C6_LP_SRAM_BASE, C6_LP_SRAM_SIZE, ESP32_REG_RAM);
     esp32_add_region(soc, C6_ROM_BASE, H2_ROM_SIZE, ESP32_REG_RAM);
 

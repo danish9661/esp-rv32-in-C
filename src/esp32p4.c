@@ -50,7 +50,6 @@ static uint32_t sha_len;
 static uint32_t sha_digest[8];
 static int sha_computed;
 static int sha_reset_pending;
-static unsigned dbg_69_at_check;  /* times bit 69 seen pending at check */
 static unsigned dbg_trap_deliv;   /* times a trap was actually delivered */
 static unsigned dbg_gdma_intrwr;  /* guest writes to GDMA intr regs */
 static unsigned dbg_gdma_intrwr_clear; /* ...that cleared bit 69 */
@@ -177,13 +176,16 @@ struct esp32p4_soc {
     uint32_t strap_b0410; /* 0x600b0410: strapping (low5=5) + reset reason */
     uint64_t systimer_unit1_counter;
     uint64_t systimer_comp0;
+    uint64_t systimer_comp1;
     uint64_t systimer_comp2;
     uint32_t systimer_conf;
     uint32_t systimer_target0_conf;
+    uint32_t systimer_target1_conf;
     uint32_t systimer_target2_conf;
     uint32_t systimer_int_ena;
     uint32_t systimer_int_raw;
     uint64_t systimer_t0_crossed;
+    uint64_t systimer_t1_crossed;
     uint64_t systimer_t2_crossed;
     uint64_t systimer_unit0_val; /* latched by UNIT0_OP UPDATE */
     uint64_t systimer_unit1_val; /* latched by UNIT1_OP UPDATE */
@@ -791,6 +793,7 @@ void esp32p4_smp_poll(riscv_t *rv)
 #define P4_AXI_DMA_OUT_CH0_INTR_SOURCE 65u
 /* SYSTIMER interrupt sources (interrupts.h enum) */
 #define P4_SYSTIMER_T0_SOURCE 53u
+#define P4_SYSTIMER_T1_SOURCE 54u
 #define P4_SYSTIMER_T2_SOURCE 55u
 /* Crosscore/yield sources: HP_SYSTEM_CPU_INT_FROM_CPU_0 (0x500E5010,
  * source 79, targets PRO CPU) and _FROM_CPU_1 (0x500E5014, source 80,
@@ -958,9 +961,12 @@ static void esp32_uart_putc(esp32p4_t *soc, char c)
 #define SYSTIMER_UNIT1_OP 0x08u
 #define SYSTIMER_TARGET0_HI 0x1Cu
 #define SYSTIMER_TARGET0_LO 0x20u
+#define SYSTIMER_TARGET1_HI 0x24u
+#define SYSTIMER_TARGET1_LO 0x28u
 #define SYSTIMER_TARGET2_LO 0x30u
 #define SYSTIMER_TARGET2_HI 0x2Cu
 #define SYSTIMER_TARGET0_CONF 0x34u
+#define SYSTIMER_TARGET1_CONF 0x38u
 #define SYSTIMER_TARGET2_CONF 0x3Cu
 #define SYSTIMER_VALUE_HI 0x40u
 #define SYSTIMER_VALUE_LO 0x44u
@@ -973,6 +979,7 @@ static void esp32_uart_putc(esp32p4_t *soc, char c)
 /* ESP32-P4 interrupt sources (soc/interrupts.h): 53 = SYSTIMER_TARGET0
  * (FreeRTOS tick), 55 = SYSTIMER_TARGET2 (esp_timer). */
 #define SYSTIMER_T0_SOURCE 53u
+#define SYSTIMER_T1_SOURCE 54u
 #define SYSTIMER_T2_SOURCE 55u
 
 /* ------------------------------------------------------------------ */
@@ -1869,12 +1876,18 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
             return (uint32_t) soc->systimer_comp0;
         case SYSTIMER_TARGET0_HI:
             return (uint32_t) (soc->systimer_comp0 >> 32);
+        case SYSTIMER_TARGET1_LO:
+            return (uint32_t) soc->systimer_comp1;
+        case SYSTIMER_TARGET1_HI:
+            return (uint32_t) (soc->systimer_comp1 >> 32);
         case SYSTIMER_TARGET2_LO:
             return (uint32_t) soc->systimer_comp2;
         case SYSTIMER_TARGET2_HI:
             return (uint32_t) (soc->systimer_comp2 >> 32);
         case SYSTIMER_TARGET0_CONF:
             return soc->systimer_target0_conf;
+        case SYSTIMER_TARGET1_CONF:
+            return soc->systimer_target1_conf;
         case SYSTIMER_TARGET2_CONF:
             return soc->systimer_target2_conf;
         case SYSTIMER_INT_ENA:
@@ -3165,7 +3178,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         uint32_t s = (addr - P4_PERIPH_BASE - 0x10000u) >> 2;
         uint32_t v = val & 0x1Fu;
         soc->intc_intmap[0][s] = (v == 0u) ? 0xFFFFFFFFu : ((v - 16u) & 0x1Fu);
-        if (s == 53 || s == 55 || s == 79) {
+        if (s == 53 || s == 54 || s == 55 || s == 79) {
             static unsigned long mx = 0;
             if (mx++ < 10)
                 fprintf(stderr, "[MTX] source=%u -> line=%u (pc=%08x)\n", s,
@@ -3184,8 +3197,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
     if (addr >= P4_PERIPH_BASE + 0xA000u &&
         addr < P4_PERIPH_BASE + 0xB000u) {
         uint32_t _o = addr - P4_PERIPH_BASE - 0xA000u;
-        if (_o == 0x1Cu || _o == 0x20u || _o == 0x34u || _o == 0x3Cu ||
-            _o == 0x64u || _o == 0x6Cu) {
+        if (_o == 0x1Cu || _o == 0x20u || _o == 0x24u || _o == 0x28u ||
+            _o == 0x34u || _o == 0x38u || _o == 0x3Cu || _o == 0x64u ||
+            _o == 0x6Cu) {
             static unsigned long sq2 = 0;
             if (sq2++ < 20)
                 fprintf(stderr, "[SYST] wr %04x <- %08x (pc=%08x)\n", _o, val,
@@ -3194,6 +3208,40 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         switch (off - 0xA000u) {
         case SYSTIMER_CONF:
             soc->systimer_conf = val;
+            /* Period mode must not fire a catch-up burst for boundaries
+             * crossed before it was enabled (real HW fires at the next
+             * boundary after enable). Re-sync both targets' last-fired
+             * markers so the first alarm comes one period after enable. */
+            if (soc->systimer_target0_conf & 0x40000000u) {
+                uint64_t p0 =
+                    soc->systimer_target0_conf & 0x03FFFFFFu;
+                uint64_t c0 =
+                    (soc->systimer_target0_conf & 0x80000000u)
+                        ? soc->systimer_unit1_counter
+                        : soc->systimer_counter;
+                if (p0)
+                    soc->systimer_t0_crossed = c0 / p0;
+            }
+            if (soc->systimer_target1_conf & 0x40000000u) {
+                uint64_t p1 =
+                    soc->systimer_target1_conf & 0x03FFFFFFu;
+                uint64_t c1 =
+                    (soc->systimer_target1_conf & 0x80000000u)
+                        ? soc->systimer_unit1_counter
+                        : soc->systimer_counter;
+                if (p1)
+                    soc->systimer_t1_crossed = c1 / p1;
+            }
+            if (soc->systimer_target2_conf & 0x40000000u) {
+                uint64_t p2 =
+                    soc->systimer_target2_conf & 0x03FFFFFFu;
+                uint64_t c2 =
+                    (soc->systimer_target2_conf & 0x80000000u)
+                        ? soc->systimer_unit1_counter
+                        : soc->systimer_counter;
+                if (p2)
+                    soc->systimer_t2_crossed = c2 / p2;
+            }
             return;
         case SYSTIMER_UNIT0_OP:
             mmio32[off >> 2] = val;
@@ -3220,6 +3268,37 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             return;
         case SYSTIMER_TARGET0_CONF:
             soc->systimer_target0_conf = val;
+            /* Sync the period marker (see SYSTIMER_CONF): programming the
+             * target must not retro-fire for old boundary crossings. */
+            if (val & 0x40000000u) {
+                uint64_t p0 = val & 0x03FFFFFFu;
+                uint64_t c0 = (val & 0x80000000u)
+                                  ? soc->systimer_unit1_counter
+                                  : soc->systimer_counter;
+                if (p0)
+                    soc->systimer_t0_crossed = c0 / p0;
+            }
+            return;
+        case SYSTIMER_TARGET1_LO:
+            soc->systimer_comp1 =
+                (soc->systimer_comp1 & ~0xFFFFFFFFull) | val;
+            return;
+        case SYSTIMER_TARGET1_HI:
+            soc->systimer_comp1 =
+                (soc->systimer_comp1 & 0xFFFFFFFFull) |
+                ((uint64_t) val << 32);
+            return;
+        case SYSTIMER_TARGET1_CONF:
+            soc->systimer_target1_conf = val;
+            /* Sync the period marker (see SYSTIMER_CONF). */
+            if (val & 0x40000000u) {
+                uint64_t p1 = val & 0x03FFFFFFu;
+                uint64_t c1 = (val & 0x80000000u)
+                                  ? soc->systimer_unit1_counter
+                                  : soc->systimer_counter;
+                if (p1)
+                    soc->systimer_t1_crossed = c1 / p1;
+            }
             return;
         case SYSTIMER_TARGET2_LO:
             soc->systimer_comp2 =
@@ -3232,14 +3311,29 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             return;
         case SYSTIMER_TARGET2_CONF:
             soc->systimer_target2_conf = val;
+            /* Sync the period marker (see SYSTIMER_CONF). */
+            if (val & 0x40000000u) {
+                uint64_t p2 = val & 0x03FFFFFFu;
+                uint64_t c2 = (val & 0x80000000u)
+                                  ? soc->systimer_unit1_counter
+                                  : soc->systimer_counter;
+                if (p2)
+                    soc->systimer_t2_crossed = c2 / p2;
+            }
             return;
         case SYSTIMER_INT_ENA:
             soc->systimer_int_ena = val;
             return;
         case SYSTIMER_INT_CLR:
             soc->systimer_int_raw &= ~val;
-            p4_intc_clear(soc, SYSTIMER_T0_SOURCE);
-            p4_intc_clear(soc, SYSTIMER_T2_SOURCE);
+            /* Clear only the INTC sources whose raw bits were cleared
+             * (was: unconditionally both, dropping a pending sibling). */
+            if (val & 1u)
+                p4_intc_clear(soc, SYSTIMER_T0_SOURCE);
+            if (val & 2u)
+                p4_intc_clear(soc, SYSTIMER_T1_SOURCE);
+            if (val & 4u)
+                p4_intc_clear(soc, SYSTIMER_T2_SOURCE);
             return;
         default:
             mmio32[off >> 2] = val;
@@ -3727,7 +3821,18 @@ void esp32p4_check_interrupt(riscv_t *rv)
      * updated below only for compatibility with generic CSR reads.) */
     uint32_t lines = esp32_intc_raise(soc, h);
     rv->csr_mip = (rv->csr_mip & ~0x0FFFFFFEu) | lines;
-    uint32_t thresh = (soc->clic_thresh[h] >> 24) & 0xFFu;
+    /* Effective CLIC threshold: MMIO THRESH (never programmed by the SDK;
+     * stays 0) vs CSR MINTTHRESH (0x347, the SMP port's critical-section
+     * mask: xPortEnterCritical writes 127). Guest levels live in
+     * CTL[7:5] (SDK uses 0x20/0x80-style bytes), so compare in level
+     * domain: ROM's idle threshold 31 scales to 0 (everything fires,
+     * exactly the pre-MINTTHRESH behavior) while take()'s 127 scales to
+     * 3 (masks levels 0-3 inside critical sections, HW-faithful). */
+    uint32_t thresh = soc->clic_thresh[h] & 0xFFu;
+    uint32_t mintthresh = rv->csr_mintthresh & 0xFFu;
+    if (mintthresh > thresh)
+        thresh = mintthresh;
+    thresh >>= 5;
     int best_id = -1;
     uint32_t best_level = 0;
     for (int id = 0; id < 64; id++) {
@@ -3750,9 +3855,10 @@ void esp32p4_check_interrupt(riscv_t *rv)
         }
         if (!ip || !soc->clic_ie[h][id])
             continue;
-        /* NLBITS=3: level = CTL[7:5]. The SDK runs with threshold 0 and
-         * default CTL 0x1F (level 0) and expects those lines to fire, so
-         * deliver when level >= threshold. */
+        /* Level = CTL[7:5] (NLBITS=3). Threshold 0 outside critical
+         * sections (SDK default + scaled ROM idle value), 3 inside
+         * take() — only level 4+ lines (e.g. 0x80 console lines)
+         * preempt critical sections, as on HW. */
         uint32_t level = ((uint32_t) soc->clic_ctl[h][id]) >> 5;
         if (level < thresh)
             continue;
@@ -3781,9 +3887,9 @@ void esp32p4_check_interrupt(riscv_t *rv)
      * write from the SDK; clear the pending flag once its mapped line is
      * delivered so the SDK's busy-wait on the FROM_CPU reg reads back
      * as cleared. */
-    if (best_id == 16 + (soc->intc_intmap[h][P4_FROM_CPU_INTR_SOURCE] & 0x1Fu))
+    if (best_id == (int) (16 + (soc->intc_intmap[h][P4_FROM_CPU_INTR_SOURCE] & 0x1Fu)))
         p4_intc_clear(soc, P4_FROM_CPU_INTR_SOURCE);
-    if (best_id == 16 + (soc->intc_intmap[h][P4_FROM_CPU1_INTR_SOURCE] & 0x1Fu))
+    if (best_id == (int) (16 + (soc->intc_intmap[h][P4_FROM_CPU1_INTR_SOURCE] & 0x1Fu)))
         p4_intc_clear(soc, P4_FROM_CPU1_INTR_SOURCE);
     SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ((1u << 31) | (uint32_t) best_id), 0);
 }
@@ -4744,10 +4850,11 @@ void esp32p4_periodic(riscv_t *rv)
     soc->lp_timer = rv->csr_cycle / 533u; /* RC_SLOW ~150 kHz */
 
 /* SYSTIMER alarms. The C6: alarm enables are SYSTIMER_CONF bits
- * (TARGET0_WORK_EN=24, TARGET2_WORK_EN=22); TIMER_UNIT_SEL (bit31 of the
- * per-target CONF) picks the counter unit; bit30 selects period mode
- * (fires every PERIOD ticks, period = CONF bits 25:0). The app's esp_timer
- * uses TARGET2 (INTC source 59); the FreeRTOS tick uses TARGET0 (57). */
+ * (TARGET0_WORK_EN=24, TARGET1_WORK_EN=23, TARGET2_WORK_EN=22);
+ * TIMER_UNIT_SEL (bit31 of the per-target CONF) picks the counter unit;
+ * bit30 selects period mode (fires every PERIOD ticks, period = CONF
+ * bits 25:0). The app's esp_timer uses TARGET2 (INTC source 59); the
+ * FreeRTOS tick uses TARGET0 (57). */
     {
         uint64_t cnt0 = (soc->systimer_target0_conf & 0x80000000u)
                             ? soc->systimer_unit1_counter
@@ -4760,11 +4867,36 @@ void esp32p4_periodic(riscv_t *rv)
                 if (crossed > soc->systimer_t0_crossed) {
                     soc->systimer_t0_crossed = crossed;
                     soc->systimer_int_raw |= 1u;
-                    p4_intc_set(soc, SYSTIMER_T0_SOURCE);
+                    if (soc->systimer_int_ena & 1u)
+                        p4_intc_set(soc, SYSTIMER_T0_SOURCE);
                 }
             } else if (soc->systimer_comp0 && cnt0 >= soc->systimer_comp0) {
                 soc->systimer_int_raw |= 1u;
-                p4_intc_set(soc, SYSTIMER_T0_SOURCE);
+                if (soc->systimer_int_ena & 1u)
+                    p4_intc_set(soc, SYSTIMER_T0_SOURCE);
+            }
+        }
+        /* TARGET1 (INTC source 54) is hart1's FreeRTOS tick in SMP.
+         * The CPU interrupt is gated on INT_ENA like HW: the guest arms
+         * T1's comparator (CONF) while enabling only T0 (ENA=1), so an
+         * ungated T1 would spuriously interrupt unicore images. */
+        uint64_t cnt1 = (soc->systimer_target1_conf & 0x80000000u)
+                            ? soc->systimer_unit1_counter
+                            : soc->systimer_counter;
+        if (soc->systimer_conf & (1u << 23)) { /* TARGET1_WORK_EN */
+            if (soc->systimer_target1_conf & 0x40000000u) {
+                uint64_t p = soc->systimer_target1_conf & 0x03FFFFFFu;
+                uint64_t crossed = p ? (cnt1 / p) : 0;
+                if (crossed > soc->systimer_t1_crossed) {
+                    soc->systimer_t1_crossed = crossed;
+                    soc->systimer_int_raw |= 2u;
+                    if (soc->systimer_int_ena & 2u)
+                        p4_intc_set(soc, SYSTIMER_T1_SOURCE);
+                }
+            } else if (soc->systimer_comp1 && cnt1 >= soc->systimer_comp1) {
+                soc->systimer_int_raw |= 2u;
+                if (soc->systimer_int_ena & 2u)
+                    p4_intc_set(soc, SYSTIMER_T1_SOURCE);
             }
         }
         uint64_t cnt2 = (soc->systimer_target2_conf & 0x80000000u)
@@ -4777,11 +4909,13 @@ void esp32p4_periodic(riscv_t *rv)
                 if (crossed > soc->systimer_t2_crossed) {
                     soc->systimer_t2_crossed = crossed;
                     soc->systimer_int_raw |= 4u;
-                    p4_intc_set(soc, SYSTIMER_T2_SOURCE);
+                    if (soc->systimer_int_ena & 4u)
+                        p4_intc_set(soc, SYSTIMER_T2_SOURCE);
                 }
             } else if (soc->systimer_comp2 && cnt2 >= soc->systimer_comp2) {
                 soc->systimer_int_raw |= 4u;
-                p4_intc_set(soc, SYSTIMER_T2_SOURCE);
+                if (soc->systimer_int_ena & 4u)
+                    p4_intc_set(soc, SYSTIMER_T2_SOURCE);
             }
         }
     }

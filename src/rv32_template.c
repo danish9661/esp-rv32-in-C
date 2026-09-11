@@ -873,26 +873,31 @@ RVOP(remu, {
 RVOP(lrw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
+    uint32_t v = MEM_READ_W(rv, addr);
     if (ir->rd)
-        rv->X[ir->rd] = MEM_READ_W(rv, addr);
-    /* skip registration of the 'reservation set'
-     * FIXME: unimplemented
-     */
+        rv->X[ir->rd] = v;
+    /* record reservation (value-based; see struct comment) */
+    rv->lr_value = v;
+    rv->lr_valid = true;
 })
 
 /* SC.W: Store Conditional */
 RVOP(scw, {
-    /* assume the 'reservation set' is valid
-     * FIXME: unimplemented
-     */
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, STORE, false, 1);
     const uint32_t value = rv->X[ir->rs2];
-    MEM_WRITE_W(rv, addr, value);
-    rv->X[ir->rd] = 0;
+    uint32_t cur = MEM_READ_W(rv, addr);
+    if (rv->lr_valid && cur == rv->lr_value) {
+        MEM_WRITE_W(rv, addr, value);
+        if (ir->rd)
+            rv->X[ir->rd] = 0;
 #if RV32_HAS(ARCH_TEST)
-    check_tohost_write(rv, addr, value);
+        check_tohost_write(rv, addr, value);
 #endif
+    } else if (ir->rd) {
+        rv->X[ir->rd] = 1; /* reservation lost: fail, caller retries */
+    }
+    rv->lr_valid = false;
 })
 
 /* AMOSWAP.W: Atomic Swap */

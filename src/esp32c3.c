@@ -730,7 +730,8 @@ static void esp32c3_aes_keyexp(const uint8_t *key, int Nk, uint8_t *w)
     }
 }
 
-static void esp32c3_aes_subshift(uint8_t *s, int dec)
+static void __attribute__((unused))
+esp32c3_aes_subshift(uint8_t *s, int dec)
 {
     if (!dec) {
         for (int i = 0; i < 16; i++) s[i] = esp32c3_aes_sbox[s[i]];
@@ -786,7 +787,7 @@ static void esp32c3_aes_mix(uint8_t *s, int inv)
 static void esp32c3_aes_block(const uint8_t *in, const uint8_t *key, int Nk,
                                int decrypt, uint8_t *out)
 {
-    int Nr = Nk + 6, Nb = 4;
+    int Nr = Nk + 6;
     /* Max AES-256: 4*(4*(14+1)) = 240 bytes. Use fixed buffer — WASM VLAs
      * corrupt the stack when the VLA is large. */
     uint8_t w[240];
@@ -1813,8 +1814,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                             &soc->gdma_out_desc_buf[c],
                             &soc->gdma_out_desc_len[c],
                             &soc->gdma_out_next_addr[c]);
-                    if (!ok)
-                        ; /* load failed — out_run stays 0 */
+                    if (!ok) {
+                        /* load failed — out_run stays 0 */
+                    }
                     if (ok)
                         soc->gdma_out_run[c] = 1;
                     soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
