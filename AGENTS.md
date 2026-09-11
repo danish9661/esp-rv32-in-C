@@ -440,6 +440,16 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     (tcb=[IDLE-0, IDLE-1]). No emulator or patcher change was needed —
     F1/S7' remain a faster bringup scaffold only. Next: WASM SMP demo
     entry, then peripherals on SMP / real IPC.
+  - DONE 2026-09-11: WASM SMP demo entry. `run_esp32p4smp` glue in
+    `assets/wasm/js/system-pre.js` + "Run ESP32-P4 SMP App" button in
+    `assets/wasm/html/system.html` (incl. enabling it in
+    `onRuntimeInitialized`), serving the stock unpatched dual-core
+    image (`demo/system/esp32p4smp/p4hellov3.ino.{elf,merged.bin}`).
+    Verified headless-Chrome CDP: button click → HELLO_UART_OK in 27 s
+    (node equivalent also green). Note: `tools/cdp_boot_test.py` binds
+    fixed ports 8932/9331 — a killed run leaves a stale dev-server
+    squatting on 8932 and later runs fail with "button never enabled";
+    use fresh ports or clear strays first.
   - Breakthrough 2026-09-11: dual HELLO+TICK on `-C esp32p4smp` with the
     scaffolded image (`tools/p4_mksmp.py` F1+S7', `fw/p4smp/smp.bin`):
     hart0 runs main_task (parks after setup), hart1 runs IDLE-1 + ipc1 +

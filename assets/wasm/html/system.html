@@ -507,6 +507,7 @@
       <button class="btn btn-secondary" id="runEsp32c6Button" disabled>Run ESP32-C6 App</button>
       <button class="btn btn-secondary" id="runEsp32h2Button" disabled>Run ESP32-H2 App</button>
       <button class="btn btn-secondary" id="runEsp32p4Button" disabled>Run ESP32-P4 App</button>
+      <button class="btn btn-secondary" id="runEsp32p4smpButton" disabled>Run ESP32-P4 SMP App</button>
       <button class="btn btn-secondary" id="runEsp32c6I2SButton" disabled>Run ESP32-C6 I2S/GDMA</button>
     </div>
 
@@ -930,6 +931,48 @@
       }
     });
 
+    // ESP32-P4 SMP app mode: dual-core hello sketch (HELLO_UART_OK + TICK
+    // with main on PRO CPU and loopTask on APP CPU) through the
+    // esp32p4smp machine. NOTE: this is the stock unpatched dual-core
+    // build; it needs the SMP model (-C esp32p4smp).
+    const ESP32P4SMP_ELF = 'esp32p4smp/p4hellov3.ino.elf';
+    const ESP32P4SMP_FLASH = 'esp32p4smp/p4hellov3.ino.merged.bin';
+    const runEsp32p4smpButton = document.getElementById('runEsp32p4smpButton');
+
+    runEsp32p4smpButton?.addEventListener('click', async () => {
+      runEsp32p4smpButton.disabled = true;
+      statusText.textContent = 'Downloading ESP32-P4 SMP firmware...';
+      statusBadge.classList.add('loading');
+      if (term) term.write('\x1b[33mDownloading ESP32-P4 SMP firmware...\x1b[0m\r\n');
+
+      try {
+        const [elfData, flashData] = await Promise.all([
+          fetchWithProgress(ESP32P4SMP_ELF, 'App ELF'),
+          fetchWithProgress(ESP32P4SMP_FLASH, 'Flash image'),
+        ]);
+
+        if (term) term.write('\x1b[33mWriting firmware to VFS...\x1b[0m\r\n');
+        try {
+          Module.FS.mkdir('/esp32p4smp');
+        } catch (e) { /* already exists */ }
+        Module.FS.writeFile('/' + ESP32P4SMP_ELF, elfData);
+        Module.FS.writeFile('/' + ESP32P4SMP_FLASH, flashData);
+
+        statusText.textContent = 'Booting ESP32-P4 SMP app...';
+        statusBadge.classList.remove('loading');
+        if (term) term.write('\x1b[33mBooting ESP32-P4 SMP app...\x1b[0m\r\n');
+
+        Module._indirect_rv_halt();
+        Module['run_esp32p4smp'](ESP32P4SMP_ELF, ESP32P4SMP_FLASH);
+      } catch (err) {
+        console.error('ESP32-P4 SMP boot failed:', err);
+        statusText.textContent = 'Download failed';
+        statusBadge.classList.add('loading');
+        if (term) term.write(`\x1b[31mError: ${err.message}\x1b[0m\r\n`);
+        runEsp32p4smpButton.disabled = false;
+      }
+    });
+
     // Fullscreen handler with fallback
     function requestCanvasFullscreen() {
       const canvas = document.getElementById('canvas');
@@ -1149,6 +1192,7 @@
         if (runEsp32c6I2SButton) runEsp32c6I2SButton.disabled = false;
         if (runEsp32h2Button) runEsp32h2Button.disabled = false;
         if (runEsp32p4Button) runEsp32p4Button.disabled = false;
+        if (runEsp32p4smpButton) runEsp32p4smpButton.disabled = false;
         setTimeout(() => ProgressiveLoader.hide(), 300);
       }
     };

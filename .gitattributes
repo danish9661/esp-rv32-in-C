@@ -6,3 +6,6 @@ map.h	text diff=c
 
 # Executables
 *.elf	binary
+
+# Firmware/flash images (demo assets)
+*.bin	binary

@@ -20,5 +20,9 @@ Module["run_esp32p4"] = function (elf_name, flash_name) {
   callMain(["-C", "esp32p4", "-F", "/" + flash_name, "/" + elf_name]);
 };
 
+Module["run_esp32p4smp"] = function (elf_name, flash_name) {
+  callMain(["-C", "esp32p4smp", "-F", "/" + flash_name, "/" + elf_name]);
+};
+
 // Note: Terminal initialization is defined in system.html
 // Module.onRuntimeInitialized is defined in the HTML file
