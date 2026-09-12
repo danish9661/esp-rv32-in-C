@@ -468,6 +468,22 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     readback: `IPC_RES 0 0 3 1 1` + `IPC_DONE` + steady TICKs on
     `-C esp32p4smp`, unpatched. GPIO driven and observed from hart1
     through the existing OUT-echo model.
+  - DONE 2026-09-11: full peripheral matrix on dual-core, unpatched
+    `merged.bin` images, `-C esp32p4smp`, zero faults everywhere:
+    gpio/gptimer/i2c/spi/adc/ledc/twai/pcnt/mcpwm/tsens/rmt/rmtdir/
+    rmtleg/rmtrx/i2s/i2stx/hello/ipc DONE markers all green (uart via
+    native `-U rxfile`: `UART_GOT 4 PING` + `UART_DONE` both unicore
+    and SMP). Key fix this round: per-hart cycle-counter divergence
+    wrapped TIMG/SYSTIMER/LEDC/MCPWM time-delta math (u64 underflow
+    exploded the TG0 counter past its alarm → 200k/s level-locked
+    interrupt storm on hart1 that also starved every LR/SC window);
+    all delta accumulations now clamp future anchors to zero elapsed.
+    Methodology notes: stale Sep-5 `patched.bin`s had masked this
+    (regenerated with current patcher first); `grep -c PATTERN` over
+    counts on CRLF logs — anchor with `$'...\r?$'`; box load swings
+    wall-time 3-10x, use generous timeouts. Follow-up: node/WASM uart
+    RX feeding never worked (`/uartrx` written but rx path unset in
+    WASM) — native `-U` is the working path.
   - Breakthrough 2026-09-11: dual HELLO+TICK on `-C esp32p4smp` with the
     scaffolded image (`tools/p4_mksmp.py` F1+S7', `fw/p4smp/smp.bin`):
     hart0 runs main_task (parks after setup), hart1 runs IDLE-1 + ipc1 +

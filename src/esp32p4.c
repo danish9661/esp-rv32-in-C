@@ -4661,9 +4661,15 @@ void esp32p4_periodic(riscv_t *rv)
                  * advances exactly one tick per f/256 source cycles,
                  * wrapping at the full PWM period */
                 uint64_t span = (uint64_t) f * (uint64_t) period * ratio;
+                /* future-anchor clamp (see TIMG): anchors can be set
+                 * from either hart's cycle counter. */
+                uint64_t lnow = rv->csr_cycle;
                 soc->ledc_timer_frac[t] +=
-                    (rv->csr_cycle - soc->ledc_timer_anchor[t]) * 512ull;
-                soc->ledc_timer_anchor[t] = rv->csr_cycle;
+                    ((lnow >= soc->ledc_timer_anchor[t])
+                         ? lnow - soc->ledc_timer_anchor[t]
+                         : 0u) *
+                    512ull;
+                soc->ledc_timer_anchor[t] = lnow;
                 soc->ledc_timer_frac[t] %= span;
                 uint64_t ticks = soc->ledc_timer_frac[t] / f;
                 uint32_t pos = (uint32_t)(ticks % period);
@@ -4706,8 +4712,13 @@ void esp32p4_periodic(riscv_t *rv)
             if (mod == 0u || period == 0)
                 continue;
             uint64_t step = (uint64_t) ((cfg0 & 0xFFu) + 1u) * clkps * 2ull;
-            soc->mcpwm_frac[t] += rv->csr_cycle - soc->mcpwm_anchor[t];
-            soc->mcpwm_anchor[t] = rv->csr_cycle;
+            /* future-anchor clamp (see TIMG): without it a wrapped
+             * elapsed makes the phase loop below hang the host. */
+            uint64_t mnow = rv->csr_cycle;
+            soc->mcpwm_frac[t] += (mnow >= soc->mcpwm_anchor[t])
+                                      ? mnow - soc->mcpwm_anchor[t]
+                                      : 0u;
+            soc->mcpwm_anchor[t] = mnow;
             uint64_t elapsed = soc->mcpwm_frac[t] / step;
             soc->mcpwm_frac[t] %= step;
             uint32_t phase = soc->mcpwm_phase[t];
@@ -4782,10 +4793,18 @@ void esp32p4_periodic(riscv_t *rv)
         uint32_t div = ((cfg & TIMG_T0_DIVIDER) >> 13) + 1u;
         uint32_t ratio = (cfg & TIMG_T0_USE_XTAL) ? 2u : 1u;
         /* accumulate fractional cycles so the counter advances exactly
-         * one tick per div*ratio cycles regardless of block granularity */
+         * one tick per div*ratio cycles regardless of block granularity.
+         * Clamp: CONFIG/LOAD writes can anchor from the other hart's
+         * cycle counter (harts diverge); a future anchor must yield no
+         * time, never a u64 wrap (which explodes the counter past the
+         * alarm and level-locks the interrupt). */
         uint64_t step = (uint64_t) div * (uint64_t) ratio;
-        soc->timg_frac[g] += rv->csr_cycle - soc->timg_anchor[g];
-        soc->timg_anchor[g] = rv->csr_cycle;
+        uint64_t now = rv->csr_cycle;
+        uint64_t dt = (now >= soc->timg_anchor[g])
+                          ? now - soc->timg_anchor[g]
+                          : 0u;
+        soc->timg_frac[g] += dt;
+        soc->timg_anchor[g] = now;
         uint64_t elapsed = soc->timg_frac[g] / step;
         soc->timg_frac[g] %= step;
         uint64_t cnt;
@@ -4836,7 +4855,10 @@ void esp32p4_periodic(riscv_t *rv)
     }
 
     /* advance SYSTIMER counters (both units free-run on the C6) */
-    uint64_t elapsed = rv->csr_cycle - soc->last_cycle;
+    /* Same future-anchor clamp as TIMG (per-hart cycle divergence). */
+    uint64_t elapsed = (rv->csr_cycle >= soc->last_cycle)
+                           ? rv->csr_cycle - soc->last_cycle
+                           : 0u;
     soc->last_cycle = rv->csr_cycle;
 
     /* The C6 system timer is clocked by XTAL/2.5 = 16 MHz and the RTC
