@@ -450,6 +450,20 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     fixed ports 8932/9331 — a killed run leaves a stale dev-server
     squatting on 8932 and later runs fail with "button never enabled";
     use fresh ports or clear strays first.
+  - DONE 2026-09-11: real IPC on SMP, no FW patches. New sketch
+    `fw/p4ipc/p4ipc.ino` (arduino-cli, `esp32:esp32:esp32p4`,
+    `ChipVariant=postv3`): setup prints HELLO, runs
+    `esp_ipc_call_blocking(1, fn, 1..2)` twice, checks
+    `e1==e2==ESP_OK`, count==3, ran-on-core==1 → `IPC_DONE`, then loop
+    TICKs. Unpatched `merged.bin` on `-C esp32p4smp` prints
+    `IPC_RES 0 0 3 1`, `IPC_DONE`, plus steady TICKs first try — the
+    full crosscore path works with infinite-wait ipc tasks (hart0 send
+    → hart1 crosscore ISR → ipc1 notify-take → fn → ack). This retires
+    the F1/S7' failure theories (they were diagnosed pre-MINTTHRESH /
+    pre-TARGET1 / pre-LRSC-fix); `tools/p4_mksmp.py` marked superseded
+    but kept. Next: SMP peripheral proofs (GPIO blink from loopTask on
+    hart1 is already in the hello sketch's loop; verify host-side via
+    gpio_out plumbing), then WiFi/BLE stubs last.
   - Breakthrough 2026-09-11: dual HELLO+TICK on `-C esp32p4smp` with the
     scaffolded image (`tools/p4_mksmp.py` F1+S7', `fw/p4smp/smp.bin`):
     hart0 runs main_task (parks after setup), hart1 runs IDLE-1 + ipc1 +

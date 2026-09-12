@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Make a P4 Arduino SMP image bootable in the emulator (TEST SCAFFOLDING).
 
+NOTE (2026-09-11): SUPERSEDED for bringup — the unpatched dual-core
+image now boots to HELLO+TICK on -C esp32p4smp with no patches (the
+F1/S7' failure modes were diagnosed on broken emulator code: missing
+MINTTHRESH masking, missing TARGET1 tick, always-succeed SC). Real
+esp_ipc_call traffic also works unpatched (see fw/p4ipc + AGENTS log).
+Kept for reproducing earlier results and as a faster-boot option.
+
 Root cause (verified by tracing): hart0's first scheduler yield
 no-switch-starts ipc0, which blocks forever in ulTaskGenericNotifyTake
 (portMAX_DELAY) while HOLDING xKernelLock. Hart1's first context switch
