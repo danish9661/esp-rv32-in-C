@@ -426,6 +426,20 @@ int main(int argc, char **args)
         return 1;
     }
 
+#ifdef __EMSCRIPTEN__
+    /* Node/browser runners preload host RX bytes at MEMFS /uartrx when
+     * asked (P4_RX_FILE/H2_RX_FILE env); default to it so UART reads
+     * work without extra flags. An explicit -U still overrides. */
+#if RV32_HAS(ESP32_H2)
+    if (!esp32h2_uart_rx_path)
+        esp32h2_uart_rx_path = "/uartrx";
+#endif
+#if RV32_HAS(ESP32_P4)
+    if (!esp32p4_uart_rx_path)
+        esp32p4_uart_rx_path = "/uartrx";
+#endif
+#endif
+
     int run_flag = 0;
 #if !RV32_HAS(SYSTEM_MMIO)
     run_flag |= opt_trace;

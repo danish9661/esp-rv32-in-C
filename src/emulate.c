@@ -2806,16 +2806,16 @@ static void __trap_handler(riscv_t *rv)
 
     /* set to false by sret implementation */
     /* Pause budget: a trap that executes this many instructions without
-     * completing (e.g. a spinlock take-loop inside an ISR on dual-core
-     * SMP) yields back to the outer loop INSTEAD of wedging it.
+     * completing yields back to the outer loop INSTEAD of wedging it.
      * is_trapped stays set, so the trap resumes when this hart is
      * scheduled again; meanwhile the other hart and the periodic
-     * peripheral tick run, letting time flow so the holder can release
-     * and the spinner can acquire (mirrors HW concurrency). Normal ISRs
-     * are far shorter and never hit the budget. */
-#if 1 /* trap pause: yield on spinning traps (SMP bringup) */
+     * peripheral tick run. This is load-bearing on SMP, not a
+     * bringup hack: e.g. hart1's crosscore ISR spins in an infinite
+     * take-retry for a lock hart0 holds, and lockstep emulation would
+     * otherwise never schedule the holder (verified: unpatched dual
+     * boot wedges in early bringup with the budget disabled). Normal
+     * ISRs are far shorter and never hit the budget. */
     unsigned trap_budget = 20000;
-#endif
     while (rv->is_trapped && !rv_has_halted(rv)) {
         uint32_t insn;
     retry_fetch:
@@ -2853,10 +2853,8 @@ static void __trap_handler(riscv_t *rv)
         ir->impl = dispatch_table[ir->opcode];
         rv->compressed = is_compressed(insn);
         ir->impl(rv, ir, rv->csr_cycle, rv->PC);
-#if 1 /* trap pause (see above) */
         if (--trap_budget == 0)
             break; /* pause a spinning trap; resume on next schedule */
-#endif
     }
 
     mpool_free(rv->block_ir_mp, ir);

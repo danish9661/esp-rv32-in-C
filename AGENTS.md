@@ -475,6 +475,17 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     TWAI/TSENS/ADC + DEMO_DONE); H2 hello+TICKs, gpio/gptimer/rmt DONE
     (incl. RMT_TX/WAIT OK). P4 matrix (18 tests incl. SMP) already
     green on this HEAD.
+  - DONE 2026-09-11: trap-pause de-scaffolding verdict: KEEP (it is
+    load-bearing, not a hack). With the budget disabled, unpatched
+    dual boot wedges in early bringup with zero further output: hart1
+    sits in its crosscore ISR's infinite take-retry for a lock hart0
+    holds, and lockstep emulation never schedules the holder (real HW
+    runs both concurrently). Comment reworded to say so; `#if` games
+    removed. Node/WASM uart-RX follow-up also done: `run_p4.js` /
+    `run_h2.js` preload MEMFS `/uartrx` but nothing ever set the rx
+    path in WASM, so RX reads got nothing; `main.c` now defaults both
+    paths to `/uartrx` under `__EMSCRIPTEN__` (`-U` still overrides).
+    Verified node `UART_GOT 4 PING` + DONE unicore and SMP.
   - DONE 2026-09-11: full peripheral matrix on dual-core, unpatched
     `merged.bin` images, `-C esp32p4smp`, zero faults everywhere:
     gpio/gptimer/i2c/spi/adc/ledc/twai/pcnt/mcpwm/tsens/rmt/rmtdir/
