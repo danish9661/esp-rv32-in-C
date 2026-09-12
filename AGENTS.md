@@ -487,12 +487,18 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     file feed + `-U` + `/uartrx` WASM default (+C3/C6 RX_FILE runner
     envs). FS images are prebuilt externally for now (littlefs-python,
     2 MB @0x200000 + boot.py/main.py). KNOWN GAPS (logged, not
-    regressions): FS writes fail (IDF erase path errors pre-SPI with
-    0x105 instantly on C3/C6; reads fine; Arduino NVS silently gets
-    default) — needs a dedicated IDF-flash-op pass; machine.SPI
-    constructor hangs on C3 (likely DMA/SPI2 init poll); long REPL
-    scripts stall past ~250 fed bytes (use main.py for long tests);
-    H2/P4 have no upstream MicroPython port.
+    regressions): FS writes fail — narrowed hard via Arduino NVS
+    sketch with exact codes (INIT 0, OPEN 0x105) plus ELF disassembly:
+    `Page::initialize`'s partition header read returns 0x105 with ZERO
+    SPI traffic, while `esp_flash_get_size` works (so chip_check
+    passes; failure is post-check pre-SPI in the start/lock/verify
+    path, or a silent-zero MMU read masking a fault). Next step when
+    resumed: GDB with Arduino ELF symbols on the writeItem return.
+    Also: machine.SPI constructor hangs on C3 (likely DMA/SPI2 init
+    poll); long REPL inputs stall past ~250 fed bytes (use main.py for
+    long tests, which verified the full matrix on both chips: PIN 1,
+    I2C [80], ADC 1408, TIMER True, PWM_OK, ALL_OK); H2/P4 have no
+    upstream MicroPython port.
   - DONE 2026-09-11: trap-pause de-scaffolding verdict: KEEP (it is
     load-bearing, not a hack). With the budget disabled, unpatched
     dual boot wedges in early bringup with zero further output: hart1
