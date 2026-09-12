@@ -58,3 +58,6 @@ extern void (*esp32c3_gpio_output)(int pin, bool level);
 /* Optional full flash image (bootloader @ 0x0, partitions @ 0x8000,
  * app @ 0x10000). When set, the machine boots from the ROM reset vector. */
 extern const char *esp32c3_flash_image_path;
+
+/* Optional UART RX injection source (FIFO file the host writes to). */
+extern const char *esp32c3_uart_rx_path;

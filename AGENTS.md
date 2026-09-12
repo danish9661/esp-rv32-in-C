@@ -475,6 +475,24 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     TWAI/TSENS/ADC + DEMO_DONE); H2 hello+TICKs, gpio/gptimer/rmt DONE
     (incl. RMT_TX/WAIT OK). P4 matrix (18 tests incl. SMP) already
     green on this HEAD.
+  - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
+    (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
+    interactive (`print(6*7)` → `42`). Peripheral proof via REPL,
+    both chips: Pin OUT+readback, I2C scan `[80]`, ADC read `1408`,
+    Timer init/periodic-callback/deinit, PWM init/deinit — all green.
+    Emulator fixes: flash backing init to erased 0xFF (inisetup empty
+    check); C3 SPI program/erase + missing 0xBB fast-read; C6
+    program-AND semantics + erase; unbuffered stdout (REPL prompt has
+    no newline and was lost in libc buffering on kill); C3 UART RX
+    file feed + `-U` + `/uartrx` WASM default (+C3/C6 RX_FILE runner
+    envs). FS images are prebuilt externally for now (littlefs-python,
+    2 MB @0x200000 + boot.py/main.py). KNOWN GAPS (logged, not
+    regressions): FS writes fail (IDF erase path errors pre-SPI with
+    0x105 instantly on C3/C6; reads fine; Arduino NVS silently gets
+    default) — needs a dedicated IDF-flash-op pass; machine.SPI
+    constructor hangs on C3 (likely DMA/SPI2 init poll); long REPL
+    scripts stall past ~250 fed bytes (use main.py for long tests);
+    H2/P4 have no upstream MicroPython port.
   - DONE 2026-09-11: trap-pause de-scaffolding verdict: KEEP (it is
     load-bearing, not a hack). With the budget disabled, unpatched
     dual boot wedges in early bringup with zero further output: hart1

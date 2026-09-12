@@ -266,6 +266,9 @@ static bool parse_args(int argc, char **args)
 #endif
             break;
         case 'U':
+#if RV32_HAS(ESP32_C3)
+            esp32c3_uart_rx_path = optarg;
+#endif
 #if RV32_HAS(ESP32_C6)
             esp32c6_uart_rx_path = optarg;
 #endif
@@ -421,6 +424,11 @@ int main(int argc, char **args)
 {
     reset_runtime_options();
 
+    /* Unbuffered stdout: guest console bytes (e.g. a REPL prompt with
+     * no trailing newline) must be visible immediately, and no tail
+     * may be lost when the run is killed. stderr already is. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     if (argc == 1 || !parse_args(argc, args)) {
         print_usage(args[0]);
         return 1;
@@ -428,8 +436,16 @@ int main(int argc, char **args)
 
 #ifdef __EMSCRIPTEN__
     /* Node/browser runners preload host RX bytes at MEMFS /uartrx when
-     * asked (P4_RX_FILE/H2_RX_FILE env); default to it so UART reads
-     * work without extra flags. An explicit -U still overrides. */
+     * asked (*_RX_FILE env); default to it so UART reads work without
+     * extra flags. An explicit -U still overrides. */
+#if RV32_HAS(ESP32_C3)
+    if (!esp32c3_uart_rx_path)
+        esp32c3_uart_rx_path = "/uartrx";
+#endif
+#if RV32_HAS(ESP32_C6)
+    if (!esp32c6_uart_rx_path)
+        esp32c6_uart_rx_path = "/uartrx";
+#endif
 #if RV32_HAS(ESP32_H2)
     if (!esp32h2_uart_rx_path)
         esp32h2_uart_rx_path = "/uartrx";

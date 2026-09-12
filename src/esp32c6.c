@@ -488,9 +488,11 @@ esp32c6_t *esp32c6_new(void)
     soc->spi2_jedec = 4;
     soc->gpio_in_prev = 0;
 
-    /* flash backing shared by the i/d-cache window */
-    uint8_t *flash = calloc(1, C6_FLASH_SIZE);
+    /* flash backing shared by the i/d-cache window. Erased flash
+     * reads 0xFF (real HW); empty checks and littlefs rely on it. */
+    uint8_t *flash = malloc(C6_FLASH_SIZE);
     assert(flash);
+    memset(flash, 0xFF, C6_FLASH_SIZE);
 
     esp32_add_region(soc, C6_SRAM_BASE, C6_SRAM_SIZE, ESP32_REG_RAM);
     esp32_add_region(soc, C6_LP_SRAM_BASE, C6_LP_SRAM_SIZE, ESP32_REG_RAM);
@@ -2441,9 +2443,38 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 if (faddr < C6_FLASH_SIZE)
                     memcpy(w, fi->data + faddr, nbytes);
             } else if (user & 0x08000000u) {
-                /* USR_MOSI: write data from W0 */
-                if (faddr < C6_FLASH_SIZE)
-                    memcpy(fi->data + faddr, w, nbytes);
+                /* USR_MOSI: program data from W0 (flash can only
+                 * clear bits: AND. Length from MOSI_DLEN). */
+                uint32_t mosi =
+                    (mmio32[(base + 0x2Cu) >> 2] & 0x3FFu) + 1u;
+                uint32_t wn = (mosi + 7u) / 8u;
+                if (wn > 64u)
+                    wn = 64u;
+                uint8_t *wb = (uint8_t *) w;
+                for (uint32_t i = 0; i < wn; i++)
+                    if (faddr + i < C6_FLASH_SIZE)
+                        fi->data[faddr + i] &= wb[i];
+                soc->flash_sr &= ~0x02u; /* program clears WEL */
+            } else if (cmd == 0x20u || cmd == 0x52u || cmd == 0xD8u ||
+                       cmd == 0x60u || cmd == 0xC7u) {
+                /* erase to 0xFF: 4K sector / 32K / 64K block / chip */
+                uint32_t len = C6_FLASH_SIZE, ebase = 0;
+                if (cmd == 0x20u) {
+                    len = 4096u;
+                    ebase = faddr & ~4095u;
+                } else if (cmd == 0x52u) {
+                    len = 32768u;
+                    ebase = faddr & ~32767u;
+                } else if (cmd == 0xD8u) {
+                    len = 65536u;
+                    ebase = faddr & ~65535u;
+                }
+                if (ebase < C6_FLASH_SIZE) {
+                    if (ebase + len > C6_FLASH_SIZE)
+                        len = C6_FLASH_SIZE - ebase;
+                    memset(fi->data + ebase, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u; /* erase clears WEL */
             } else if (cmd == 0x9Fu) {
                 /* RDID: JEDEC ID (Winbond W25Q32: 0xEF 0x40 0x16) */
                 w[0] = 0x1640EFu;

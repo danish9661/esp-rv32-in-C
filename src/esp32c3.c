@@ -20,6 +20,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "esp32c3.h"
 #include "esp32c3_rom.h"
@@ -216,6 +219,7 @@ struct esp32c3_soc {
     unsigned int uart_rx_tail[2];
     unsigned int uart_tx_cnt[2];
     uint8_t uart_tx_idle[2];
+    int uart_rx_fd; /* host injection fd for port 0, -1 when not open */
 
     /* I2C_EXT (0x60013000): virtual EEPROM device model (mirrors i2c_dev_t) */
     uint32_t i2c_reg[128]; /* 0x200 bytes */
@@ -388,6 +392,7 @@ esp32c3_t *esp32c3_new(void)
     esp32c3_t *soc = calloc(1, sizeof(esp32c3_t));
     assert(soc);
     soc->systimer_conf = 0x40000000u; /* TIMER_UNIT0_WORK_EN default 1 */
+    soc->uart_rx_fd = -1;
 
     /* virtual I2C device: 16-byte EEPROM with a known pattern */
     for (int i = 0; i < 16; i++)
@@ -412,9 +417,12 @@ esp32c3_t *esp32c3_new(void)
         soc->gdma_int_ena[i] = 0;
     }
 
-    /* flash backing shared by i-cache and d-cache windows */
-    uint8_t *flash = calloc(1, C3_FLASH_SIZE);
+    /* flash backing shared by i-cache and d-cache windows. Erased
+     * flash reads 0xFF (real HW); inisetup-style empty checks and
+     * littlefs rely on it. The image is loaded over this below. */
+    uint8_t *flash = malloc(C3_FLASH_SIZE);
     assert(flash);
+    memset(flash, 0xFF, C3_FLASH_SIZE);
 
     esp32_add_region(soc, C3_DRAM_BASE, C3_DRAM_SIZE, ESP32_REG_RAM);
     esp32_add_region(soc, C3_IRAM_BASE, C3_IRAM_SIZE, ESP32_REG_RAM);
@@ -1877,11 +1885,46 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             } else if (cmd == 0x31u) {
                 soc->flash_sr2 = w[0] & 0xFFu; /* WRSR2 */
             } else if (cmd == 0x03u || cmd == 0x0Bu || cmd == 0x3Bu ||
-                       cmd == 0x6Bu || cmd == 0xEBu) {
+                       cmd == 0x6Bu || cmd == 0xBBu || cmd == 0xEBu) {
                 /* flash read commands: copy from flash image */
                 uint32_t faddr = mmio32[0x2004u >> 2];
                 if (faddr < C3_FLASH_SIZE)
                     memcpy(w, fi->data + faddr, nbytes);
+            } else if (cmd == 0x02u || cmd == 0x32u) {
+                /* page program: MOSI bytes from W0, flash can only
+                 * clear bits (AND). Length from MOSI_DLEN. */
+                uint32_t mosi = (mmio32[0x202Cu >> 2] & 0x3FFu) + 1u;
+                uint32_t wn = (mosi + 7u) / 8u;
+                if (wn > 64u)
+                    wn = 64u;
+                uint32_t faddr = mmio32[0x2004u >> 2];
+                uint8_t *wb = (uint8_t *) w;
+                for (uint32_t i = 0; i < wn; i++)
+                    if (faddr + i < C3_FLASH_SIZE)
+                        fi->data[faddr + i] &= wb[i];
+                soc->flash_sr &= ~0x02u; /* program clears WEL */
+            } else if (cmd == 0x20u || cmd == 0x52u || cmd == 0xD8u ||
+                       cmd == 0x60u || cmd == 0xC7u) {
+                /* erase to 0xFF: 4K sector / 32K / 64K block / chip */
+                uint32_t faddr = mmio32[0x2004u >> 2];
+                uint32_t len = C3_FLASH_SIZE;
+                uint32_t base = 0;
+                if (cmd == 0x20u) {
+                    len = 4096u;
+                    base = faddr & ~4095u;
+                } else if (cmd == 0x52u) {
+                    len = 32768u;
+                    base = faddr & ~32767u;
+                } else if (cmd == 0xD8u) {
+                    len = 65536u;
+                    base = faddr & ~65535u;
+                }
+                if (base < C3_FLASH_SIZE) {
+                    if (base + len > C3_FLASH_SIZE)
+                        len = C3_FLASH_SIZE - base;
+                    memset(fi->data + base, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u; /* erase clears WEL */
             }
             if (0) fprintf(stderr, "DBG: spiw0 cmd=0x%02x w0=0x%08x\n", cmd, w[0]);
             mmio32[off >> 2] = 0; /* CMD self-clears when done */
@@ -2746,11 +2789,63 @@ void esp32c3_check_interrupt(riscv_t *rv)
     SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ((1u << 31) | idx), 0);
 }
 
+/* Optional UART RX injection source (FIFO file the host writes to). */
+const char *esp32c3_uart_rx_path = NULL;
+
+/* Drain host-injected UART RX bytes (FIFO file) into the guest RX FIFO. */
+static void esp32c3_uart_rx_poll(esp32c3_t *soc)
+{
+    if (!esp32c3_uart_rx_path)
+        return;
+    if (soc->uart_rx_fd < 0) {
+        soc->uart_rx_fd =
+            open(esp32c3_uart_rx_path, O_RDONLY | O_NONBLOCK);
+        if (soc->uart_rx_fd < 0) {
+            if (errno != ENOENT && errno != EACCES)
+                fprintf(stderr, "esp32c3: uart rx open %s: %s\n",
+                        esp32c3_uart_rx_path, strerror(errno));
+            return;
+        }
+    }
+    for (;;) {
+        unsigned int count = (soc->uart_rx_head[0] - soc->uart_rx_tail[0]) &
+                             (UART_RX_FIFO_SZ - 1u);
+        unsigned int free_slots = UART_RX_FIFO_SZ - 1u - count;
+        unsigned int head = soc->uart_rx_head[0] % UART_RX_FIFO_SZ;
+        unsigned int chunk = UART_RX_FIFO_SZ - head;
+        if (chunk > free_slots)
+            chunk = free_slots;
+        ssize_t n = read(soc->uart_rx_fd, soc->uart_rx[0] + head, chunk);
+        if (n <= 0)
+            break; /* EAGAIN/EOF: nothing more right now */
+        soc->uart_rx_head[0] =
+            (soc->uart_rx_head[0] + n) % UART_RX_FIFO_SZ;
+    }
+}
+
 void esp32c3_periodic(riscv_t *rv)
 {
     esp32c3_t *soc = PRIV(rv)->esp32c3;
     if (!soc)
         return;
+
+    /* feed host-injected bytes into the UART RX FIFO (throttled) */
+    if ((rv->csr_cycle & 0x1FFu) == 0)
+        esp32c3_uart_rx_poll(soc);
+
+    /* UART RX interrupt: bytes are waiting and the driver armed
+     * RXFIFO_TOUT (real HW fires it after rx_tout_thrhd idle bit times;
+     * the model fires it immediately, the ISR then drains the FIFO). */
+    {
+        uint32_t *mmio32 = (uint32_t *) soc->mmio;
+        uint32_t *raw = &mmio32[UART_INT_RAW_REG >> 2];
+        if (soc->uart_rx_head[0] != soc->uart_rx_tail[0] &&
+            (mmio32[UART_INT_ENA_REG >> 2] & UART_RXFIFO_TOUT_BIT) &&
+            !(*raw & UART_RXFIFO_TOUT_BIT)) {
+            *raw |= UART_RXFIFO_TOUT_BIT;
+            soc->intc_status |= ((unsigned __int128) 1) << C3_UART0_INTR_SOURCE;
+        }
+    }
 
     /* advance SYSTIMER counters (both units free-run on the C3) */
     uint64_t elapsed = rv->csr_cycle - soc->last_cycle;
