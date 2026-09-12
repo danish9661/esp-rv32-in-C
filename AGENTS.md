@@ -468,6 +468,13 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     readback: `IPC_RES 0 0 3 1 1` + `IPC_DONE` + steady TICKs on
     `-C esp32p4smp`, unpatched. GPIO driven and observed from hart1
     through the existing OUT-echo model.
+  - DONE 2026-09-11: cross-chip regression after the shared-core
+    changes (value-based LR/SC, trap-pause budget, MINTSTATUS/
+    MINTTHRESH CSRs). All green, zero faults: C3 esp32test blink
+    stable 45 s; C6 demotest full report (PCNT/LEDC/MCPWM/RMT/I2C/SPI/
+    TWAI/TSENS/ADC + DEMO_DONE); H2 hello+TICKs, gpio/gptimer/rmt DONE
+    (incl. RMT_TX/WAIT OK). P4 matrix (18 tests incl. SMP) already
+    green on this HEAD.
   - DONE 2026-09-11: full peripheral matrix on dual-core, unpatched
     `merged.bin` images, `-C esp32p4smp`, zero faults everywhere:
     gpio/gptimer/i2c/spi/adc/ledc/twai/pcnt/mcpwm/tsens/rmt/rmtdir/
