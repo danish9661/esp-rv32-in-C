@@ -461,9 +461,13 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     → hart1 crosscore ISR → ipc1 notify-take → fn → ack). This retires
     the F1/S7' failure theories (they were diagnosed pre-MINTTHRESH /
     pre-TARGET1 / pre-LRSC-fix); `tools/p4_mksmp.py` marked superseded
-    but kept. Next: SMP peripheral proofs (GPIO blink from loopTask on
-    hart1 is already in the hello sketch's loop; verify host-side via
-    gpio_out plumbing), then WiFi/BLE stubs last.
+    but kept. Next: SMP peripheral proof (below), then WiFi/BLE stubs last.
+  - DONE 2026-09-11: SMP peripheral proof, no emulator change needed.
+    Extended `fw/p4ipc` so the APP-core `ipc_fn` drives GPIO8 high,
+    reads back the pad input, and drives low; setup requires the
+    readback: `IPC_RES 0 0 3 1 1` + `IPC_DONE` + steady TICKs on
+    `-C esp32p4smp`, unpatched. GPIO driven and observed from hart1
+    through the existing OUT-echo model.
   - Breakthrough 2026-09-11: dual HELLO+TICK on `-C esp32p4smp` with the
     scaffolded image (`tools/p4_mksmp.py` F1+S7', `fw/p4smp/smp.bin`):
     hart0 runs main_task (parks after setup), hart1 runs IDLE-1 + ipc1 +
