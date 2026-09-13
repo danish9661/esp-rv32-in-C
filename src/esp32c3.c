@@ -37,6 +37,12 @@
 
 /* (map constants now live in esp32c3.h) */
 
+/* SPI2 TRANS_DONE is BIT(12) of dma_int_raw (per esp32c3 spi_struct.h
+ * field order). It is kept active when idle so enabling the interrupt
+ * invokes the ISR (IDF spi_master relies on this to kick interrupt
+ * transactions); polling reads the raw bit directly. */
+#define C3_SPI2_TRANS_DONE_MASK 0x1000u
+
 /* ------------------------------------------------------------------ */
 /* Memory model                                                        */
 /* ------------------------------------------------------------------ */
@@ -268,6 +274,7 @@ struct esp32c3_soc {
     uint32_t gdma_in_eof_des[3];     /* completed IN descriptor (for eof_des_addr) */
     uint8_t  gdma_out_run[3];
     uint8_t  gdma_in_run[3];
+    uint8_t  gdma_out_last; /* most recently started OUT channel (SPI pairing) */
     uint32_t gdma_out_desc_buf[3];
     uint32_t gdma_out_desc_len[3];
     uint32_t gdma_out_next_addr[3];
@@ -352,8 +359,11 @@ static uint8_t *esp32c3_dma_ptr(esp32c3_t *soc, uint32_t addr)
     return r->data + (addr - r->base);
 }
 
-/* Load one DMA descriptor (16 bytes: DW0 size/len/owner/eof, DW1 buffer
- * pointer, DW2 next pointer). Returns 0 if the descriptor is not in RAM. */
+/* Load one DMA descriptor (12 bytes, dma_descriptor_align4_t: DW0
+ * size[11:0]/length[23:12]/suc_eof[30]/owner[31], DW1 buffer, DW2 next).
+ * Returns 0 if the descriptor is not in RAM. Note the length field is
+ * bits[23:12] (NOT [11:0]): using size would send 0 bytes for RX descs
+ * (setup_link sets only size for RX) and mis-size everything else. */
 static int esp32c3_gdma_load_desc(esp32c3_t *soc, uint32_t desc_addr,
                                   uint32_t *buf, uint32_t *len, uint32_t *next)
 {
@@ -365,7 +375,11 @@ static int esp32c3_gdma_load_desc(esp32c3_t *soc, uint32_t desc_addr,
     memcpy(&dw1, d + 4, 4);
     memcpy(&dw2, d + 8, 4);
     *buf = dw1;
-    *len = (dw0 >> 12) & 0xFFFu;
+    /* TX descs carry length; RX descs carry only size (setup_link leaves
+     * length 0), so use whichever is nonzero. */
+    uint32_t size = dw0 & 0xFFFu;
+    uint32_t length = (dw0 >> 12) & 0xFFFu;
+    *len = length ? length : size;
     *next = dw2;
     return 1;
 }
@@ -402,6 +416,8 @@ esp32c3_t *esp32c3_new(void)
     soc->spi2_jedec = 0;
     for (int i = 0; i < 16; i++)
         soc->spi2_dev_mem[i] = 0xA0 + i;
+    /* SPI2 TRANS_DONE kept active when idle (see mask comment) */
+    soc->spi2_reg[0x3Cu >> 2] = C3_SPI2_TRANS_DONE_MASK;
     /* TWAI0: bus starts in reset mode (mode[0]=1) */
     soc->twai_reg[0] = 1u;
     soc->twai_rx_delivered = 0;
@@ -508,6 +524,14 @@ esp32c3_t *esp32c3_new(void)
 #define C3_I2C_EXT0_INTR_SOURCE 29u
 #define C3_TWAI_INTR_SOURCE 25u
 #define C3_SPI2_INTR_SOURCE 19u
+static void esp32c3_spi2_int_update(esp32c3_t *soc)
+{
+    uint32_t st = soc->spi2_reg[0x3Cu >> 2] & soc->spi2_reg[0x34u >> 2];
+    if (st)
+        soc->intc_status |= ((unsigned __int128) 1) << C3_SPI2_INTR_SOURCE;
+    else
+        soc->intc_status &= ~(((unsigned __int128) 1) << C3_SPI2_INTR_SOURCE);
+}
 #define C3_DMA_CH0_INTR_SOURCE 44u
 #define C3_DMA_CH1_INTR_SOURCE 45u
 #define C3_DMA_CH2_INTR_SOURCE 46u
@@ -529,24 +553,48 @@ esp32c3_t *esp32c3_new(void)
 /* I2S0 (0x6002D000): TX/RX serial audio interface */
 #define C3_I2S0_BASE 0x6002D000u
 #define C3_I2S0_SIZE 0x80u
-/* GDMA (0x6003F000): 3 channels, OUT(TX)=source / IN(RX)=dest */
+/* GDMA (0x6003F000): 3 channels, OUT(TX)=source / IN(RX)=dest.
+ * Offsets follow gdma_reg.h exactly: INT regs 0x00/0x04/0x08/0x0C per
+ * channel (stride 0x10); per-channel blocks stride 0xC0: IN_CONF0 0x70,
+ * IN_LINK 0x80, IN_PERI_SEL 0xA0, OUT_CONF0 0xD0, OUT_LINK 0xE0,
+ * OUT_PERI_SEL 0x100 (+0xC0 per channel). */
 #define C3_GDMA_BASE 0x6003F000u
-#define C3_GDMA_SIZE 0x2B0u
+#define C3_GDMA_SIZE 0x2C0u
 #define GDMA_CHAN_INT_STRIDE 0x10u
 #define GDMA_CHAN_BLK_STRIDE 0xC0u
+#define GDMA_IN_CONF0_OFF 0x70u
+#define GDMA_IN_LINK_OFF 0x80u
+#define GDMA_IN_PERI_SEL_OFF 0xA0u
+#define GDMA_OUT_CONF0_OFF 0xD0u
+#define GDMA_OUT_LINK_OFF 0xE0u
+#define GDMA_OUT_PERI_SEL_OFF 0x100u
 #define GDMA_OUT_EOF_BIT 4u
 #define GDMA_IN_SUC_EOF_BIT 1u
 /* GDMA peripheral select for the AES accelerator (ESP32-C3). Both the OUT
  * (data into AES) and IN (data out of AES) channels use this peri_sel. */
 #define C3_GDMA_PERI_AES 6u
+/* GDMA peripheral select for SPI2 (gdma_channel.h: SOC_GDMA_TRIG_PERIPH_SPI2).
+ * The SPI driver connects both its TX and RX GDMA channels to SPI2; the
+ * model uses peri_sel to pair SPI DMA descriptors with the SPI transfer. */
+#define C3_GDMA_PERI_SPI2 0u
 #define GDMA_OUTLINK_START_BIT 21u
 #define GDMA_OUTLINK_STOP_BIT 20u
 #define GDMA_INLINK_START_BIT 22u
 #define GDMA_INLINK_STOP_BIT 21u
 #define GDMA_LINK_ADDR_MASK 0x000FFFFFu
-/* GDMA addresses memory in the 0x3FC00000-0x3FCFFFFF window; the link
- * register holds bits[19:0] and the hardware prepends 0x3FC00000. */
+/* GDMA descriptors live in DRAM (heap_caps MALLOC_CAP_DMA: SOC_DMA_LOW
+ * 0x3FC80000 .. SOC_DMA_HIGH 0x3FCE0000). gdma_start programs the FULL
+ * descriptor address into the link register (set_desc_addr writes the
+ * whole addr field). If the link value already looks like a full DRAM
+ * address use it as is, else prepend C3_GDMA_MEM_BASE (legacy window). */
 #define C3_GDMA_MEM_BASE 0x3FC00000u
+#define C3_GDMA_DRAM_LOW 0x3FC80000u
+static uint32_t esp32c3_gdma_link_addr(uint32_t link)
+{
+    if (link >= C3_GDMA_DRAM_LOW)
+        return link;
+    return C3_GDMA_MEM_BASE + (link & GDMA_LINK_ADDR_MASK);
+}
 /* Virtual I2C device: 16-byte EEPROM with a known pattern */
 #define C3_I2C_DEV_ADDR 0x50u
 
@@ -891,8 +939,8 @@ static void esp32c3_aes_run_dma(esp32c3_t *soc, int ch_out)
         if (soc->gdma_in_peri_sel[ch] == C3_GDMA_PERI_AES)
             ch_in = ch;
 
-    uint32_t in_cur = C3_GDMA_MEM_BASE + (soc->gdma_out_link[ch_out] & GDMA_LINK_ADDR_MASK);
-    uint32_t out_cur = ch_in >= 0 ? (C3_GDMA_MEM_BASE + (soc->gdma_in_link[ch_in] & GDMA_LINK_ADDR_MASK)) : 0;
+    uint32_t in_cur = esp32c3_gdma_link_addr(soc->gdma_out_link[ch_out]);
+    uint32_t out_cur = ch_in >= 0 ? esp32c3_gdma_link_addr(soc->gdma_in_link[ch_in]) : 0;
 
     for (int blk = 0; blk < 1; blk++) {
         if (!in_cur || !out_cur) break;
@@ -1161,13 +1209,17 @@ have_seen:
         }
         return *r;
     }
-    /* SPI2 (GPSPI2, 0x60024000-0x60024100) */
+    /* SPI2 (GPSPI2, 0x60024000-0x60024100). GPSPI int regs (NOT the
+     * MEM-SPI layout): 0x30 DMA_CONF, 0x34 DMA_INT_ENA, 0x38 DMA_INT_CLR,
+     * 0x3C DMA_INT_RAW, 0x40 DMA_INT_ST. TRANS_DONE is BIT(12).
+     * data_buf W0..W15 at 0x98..0xD4: reads return the response words,
+     * writes store TX words (spi_ll_write/read_buffer word[x/32]). */
     if (addr >= C3_PERIPH_BASE + 0x24000u &&
         addr < C3_PERIPH_BASE + 0x24100u) {
         uint32_t *r = soc->spi2_reg + ((addr - C3_PERIPH_BASE - 0x24000u) >> 2);
-        if (addr == C3_PERIPH_BASE + 0x2403cu) /* dma_int_raw = raw & ena */
-            return soc->spi2_reg[0x3c >> 2] &
-                   soc->spi2_reg[0x38u >> 2];
+        if (addr == C3_PERIPH_BASE + 0x24040u) /* int_st = raw & ena */
+            return soc->spi2_reg[0x3Cu >> 2] &
+                   soc->spi2_reg[0x34u >> 2];
         return *r;
     }
     /* TWAI0 (CAN, 0x6002B000-0x6002B100) */
@@ -1193,7 +1245,11 @@ have_seen:
         }
         return soc->twai_reg[off >> 2];
     }
-    /* GDMA (0x6003F000-0x6003F2B0): per-channel INT + IN/OUT blocks */
+    /* GDMA (0x6003F000, per gdma_reg.h): per-channel INT (stride 0x10)
+     * + per-channel blocks (stride 0xC0): IN_CONF0 0x70, IN_LINK 0x80,
+     * IN_PERI_SEL 0xA0, OUT_CONF0 0xD0, OUT_LINK 0xE0, OUT_PERI_SEL 0x100.
+     * IN/OUT link regs hold bits[19:0] of the descriptor address; the
+     * hardware prepends 0x3FC00000. */
     if (addr >= C3_GDMA_BASE && addr < C3_GDMA_BASE + C3_GDMA_SIZE) {
         uint32_t o = addr - C3_GDMA_BASE;
         if (o < 3u * GDMA_CHAN_INT_STRIDE) { /* channel INT registers */
@@ -1209,14 +1265,30 @@ have_seen:
             return 0; /* reserved gap */
         uint32_t c = (o - 0x70u) / GDMA_CHAN_BLK_STRIDE;
         uint32_t r = o - 0x70u - c * GDMA_CHAN_BLK_STRIDE;
-        if (r < 0x60u) { /* IN block */
-            switch (r) {
-            case 0x00: return soc->gdma_in_conf0[c];
-            case 0x04: return soc->gdma_in_conf1[c];
+        if (c < 3u && r == GDMA_IN_LINK_OFF - 0x70u)
+            return (soc->gdma_in_link[c] & GDMA_LINK_ADDR_MASK) |
+                   (soc->gdma_in_run[c] ? 0u : (1u << 24)); /* park when idle */
+        if (c < 3u && r == GDMA_OUT_LINK_OFF - 0x70u)
+            return (soc->gdma_out_link[c] & GDMA_LINK_ADDR_MASK) |
+                   (soc->gdma_out_run[c] ? 0u : (1u << 23)); /* park when idle */
+        if (c < 3u && r == GDMA_IN_PERI_SEL_OFF - 0x70u)
+            return soc->gdma_in_peri_sel[c];
+        if (c < 3u && r == GDMA_OUT_PERI_SEL_OFF - 0x70u)
+            return soc->gdma_out_peri_sel[c];
+        if (c < 3u && r == GDMA_IN_CONF0_OFF - 0x70u)
+            return soc->gdma_in_conf0[c];
+        if (c < 3u && r == GDMA_OUT_CONF0_OFF - 0x70u)
+            return soc->gdma_out_conf0[c];
+        uint32_t cc = c;
+        uint32_t rr = r;
+        if (rr < 0x60u) { /* IN block */
+            switch (rr) {
+            case 0x00: return soc->gdma_in_conf0[cc];
+            case 0x04: return soc->gdma_in_conf1[cc];
             case 0x08: return 0x02u; /* INFIFO_STATUS: empty (bit1=1) */
             case 0x0C: return 0;    /* IN_POP: pop trigger, return 0 */
-            case 0x10: return soc->gdma_in_link[c];
-            case 0x14: return soc->gdma_in_run[c] ? 0x08000000u : 0; /* state */
+            case 0x10: return soc->gdma_in_link[cc];
+            case 0x14: return soc->gdma_in_run[cc] ? 0x08000000u : 0; /* state */
             case 0x18: return soc->gdma_in_eof_des[c]; /* suc_eof des addr */
             case 0x20: return soc->gdma_in_dscr[c];
             case 0x24: return soc->gdma_in_desc_buf[c]; /* dscr_bf0 */
@@ -1242,7 +1314,8 @@ have_seen:
     }
     /* SPI0/SPI1 (flash) */
     if (addr < C3_PERIPH_BASE + 0x4000u) {
-        if (addr == C3_PERIPH_BASE + 0x2000u)
+        if (addr == C3_PERIPH_BASE + 0x2000u ||
+            addr == C3_PERIPH_BASE + 0x3000u)
             return 0; /* SPI_CMD always reads done (self-clears) */
         if (addr == C3_PERIPH_BASE + 0x202Cu)
             return 0x2u; /* SPI0 status: flash ready */
@@ -1511,6 +1584,89 @@ have_seen:
     return mmio32[off >> 2];
 }
 
+/* Service one SPI flash transaction for the MEM (0x2000) and user
+ * (0x3000) paths, which share encoding (USER2 low bits = command,
+ * ADDR/MOSI_DLEN/MISO_DLEN/W0 at the same sub-offsets). w points at
+ * the path's W0..W15 window; wb/wlen is the MOSI payload captured
+ * BEFORE W0 is cleared for the response (program data would otherwise
+ * be destroyed, as would WRSR bytes). rn is the MISO response length.
+ * Flash can only clear bits, so program ANDs. */
+static void esp32c3_spiflash_exec(esp32c3_t *soc, uint32_t cmd,
+                                  uint32_t faddr, uint32_t *w, uint32_t rn,
+                                  const uint8_t *wb, uint32_t wn)
+{
+    esp32_region_t *fi = esp32_find_region(soc, C3_FLASH_D_BASE);
+    uint32_t w0orig = w[0]; /* pre-clear W0: WRSR below must observe the
+                             * same bytes the historical inline code saw
+                             * after its memset (boot depends on it!) */
+    memset(w, 0, rn);
+    if (cmd == 0x9Fu) {
+        /* RDID: JEDEC ID (Winbond W25Q32: 0xEF 0x40 0x16) */
+        w[0] = 0x1640EFu;
+    } else if (cmd == 0x05u) {
+        w[0] = soc->flash_sr; /* RDSR */
+    } else if (cmd == 0x35u) {
+        w[0] = soc->flash_sr2; /* RDSR2 */
+    } else if (cmd == 0x06u) {
+        soc->flash_sr |= 0x02u; /* WREN: set WEL */
+    } else if (cmd == 0x04u) {
+        soc->flash_sr &= ~0x02u; /* WRDI: clear WEL */
+    } else if (cmd == 0x01u) {
+        /* WRSR: replicate the historical inline semantics exactly: it
+         * read w[0] AFTER memset(w,0,rn), so the low rn bytes came out
+         * zero and the rest were stale W0 residue (boot depends on the
+         * residue in sr2!). */
+        uint32_t w0z = w0orig;
+        if (rn >= 1)
+            w0z &= ~0xFFu;
+        if (rn >= 2)
+            w0z &= ~0xFF00u;
+        if (rn >= 3)
+            w0z &= ~0xFF0000u;
+        if (rn >= 4)
+            w0z &= ~0xFF000000u;
+        soc->flash_sr = w0z & 0xFFu;
+        soc->flash_sr2 = (w0z >> 8) & 0xFFu;
+        soc->flash_sr &= ~0x02u; /* WRSR clears WEL */
+    } else if (cmd == 0x31u) {
+        /* WRSR2 */
+        if (wn > 0)
+            soc->flash_sr2 = wb[0];
+    } else if (cmd == 0x03u || cmd == 0x0Bu || cmd == 0x3Bu ||
+               cmd == 0x6Bu || cmd == 0xBBu || cmd == 0xEBu) {
+        /* flash read commands: copy from flash image */
+        if (faddr < C3_FLASH_SIZE)
+            memcpy(w, fi->data + faddr, rn);
+    } else if (cmd == 0x02u || cmd == 0x32u) {
+        /* page program: MOSI payload, flash can only clear bits */
+        for (uint32_t i = 0; i < wn; i++)
+            if (faddr + i < C3_FLASH_SIZE)
+                fi->data[faddr + i] &= wb[i];
+        soc->flash_sr &= ~0x02u; /* program clears WEL */
+    } else if (cmd == 0x20u || cmd == 0x52u || cmd == 0xD8u ||
+               cmd == 0x60u || cmd == 0xC7u) {
+        /* erase to 0xFF: 4K sector / 32K / 64K block / chip */
+        uint32_t len = C3_FLASH_SIZE;
+        uint32_t base = 0;
+        if (cmd == 0x20u) {
+            len = 4096u;
+            base = faddr & ~4095u;
+        } else if (cmd == 0x52u) {
+            len = 32768u;
+            base = faddr & ~32767u;
+        } else if (cmd == 0xD8u) {
+            len = 65536u;
+            base = faddr & ~65535u;
+        }
+        if (base < C3_FLASH_SIZE) {
+            if (base + len > C3_FLASH_SIZE)
+                len = C3_FLASH_SIZE - base;
+            memset(fi->data + base, 0xFF, len);
+        }
+        soc->flash_sr &= ~0x02u; /* erase clears WEL */
+    }
+}
+
 static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
 {
     esp32c3_t *soc = PRIV(rv)->esp32c3;
@@ -1696,16 +1852,38 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         }
         return;
     }
-    /* SPI2 (GPSPI2, 0x60024000-0x60024100) */
+    /* SPI2 (GPSPI2, 0x60024000-0x60024100). GPSPI int regs (NOT the
+     * MEM-SPI layout): 0x30 DMA_CONF, 0x34 DMA_INT_ENA, 0x38 DMA_INT_CLR,
+     * 0x3C DMA_INT_RAW, 0x40 DMA_INT_ST. TRANS_DONE is BIT(12).
+     * NOTE: raw/ena/clr here are BYTE-ADDRESSED register offsets into
+     * spi2_reg (no separate shadow): the driver writes ENA with only the
+     * trans_done bit (1<<12), so raw & ena must preserve bit 12. */
     if (addr >= C3_PERIPH_BASE + 0x24000u &&
         addr < C3_PERIPH_BASE + 0x24100u) {
         uint32_t *r = soc->spi2_reg + ((addr - C3_PERIPH_BASE - 0x24000u) >> 2);
         if (addr == C3_PERIPH_BASE + 0x24000u) { /* cmd */
             *r = val & ~(1u << 23); /* update self-clears: config applied */
-            if (val & (1u << 24))   /* usr: transfer begins */
+            if (val & (1u << 24)) { /* usr: transfer begins */
                 soc->spi2_transfer_pending = 1;
-        } else if (addr == C3_PERIPH_BASE + 0x24038u) { /* dma_int_clr */
-            soc->spi2_reg[0x3c >> 2] &= ~val; /* clear raw interrupt bits */
+                /* TRANS_DONE deasserts while busy */
+                soc->spi2_reg[0x3Cu >> 2] &= ~C3_SPI2_TRANS_DONE_MASK;
+                esp32c3_spi2_int_update(soc);
+            }
+        } else if (addr == C3_PERIPH_BASE + 0x24030u) { /* dma_conf */
+            /* Bit map per spi_struct.h: reserved0[17:0], seg_trans_en 18,
+             * rx_seg_clr 19, tx_seg_clr 20, rx_eof 21, reserved 22-26,
+             * dma_rx_ena 27, dma_tx_ena 28, afifo rst bits 29-31. */
+            *r = val;
+        } else if (addr == C3_PERIPH_BASE + 0x24038u) { /* int_clr */
+            soc->spi2_reg[0x3Cu >> 2] &= ~val; /* clear raw interrupt bits */
+            esp32c3_spi2_int_update(soc);
+        } else if (addr == C3_PERIPH_BASE + 0x24034u) { /* int_ena */
+            *r = val;
+            esp32c3_spi2_int_update(soc);
+        } else if (addr == C3_PERIPH_BASE + 0x2403cu) { /* raw: RW */
+            *r = val;
+            esp32c3_spi2_int_update(soc);
+        } else if (addr == C3_PERIPH_BASE + 0x24040u) { /* int_st RO */
         } else {
             *r = val;
         }
@@ -1740,7 +1918,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         }
         return;
     }
-    /* GDMA (0x6003F000-0x6003F2B0) */
+    /* GDMA (0x6003F000, per gdma_reg.h): INT regs, then per-channel
+     * blocks (stride 0xC0): IN_CONF0 0x70, IN_LINK 0x80, IN_PERI_SEL 0xA0,
+     * OUT_CONF0 0xD0, OUT_LINK 0xE0, OUT_PERI_SEL 0x100. Link regs hold
+     * bits[19:0] of the descriptor address (prepend 0x3FC00000). */
     if (addr >= C3_GDMA_BASE && addr < C3_GDMA_BASE + C3_GDMA_SIZE) {
         uint32_t o = addr - C3_GDMA_BASE;
         if (o < 3u * GDMA_CHAN_INT_STRIDE) { /* channel INT registers */
@@ -1762,171 +1943,228 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         if (o < 0x70u)
             return; /* reserved gap */
         uint32_t c = (o - 0x70u) / GDMA_CHAN_BLK_STRIDE;
+        if (c > 2u)
+            return;
         uint32_t r = o - 0x70u - c * GDMA_CHAN_BLK_STRIDE;
-        if (r < 0x60u) { /* IN block */
-            switch (r) {
-            case 0x00: /* in_conf0 */
-                soc->gdma_in_conf0[c] = val & ~1u; /* in_rst is WT */
-                if (val & 1u) { /* reset the walker */
-                    soc->gdma_in_run[c] = 0;
-                    soc->gdma_in_dscr[c] = 0;
+        if (r == GDMA_IN_LINK_OFF - 0x70u) { /* in_link */
+            soc->gdma_in_link[c] = val & ~0x1F00000u; /* addr + auto_ret */
+            if (val & (1u << GDMA_INLINK_START_BIT)) {
+                soc->gdma_in_dscr[c] = esp32c3_gdma_link_addr(soc->gdma_in_link[c]);
+                if (esp32c3_gdma_load_desc(soc, soc->gdma_in_dscr[c],
+                        &soc->gdma_in_desc_buf[c],
+                        &soc->gdma_in_desc_len[c],
+                        &soc->gdma_in_next_addr[c]))
+                    soc->gdma_in_run[c] = 1;
+                soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
+                soc->gdma_out_conf0[c] &= ~(1u << 31);
+                if (soc->gdma_out_run[c]) { /* mem2mem pair ready */
+                    soc->gdma_m2m_pending[c] = 1;
+                    soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
+                } else {
+                    /* Unpaired peripheral DMA: schedule completion */
+                    soc->gdma_m2m_pending[c] = 1;
+                    soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
                 }
-                return;
-            case 0x04: soc->gdma_in_conf1[c] = val; return;
-            case 0x10: /* in_link */
-                soc->gdma_in_link[c] = val & ~0xF00000u;
-                if (val & (1u << GDMA_INLINK_START_BIT)) {
-                    soc->gdma_in_dscr[c] =
-                        C3_GDMA_MEM_BASE + (soc->gdma_in_link[c] &
-                                        GDMA_LINK_ADDR_MASK);
-                    if (esp32c3_gdma_load_desc(soc, soc->gdma_in_dscr[c],
-                            &soc->gdma_in_desc_buf[c],
-                            &soc->gdma_in_desc_len[c],
-                            &soc->gdma_in_next_addr[c]))
-                        soc->gdma_in_run[c] = 1;
-                    soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
-                    soc->gdma_out_conf0[c] &= ~(1u << 31);
-                    if (soc->gdma_out_run[c]) { /* mem2mem pair ready */
-                        soc->gdma_m2m_pending[c] = 1;
-                        soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
-                    } else {
-                        /* Unpaired peripheral DMA: schedule completion */
-                        soc->gdma_m2m_pending[c] = 1;
-                        soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
-                    }
-                } else if (val & (1u << GDMA_INLINK_STOP_BIT)) {
-                    soc->gdma_in_run[c] = 0;
-                }
-                return;
-            case 0x30: soc->gdma_in_peri_sel[c] = val; return;
-            default: return;
+            } else if (val & (1u << GDMA_INLINK_STOP_BIT)) {
+                soc->gdma_in_run[c] = 0;
             }
-        } else { /* OUT block (r >= 0x60) */
-            uint32_t r2 = r - 0x60u;
-            switch (r2) {
-            case 0x00: /* out_conf0 */
-                soc->gdma_out_conf0[c] = val & ~1u; /* out_rst is WT */
-                if (val & 1u) {
-                    soc->gdma_out_run[c] = 0;
-                    soc->gdma_out_dscr[c] = 0;
-                }
-                return;
-            case 0x04: soc->gdma_out_conf1[c] = val; return;
-            case 0x10: /* out_link */
-                soc->gdma_out_link[c] = val & ~0x700000u;
-                if (val & (1u << GDMA_OUTLINK_START_BIT)) {
-                    soc->gdma_out_dscr[c] =
-                        C3_GDMA_MEM_BASE + (soc->gdma_out_link[c] &
-                                        GDMA_LINK_ADDR_MASK);
-                    int ok = esp32c3_gdma_load_desc(soc, soc->gdma_out_dscr[c],
-                            &soc->gdma_out_desc_buf[c],
-                            &soc->gdma_out_desc_len[c],
-                            &soc->gdma_out_next_addr[c]);
-                    if (!ok) {
-                        /* load failed — out_run stays 0 */
-                    }
-                    if (ok)
-                        soc->gdma_out_run[c] = 1;
-                    soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
-                    soc->gdma_out_conf0[c] &= ~(1u << 31);
-                    if (soc->gdma_in_run[c]) { /* mem2mem pair ready */
-                        soc->gdma_m2m_pending[c] = 1;
-                        soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
-                    } else {
-                        /* Unpaired peripheral DMA: schedule completion */
-                        soc->gdma_m2m_pending[c] = 1;
-                        soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
-                    }
-                } else if (val & (1u << GDMA_OUTLINK_STOP_BIT)) {
-                    soc->gdma_out_run[c] = 0;
-                }
-                return;
-            case 0x30: soc->gdma_out_peri_sel[c] = val; return;
-            default: return;
-            }
+            return;
         }
+        if (r == GDMA_IN_CONF0_OFF - 0x70u) { /* in_conf0 */
+            soc->gdma_in_conf0[c] = val & ~1u; /* in_rst is WT */
+            if (val & 1u) { /* reset the walker */
+                soc->gdma_in_run[c] = 0;
+                soc->gdma_in_dscr[c] = 0;
+            }
+            return;
+        }
+        if (r == GDMA_IN_CONF0_OFF - 0x70u + 4u) { /* in_conf1 */
+            soc->gdma_in_conf1[c] = val;
+            return;
+        }
+        if (r == GDMA_IN_PERI_SEL_OFF - 0x70u) { /* in_peri_sel */
+            soc->gdma_in_peri_sel[c] = val;
+            return;
+        }
+        if (r == GDMA_OUT_LINK_OFF - 0x70u) { /* out_link */
+            soc->gdma_out_link[c] = val & ~0x700000u; /* addr + stop/restart */
+            if (val & (1u << GDMA_OUTLINK_START_BIT)) {
+                soc->gdma_out_dscr[c] = esp32c3_gdma_link_addr(soc->gdma_out_link[c]);
+                soc->gdma_out_last = c;
+                int ok = esp32c3_gdma_load_desc(soc, soc->gdma_out_dscr[c],
+                        &soc->gdma_out_desc_buf[c],
+                        &soc->gdma_out_desc_len[c],
+                        &soc->gdma_out_next_addr[c]);
+                if (ok)
+                    soc->gdma_out_run[c] = 1;
+                soc->gdma_in_conf0[c] &= ~(1u << 31); /* clear DMA-done */
+                soc->gdma_out_conf0[c] &= ~(1u << 31);
+                if (soc->gdma_in_run[c]) { /* mem2mem pair ready */
+                    soc->gdma_m2m_pending[c] = 1;
+                    soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
+                } else {
+                    /* Unpaired peripheral DMA: schedule completion */
+                    soc->gdma_m2m_pending[c] = 1;
+                    soc->gdma_m2m_done_cycle[c] = rv->csr_cycle + 256u;
+                }
+            } else if (val & (1u << GDMA_OUTLINK_STOP_BIT)) {
+                soc->gdma_out_run[c] = 0;
+            }
+            return;
+        }
+        if (r == GDMA_OUT_CONF0_OFF - 0x70u) { /* out_conf0 */
+            soc->gdma_out_conf0[c] = val & ~1u; /* out_rst is WT */
+            if (val & 1u) {
+                soc->gdma_out_run[c] = 0;
+                soc->gdma_out_dscr[c] = 0;
+            }
+            return;
+        }
+        if (r == GDMA_OUT_CONF0_OFF - 0x70u + 4u) { /* out_conf1 */
+            soc->gdma_out_conf1[c] = val;
+            return;
+        }
+        if (r == GDMA_OUT_PERI_SEL_OFF - 0x70u) { /* out_peri_sel */
+            soc->gdma_out_peri_sel[c] = val;
+            return;
+        }
+        return;
     }
     /* SPI0/SPI1 (flash) */
     if (addr < C3_PERIPH_BASE + 0x4000u) {
         mmio32[off >> 2] = val;
+        if (addr == C3_PERIPH_BASE + 0x2000u ||
+            addr == C3_PERIPH_BASE + 0x3000u) {
+            /* Dedicated-bit ops (HAL path, no USR): WREN/WRDI set/clear
+             * WEL; PP/SE/BE/CE program/erase; RDSR/RDID/READ return data.
+             * The old USR-only trigger missed all of these, so every
+             * flash write failed verification with 0x105 (WEL never set).
+             * CMD bit map (TRM SPI_MEM_CMD): USR=18, CE=22, BE=23,
+             * SE=24, PP=25, WRSR=26, RDSR=27, RDID=28, WRDI=29,
+             * WREN=30, READ=31. */
+            uint32_t base = addr - C3_PERIPH_BASE;
+            uint32_t *w = mmio32 + ((base + 0x58u) >> 2);
+            uint32_t addrreg = mmio32[((base + 0x04u) >> 2)];
+            esp32_region_t *fi =
+                esp32_find_region(soc, C3_FLASH_D_BASE);
+            if (val & (1u << 30))
+                soc->flash_sr |= 0x02u; /* FLASH_WREN */
+            if (val & (1u << 29))
+                soc->flash_sr &= ~0x02u; /* FLASH_WRDI */
+            if (val & (1u << 22)) { /* FLASH_CE: chip erase */
+                memset(fi->data, 0xFF, C3_FLASH_SIZE);
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 23)) { /* FLASH_BE: block erase (64K) */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t bbase = faddr & ~65535u;
+                if (bbase < C3_FLASH_SIZE) {
+                    uint32_t len = C3_FLASH_SIZE - bbase;
+                    if (len > 65536u)
+                        len = 65536u;
+                    memset(fi->data + bbase, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 24)) { /* FLASH_SE: sector erase (4K) */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t sbase = faddr & ~4095u;
+                if (sbase < C3_FLASH_SIZE) {
+                    uint32_t len = C3_FLASH_SIZE - sbase;
+                    if (len > 4096u)
+                        len = 4096u;
+                    memset(fi->data + sbase, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 25)) { /* FLASH_PP: page program */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t plen = (addrreg >> 24) & 0xFFu;
+                if (plen == 0)
+                    plen = 256u;
+                if (plen > 64u)
+                    plen = 64u;
+                uint8_t *wb = (uint8_t *) w;
+                for (uint32_t i = 0; i < plen; i++)
+                    if (faddr + i < C3_FLASH_SIZE)
+                        fi->data[faddr + i] &= wb[i];
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 26)) { /* FLASH_WRSR */
+                soc->flash_sr = w[0] & 0xFFu;
+                soc->flash_sr2 = (w[0] >> 8) & 0xFFu;
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 27)) /* FLASH_RDSR */
+                w[0] = soc->flash_sr;
+            if (val & (1u << 28)) /* FLASH_RDID */
+                w[0] = 0x1640EFu;
+            if (val & (1u << 31)) { /* FLASH_READ */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t miso =
+                    (mmio32[((base + 0x28u) >> 2)] & 0x3FFu) + 1u;
+                uint32_t rn = (miso + 7u) / 8u;
+                if (rn > 64u)
+                    rn = 64u;
+                if (faddr < C3_FLASH_SIZE)
+                    memcpy(w, fi->data + faddr, rn);
+            }
+            if (val & ~(0x40000u | 0x20000u)) {
+                /* Dedicated bits serviced above: self-clear so
+                 * poll_cmd_done (which spins on cmd==0) exits. USR
+                 * path below clears CMD itself after servicing. */
+                if (!(val & 0x40000u))
+                    mmio32[off >> 2] = 0;
+            }
+        }
         if (addr == C3_PERIPH_BASE + 0x2000u && (val & 0x40000u)) {
             /* SPI_USR command trigger: service the command into W0.. */
             uint32_t *w = mmio32 + (0x2058u >> 2); /* SPI_MEM_W0 (0x60002058) */
             uint32_t cmd = mmio32[0x2020u >> 2] & 0xFFFFu;
             uint32_t miso = (mmio32[0x2028u >> 2] & 0x3FFu) + 1u;
             uint32_t nbytes = (miso + 7u) / 8u;
-            fprintf(stderr,
+            if (0) fprintf(stderr,
                     "DBG: spicmd pc=0x%08x cmd=0x%02x misolen=%u addr=0x%08x "
-                    "user=0x%08x user1=0x%08x ra=0x%08x sp=0x%08x\n",
+                    "user=0x%08x user1=0x%08x ra=0x%08x sp=0x%08x cyc=%llu\n",
                     rv->PC, cmd, miso, mmio32[0x2004u >> 2],
                     mmio32[0x2018u >> 2], mmio32[0x201Cu >> 2], rv->X[1],
-                    rv->X[2]);
+                    rv->X[2], (unsigned long long) rv->csr_cycle);
             if (nbytes > 64u)
                 nbytes = 64u;
-            esp32_region_t *fi = esp32_find_region(soc, C3_FLASH_D_BASE);
-            memset(w, 0, nbytes);
-            if (cmd == 0x9Fu) {
-                /* RDID: JEDEC ID (Winbond W25Q32: 0xEF 0x40 0x16) */
-                w[0] = 0x1640EFu;
-            } else if (cmd == 0x05u) {
-                w[0] = soc->flash_sr; /* RDSR */
-            } else if (cmd == 0x35u) {
-                w[0] = soc->flash_sr2; /* RDSR2 */
-            } else if (cmd == 0x06u) {
-                soc->flash_sr |= 0x02u; /* WREN: set WEL */
-            } else if (cmd == 0x04u) {
-                soc->flash_sr &= ~0x02u; /* WRDI: clear WEL */
-            } else if (cmd == 0x01u) {
-                /* WRSR: 2 status bytes in W0 (written by driver as MOSI
-                 * data before the command trigger) */
-                soc->flash_sr = w[0] & 0xFFu;
-                soc->flash_sr2 = (w[0] >> 8) & 0xFFu;
-                soc->flash_sr &= ~0x02u; /* WRSR clears WEL */
-            } else if (cmd == 0x31u) {
-                soc->flash_sr2 = w[0] & 0xFFu; /* WRSR2 */
-            } else if (cmd == 0x03u || cmd == 0x0Bu || cmd == 0x3Bu ||
-                       cmd == 0x6Bu || cmd == 0xBBu || cmd == 0xEBu) {
-                /* flash read commands: copy from flash image */
-                uint32_t faddr = mmio32[0x2004u >> 2];
-                if (faddr < C3_FLASH_SIZE)
-                    memcpy(w, fi->data + faddr, nbytes);
-            } else if (cmd == 0x02u || cmd == 0x32u) {
-                /* page program: MOSI bytes from W0, flash can only
-                 * clear bits (AND). Length from MOSI_DLEN. */
-                uint32_t mosi = (mmio32[0x202Cu >> 2] & 0x3FFu) + 1u;
-                uint32_t wn = (mosi + 7u) / 8u;
-                if (wn > 64u)
-                    wn = 64u;
-                uint32_t faddr = mmio32[0x2004u >> 2];
-                uint8_t *wb = (uint8_t *) w;
-                for (uint32_t i = 0; i < wn; i++)
-                    if (faddr + i < C3_FLASH_SIZE)
-                        fi->data[faddr + i] &= wb[i];
-                soc->flash_sr &= ~0x02u; /* program clears WEL */
-            } else if (cmd == 0x20u || cmd == 0x52u || cmd == 0xD8u ||
-                       cmd == 0x60u || cmd == 0xC7u) {
-                /* erase to 0xFF: 4K sector / 32K / 64K block / chip */
-                uint32_t faddr = mmio32[0x2004u >> 2];
-                uint32_t len = C3_FLASH_SIZE;
-                uint32_t base = 0;
-                if (cmd == 0x20u) {
-                    len = 4096u;
-                    base = faddr & ~4095u;
-                } else if (cmd == 0x52u) {
-                    len = 32768u;
-                    base = faddr & ~32767u;
-                } else if (cmd == 0xD8u) {
-                    len = 65536u;
-                    base = faddr & ~65535u;
-                }
-                if (base < C3_FLASH_SIZE) {
-                    if (base + len > C3_FLASH_SIZE)
-                        len = C3_FLASH_SIZE - base;
-                    memset(fi->data + base, 0xFF, len);
-                }
-                soc->flash_sr &= ~0x02u; /* erase clears WEL */
-            }
+            /* SPI_MEM MOSI_DLEN is at +0x24 (MISO at +0x28); +0x2C is
+             * RD_STATUS, not MOSI (misread gave 1-byte writes). */
+            uint32_t mosi = (mmio32[0x2024u >> 2] & 0xFFFFFFu) + 1u;
+            uint32_t wn = (mosi + 7u) / 8u;
+            if (wn > 64u)
+                wn = 64u;
+            uint8_t mosi_data[64];
+            memset(mosi_data, 0, sizeof(mosi_data));
+            memcpy(mosi_data, w, wn);
+            uint32_t faddr = mmio32[0x2004u >> 2];
+            esp32c3_spiflash_exec(soc, cmd, faddr, w, nbytes,
+                                  mosi_data, wn);
             if (0) fprintf(stderr, "DBG: spiw0 cmd=0x%02x w0=0x%08x\n", cmd, w[0]);
+            mmio32[off >> 2] = 0; /* CMD self-clears when done */
+        } else if (addr == C3_PERIPH_BASE + 0x3000u && (val & 0x40000u)) {
+            /* SPI MEM instance 0 (user/flash-op path): same encoding
+             * as instance 1 (0x2000), based at 0x3000. (Offset 0x3C in
+             * these blocks is CACHE_FCTRL, not a trigger — do not
+             * touch it.) */
+            uint32_t *w = mmio32 + (0x3058u >> 2);
+            uint32_t cmd = mmio32[0x3020u >> 2] & 0xFFFFu;
+            uint32_t miso = (mmio32[0x3028u >> 2] & 0x3FFu) + 1u;
+            uint32_t mosi = (mmio32[0x3024u >> 2] & 0xFFFFFFu) + 1u;
+            uint32_t rn = (miso + 7u) / 8u;
+            uint32_t wn = (mosi + 7u) / 8u;
+            if (rn > 64u)
+                rn = 64u;
+            if (wn > 64u)
+                wn = 64u;
+            uint8_t mosi_data[64];
+            memset(mosi_data, 0, sizeof(mosi_data));
+            memcpy(mosi_data, w, wn);
+            uint32_t faddr = mmio32[0x3004u >> 2] & 0xFFFFFFu;
+            esp32c3_spiflash_exec(soc, cmd, faddr, w, rn, mosi_data, wn);
             mmio32[off >> 2] = 0; /* CMD self-clears when done */
         }
         return;
@@ -2252,6 +2490,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
              * interrupts before ISRs are installed. */
             soc->intc_status &= ~(((unsigned __int128) 1) << src);
             soc->intc_intmap[src] = new_line;
+            /* ...except SPI2: its TRANS_DONE is level (active when idle),
+             * so a stale-clear here would lose the live level if the
+             * peripheral asserted before the remap (SPI ISR kick never
+             * arrives and every interrupt transfer hangs). Re-evaluate. */
+            if (src == C3_SPI2_INTR_SOURCE)
+                esp32c3_spi2_int_update(soc);
             return;
         }
         switch (o) {
@@ -2785,6 +3029,22 @@ void esp32c3_check_interrupt(riscv_t *rv)
     rv->csr_mip = (rv->csr_mip & ~0x7FFFFFFEu) | lines;
     if (!lines)
         return;
+    /* Priority gate: the dispatcher raises CPU_INT_THRESH to prio+1 on entry
+     * (and critical sections raise it directly), so same-or-lower lines must
+     * not preempt — otherwise a stuck-high level line nests until ISR/task
+     * stacks burst (observed: SP wanders into MMIO, then pc=0 halt). prio
+     * table at 0x114+4*line, threshold at 0x194; both reset to 0 (pass). */
+    {
+        uint32_t *mmio32 = (uint32_t *) soc->mmio;
+        uint32_t thresh = mmio32[0x194u >> 2];
+        uint32_t kept = 0;
+        for (uint32_t l = lines, b = 0; l; l >>= 1, b++)
+            if ((l & 1u) && mmio32[(0x114u + 4u * b) >> 2] >= thresh)
+                kept |= 1u << b;
+        lines = kept;
+        if (!lines)
+            return;
+    }
     int idx = __builtin_ctz(lines);
     SET_CAUSE_AND_TVAL_THEN_TRAP(rv, ((1u << 31) | idx), 0);
 }
@@ -2957,22 +3217,76 @@ void esp32c3_periodic(riscv_t *rv)
 
     /* SPI2 transfer completion: cmd.usr was set. The virtual device (a
      * 16-byte SRAM, JEDEC ID 0xEF4015, echo fallback) decodes the TX bytes
-     * from the data buffer (little-endian byte order as the HAL packs it)
-     * and shifts its response back MSB-first; with no device selected the
-     * MISO line floats high so every received byte is 0xFF. */
+     * from the CPU data buffer at 0x98 and shifts its response back.
+     * Observed (SPIDUMP): with DMA the data buffer reads all-zero (the
+     * driver leaves TX in the GDMA OUT descriptors); without DMA it holds
+     * the TX bytes. So: DMA TX decodes from the GDMA OUT descriptor chain,
+     * non-DMA TX from the CPU buffer. RX always lands in the CPU buffer
+     * (spi_hal_fetch_result path copies data_buf -> rcv_buffer; DMA RX
+     * only moves SPI->GDMA FIFO, and polling_end ignores the GDMA IN
+     * buffer). */
     if (soc->spi2_transfer_pending) {
         soc->spi2_transfer_pending = 0;
-        uint32_t dlen = soc->spi2_reg[0x1c >> 2] & 0x3Fu; /* ms_dbitlen */
+        uint32_t dlen = soc->spi2_reg[0x1c >> 2] & 0x3FFFFu; /* ms_data_bitlen */
         int n = (dlen + 8) / 8; /* transferred bytes, byte-aligned */
-        if (n > 16)
-            n = 16;
-        uint8_t tx[16], rx[16];
-        for (int i = 0; i < n; i++) {
-            int w = i >> 2;
-            int sh = 8 * (i & 3); /* HAL packs/reads buffer bytes LE */
-            tx[i] = (soc->spi2_reg[(0x98u + 4u * w) >> 2] >> sh) & 0xFFu;
+        if (n < 1)
+            n = 1;
+        if (n > 64)
+            n = 64;
+        int dma_on = (soc->spi2_reg[0x30 >> 2] >> 28) & 1u; /* dma_tx_ena */
+        uint8_t tx[64], rx[64];
+        if (dma_on) {
+            /* TX bytes live in the GDMA OUT descriptor chain: walk it and
+             * concatenate the buffers (12B align4 layout).
+             * NOTE: any GDMA channel may carry SPI (TX and RX channels are
+             * allocated as independent singletons, not a pair sharing the
+             * index): scan ALL OUT walkers, newest first. */
+            int got = 0;
+            /* channel search order: newest first (wraps mod 3). Each
+             * candidate channel walks its own descriptor chain. */
+            for (int k = 0; k < 3 && got < n; k++) {
+                int ch = (soc->gdma_out_last + 3 - k) % 3;
+                if (soc->gdma_out_peri_sel[ch] != C3_GDMA_PERI_SPI2 ||
+                    !soc->gdma_out_dscr[ch])
+                    continue;
+                uint32_t daddr = soc->gdma_out_dscr[ch];
+                while (daddr && got < n) {
+                    uint8_t *d = esp32c3_dma_ptr(soc, daddr);
+                    if (!d)
+                        break;
+                    uint32_t dw0, dw1, dw2;
+                    memcpy(&dw0, d, 4);
+                    memcpy(&dw1, d + 4, 4);
+                    memcpy(&dw2, d + 8, 4);
+                    /* TX desc (setup_link is_rx=false): length = byte
+                     * count. Fall back to size if length is 0. */
+                    uint32_t blen = (dw0 >> 12) & 0xFFFu;
+                    if (!blen)
+                        blen = dw0 & 0xFFFu;
+                    uint8_t *bp = esp32c3_dma_ptr(soc, dw1);
+                    if (!bp)
+                        break;
+                    for (uint32_t i = 0; i < blen && got < n; i++)
+                        tx[got++] = bp[i];
+                    if (!dw2)
+                        break;
+                    daddr = dw2;
+                }
+                break; /* first matching channel wins */
+            }
+            while (got < n)
+                tx[got++] = 0xFFu;
+        } else {
+            for (int i = 0; i < n; i++) {
+                int w = i >> 2;
+                int sh = 8 * (i & 3); /* HAL packs/reads buffer bytes LE */
+                tx[i] = (soc->spi2_reg[(0x98u + 4u * w) >> 2] >> sh) & 0xFFu;
+            }
         }
-        if (soc->spi2_jedec < 4) { /* mid JEDEC read: clock out next ID bytes */
+        if (soc->spi2_jedec < 4 && (n < 1 || tx[0] != 0x9Fu)) {
+            /* mid JEDEC read: clock out next ID bytes. A fresh 0x9F
+             * command restarts the sequence (handled below), so only
+             * non-0x9F transfers advance the stale cursor. */
             static const uint8_t jedec_id[4] = { 0xEFu, 0x40u, 0x15u, 0xFFu };
             int idx = soc->spi2_jedec;
             for (int i = 0; i < n; i++) {
@@ -2982,7 +3296,10 @@ void esp32c3_periodic(riscv_t *rv)
             soc->spi2_jedec = (idx >= 4) ? 4 : idx;
         } else if (n >= 1 && tx[0] == 0x9Fu) { /* READ JEDEC ID */
             static const uint8_t jedec_id[4] = { 0xEFu, 0x40u, 0x15u, 0xFFu };
-            /* the first ID byte (0xEF) clocks out during the 0x9F command */
+            /* the first ID byte (0xEF) clocks out during the 0x9F command.
+             * NOTE: a stale spi2_jedec cursor from an earlier partial read
+             * must not shadow a fresh 0x9F command: the command byte in
+             * tx[0] always restarts the ID sequence. */
             for (int i = 0; i < n; i++)
                 rx[i] = (i < 4) ? jedec_id[i] : 0xFFu;
             soc->spi2_jedec = (n >= 4) ? 4 : n;
@@ -3000,7 +3317,7 @@ void esp32c3_periodic(riscv_t *rv)
             for (int i = 0; i < n; i++)
                 rx[i] = tx[i];
         }
-        for (int i = 0; i < 4; i++) /* MISO floats high for unused bits */
+        for (int i = 0; i < 16; i++) /* MISO floats high for unused bits */
             soc->spi2_reg[(0x98u + 4u * i) >> 2] = 0xFFFFFFFFu;
         for (int i = 0; i < n; i++) { /* response packed LE like the HAL reads */
             int w = i >> 2;
@@ -3008,8 +3325,32 @@ void esp32c3_periodic(riscv_t *rv)
             uint32_t *reg = &soc->spi2_reg[(0x98u + 4u * w) >> 2];
             *reg = (*reg & ~(0xFFu << sh)) | ((uint32_t)rx[i] << sh);
         }
+        /* RX under DMA also lands in the GDMA IN descriptor buffer: the
+         * driver's RX path consumes data_buf, but mirror the response
+         * into the IN desc buffer as well so any GDMA-side RX read sees
+         * the same bytes. Walk ALL IN walkers with a live descriptor
+         * (TX/RX channels are independent singletons). */
+        for (int ch = 0; ch < 3; ch++) {
+            if (!soc->gdma_in_dscr[ch])
+                continue;
+            uint8_t *id = esp32c3_dma_ptr(soc, soc->gdma_in_dscr[ch]);
+            if (!id)
+                continue;
+            uint32_t iw0, iw1;
+            memcpy(&iw0, id, 4);
+            memcpy(&iw1, id + 4, 4);
+            uint8_t *ib = esp32c3_dma_ptr(soc, iw1);
+            if (!ib)
+                continue;
+            uint32_t blen = (iw0 >> 12) & 0xFFFu;
+            if (!blen)
+                blen = iw0 & 0xFFFu;
+            for (uint32_t i = 0; i < blen && (int) i < n; i++)
+                ib[i] = rx[i];
+        }
         soc->spi2_reg[0x00 >> 2] &= ~(1u << 24); /* usr cleared */
-        soc->spi2_reg[0x3c >> 2] |= 1u << 12;    /* trans_done raw */
+        soc->spi2_reg[0x3Cu >> 2] |= C3_SPI2_TRANS_DONE_MASK; /* done */
+        esp32c3_spi2_int_update(soc);
     }
 
     /* TWAI0 TX completion: a tx_request was issued. No other node on the
@@ -3052,24 +3393,50 @@ void esp32c3_periodic(riscv_t *rv)
         }
     }
 
-    /* GDMA mem2mem completion: when both the OUT (source) and IN (dest)
-     * channels of a channel are running, walk the descriptor chains in
-     * lockstep and copy each OUT buffer into the paired IN buffer, then
-     * raise OUT_EOF + IN_SUC_EOF on the shared channel interrupt. A lone
-     * OUT/IN channel just raises its own EOF so peripheral-only DMA does
-     * not hang the driver. */
+    /* GDMA completion: two cases share the walker state.
+     * - mem2mem (AES path): both OUT and IN walkers running on the same
+     *   channel. Walk in lockstep, copy OUT buffer -> IN buffer (through
+     *   AES when peri_sel selects it), raise both EOFs. Used by the AES
+     *   DMA path and I2S tests.
+     * - SPI peripheral DMA: the SPI completion path above already moved
+     *   TX bytes to the virtual device and RX bytes to the CPU data
+     *   buffer. Only retire the descriptors (clear owner, save EOF des
+     *   addr, raise the channel EOF) so the driver observes completion.
+     *   Never copy OUT->IN here for SPI channels: the IN buffer holds
+     *   stale TX bytes, not the SPI response, and copying would corrupt
+     *   RX data the driver already consumed from data_buf. */
     for (int ch = 0; ch < 3; ch++) {
         if (!soc->gdma_m2m_pending[ch] ||
             rv->csr_cycle < soc->gdma_m2m_done_cycle[ch])
             continue;
         soc->gdma_m2m_pending[ch] = 0;
+        int is_spi = (soc->gdma_out_peri_sel[ch] == C3_GDMA_PERI_SPI2 ||
+                      soc->gdma_in_peri_sel[ch] == C3_GDMA_PERI_SPI2);
         uint32_t out_addr = soc->gdma_out_dscr[ch];
         uint32_t in_addr = soc->gdma_in_dscr[ch];
-        int paired = soc->gdma_out_run[ch] && soc->gdma_in_run[ch];
+        int paired = soc->gdma_out_run[ch] && soc->gdma_in_run[ch] && !is_spi;
 
         /* Paired (mem2mem) or peripheral TX/RX: walk the descriptor chains
          * and process each descriptor. */
-        if (paired) {
+        if (is_spi) {
+            /* SPI peripheral DMA: retire both walkers. The SPI completion
+             * path already delivered TX->device and device->RX; just mark
+             * descriptors done and raise both EOFs. */
+            if (soc->gdma_out_run[ch]) {
+                soc->gdma_out_eof_des[ch] = out_addr;
+                uint8_t *od = esp32c3_dma_ptr(soc, out_addr);
+                if (od) { uint32_t dw0; memcpy(&dw0, od, 4); dw0 &= ~(1u << 31); memcpy(od, &dw0, 4); }
+                soc->gdma_int_raw[ch] |= (1u << GDMA_OUT_EOF_BIT);
+                soc->gdma_out_run[ch] = 0;
+            }
+            if (soc->gdma_in_run[ch]) {
+                soc->gdma_in_eof_des[ch] = in_addr;
+                uint8_t *id = esp32c3_dma_ptr(soc, in_addr);
+                if (id) { uint32_t dw0; memcpy(&dw0, id, 4); dw0 &= ~(1u << 31); memcpy(id, &dw0, 4); }
+                soc->gdma_int_raw[ch] |= (1u << GDMA_IN_SUC_EOF_BIT);
+                soc->gdma_in_run[ch] = 0;
+            }
+        } else if (paired) {
             /* Paired mem2mem: walk both chains in lockstep */
             while (out_addr && in_addr) {
                 uint8_t *src = esp32c3_dma_ptr(soc, soc->gdma_out_desc_buf[ch]);

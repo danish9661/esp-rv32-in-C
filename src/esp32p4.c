@@ -340,6 +340,7 @@ struct esp32p4_soc {
     uint32_t gdma_tx_desc_buf[3];  /* current descriptor buffer (full) */
     uint32_t gdma_tx_desc_len[3];  /* current descriptor length (bytes) */
     uint32_t gdma_tx_desc_left[3]; /* bytes still to push */
+    uint32_t gdma_out_last;        /* most recently started OUT channel */
     uint32_t gdma_tx_next_addr[3]; /* next descriptor address (DW2) */
     uint64_t gdma_tx_drain_cyc[3]; /* next cycle for the paced drain */
 
@@ -456,9 +457,9 @@ const char *esp32p4_flash_image_path = NULL;
 /* Optional UART RX injection source (FIFO file the host writes to). */
 const char *esp32p4_uart_rx_path = NULL;
 
-/* ------------------------------------------------------------------ */
-/* Region helpers                                                      */
-/* ------------------------------------------------------------------ */
+/* SPI2 TRANS_DONE mask (BIT12 of dma_int_raw); defined with the other
+ * SPI2 constants below but needed here for SoC construction. */
+#define P4_SPI2_TRANS_DONE_MASK 0x1000u
 
 /* Pending-source bit ops (u64-native; see intc_status_lo/hi comment). */
 static inline void p4_intc_set(esp32p4_t *soc, unsigned s)
@@ -588,6 +589,8 @@ esp32p4_t *esp32p4_new(void)
     for (int i = 0; i < 16; i++)
         soc->spi2_dev_mem[i] = 0x40 + i;
     soc->spi2_jedec = 4;
+    /* SPI2 TRANS_DONE kept active when idle (level kick for the ISR) */
+    soc->spi2_reg[0x3Cu >> 2] = P4_SPI2_TRANS_DONE_MASK;
     soc->gpio_in_prev = 0;
 
     /* flash backing shared by the i/d-cache window */
@@ -791,6 +794,19 @@ void esp32p4_smp_poll(riscv_t *rv)
 /* AXI_GDMA interrupt sources (interrupts.h enum) */
 #define P4_AXI_DMA_IN_CH0_INTR_SOURCE 62u
 #define P4_AXI_DMA_OUT_CH0_INTR_SOURCE 65u
+/* SPI2 interrupt source: ETS_SPI2_INTR_SOURCE (counted from the enum above) */
+#define P4_SPI2_INTR_SOURCE 25u
+/* P4_SPI2_TRANS_DONE_MASK is defined above (used by esp32p4_new). */
+static void esp32p4_spi2_int_update(esp32p4_t *soc)
+{
+    uint32_t st = soc->spi2_reg[0x3Cu >> 2] & soc->spi2_reg[0x34u >> 2];
+    if (st)
+        p4_intc_set(soc, P4_SPI2_INTR_SOURCE);
+    else
+        p4_intc_clear(soc, P4_SPI2_INTR_SOURCE);
+}
+/* GDMA peripheral select for SPI2. */
+#define P4_GDMA_PERI_SPI2 0u
 /* SYSTIMER interrupt sources (interrupts.h enum) */
 #define P4_SYSTIMER_T0_SOURCE 53u
 #define P4_SYSTIMER_T1_SOURCE 54u
@@ -1524,6 +1540,8 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
     /* SPI2 (GPSPI2, 0x60081000-0x60081100) */
     if (addr >= P4_PERIPH_BASE + 0x81000u &&
         addr < P4_PERIPH_BASE + 0x81100u) {
+        if (addr == P4_PERIPH_BASE + 0x81040u) /* dma_int_st = raw & ena */
+            return soc->spi2_reg[0x3Cu >> 2] & soc->spi2_reg[0x34u >> 2];
         return soc->spi2_reg[(addr - P4_PERIPH_BASE - 0x81000u) >> 2];
     }
 
@@ -2397,10 +2415,22 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         uint32_t *r = soc->spi2_reg + ((addr - P4_PERIPH_BASE - 0x81000u) >> 2);
         if (addr == P4_PERIPH_BASE + 0x81000u) { /* cmd */
             *r = val & ~(1u << 23); /* update self-clears: config applied */
-            if (val & (1u << 24))   /* usr: transfer begins */
+            if (val & (1u << 24)) { /* usr: transfer begins */
                 soc->spi2_transfer_pending = 1;
+                /* TRANS_DONE deasserts while busy */
+                soc->spi2_reg[0x3Cu >> 2] &= ~P4_SPI2_TRANS_DONE_MASK;
+                esp32p4_spi2_int_update(soc);
+            }
         } else if (addr == P4_PERIPH_BASE + 0x81038u) { /* dma_int_clr */
             soc->spi2_reg[0x3c >> 2] &= ~val; /* clear raw interrupt bits */
+            esp32p4_spi2_int_update(soc);
+        } else if (addr == P4_PERIPH_BASE + 0x81034u) { /* dma_int_ena */
+            *r = val;
+            esp32p4_spi2_int_update(soc);
+        } else if (addr == P4_PERIPH_BASE + 0x8103cu) { /* dma_int_raw */
+            *r = val;
+            esp32p4_spi2_int_update(soc);
+        } else if (addr == P4_PERIPH_BASE + 0x81040u) { /* dma_int_st RO */
         } else {
             *r = val;
         }
@@ -2802,6 +2832,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                     else
                         soc->gdma_tx_desc_addr[c] = P4_SRAM_BASE +
                             (soc->gdma_out_link[c] & 0xFFFFFu);
+                    soc->gdma_out_last = c;
                     esp32p4_gdma_load_desc(soc, c);
                     soc->gdma_tx_run[c] = 1;
                     soc->gdma_tx_drain_cyc[c] = rv->csr_cycle + 256u;
@@ -3184,6 +3215,10 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 fprintf(stderr, "[MTX] source=%u -> line=%u (pc=%08x)\n", s,
                         soc->intc_intmap[0][s], rv->PC);
         }
+        /* SPI2 TRANS_DONE is level (active when idle): re-evaluate after
+         * remap so the live level is not lost. */
+        if (s == P4_SPI2_INTR_SOURCE)
+            esp32p4_spi2_int_update(soc);
         return;
     }
     if (addr >= P4_PERIPH_BASE + 0x10800u &&
@@ -4303,22 +4338,61 @@ void esp32p4_periodic(riscv_t *rv)
 
     /* SPI2 transfer completion: cmd.usr was set. The virtual device (a
      * 16-byte SRAM, JEDEC ID 0xEF4015, echo fallback) decodes the TX bytes
-     * from the data buffer (little-endian byte order as the HAL packs it)
-     * and shifts its response back MSB-first; with no device selected the
-     * MISO line floats high so every received byte is 0xFF. */
+     * and shifts its response back. TX source: DMA OUT descriptor chain
+     * when dma_tx_ena (bit 28 of DMA_CONF 0x30), else the CPU data buffer
+     * at 0x98. RX always lands in the CPU data buffer and is mirrored
+     * into the GDMA IN descriptor buffers. */
     if (soc->spi2_transfer_pending) {
         soc->spi2_transfer_pending = 0;
-        uint32_t dlen = soc->spi2_reg[0x1c >> 2] & 0x3Fu; /* usr_mosi_dbitlen */
+        uint32_t dlen = soc->spi2_reg[0x1c >> 2] & 0x3FFFFu; /* ms_data_bitlen */
         int n = (dlen + 8) / 8; /* transferred bytes, byte-aligned */
-        if (n > 16)
-            n = 16;
-        uint8_t tx[16], rx[16];
-        for (int i = 0; i < n; i++) {
-            int w = i >> 2;
-            int sh = 8 * (i & 3); /* HAL packs/reads buffer bytes LE */
-            tx[i] = (soc->spi2_reg[(0x98u + 4u * w) >> 2] >> sh) & 0xFFu;
+        if (n < 1)
+            n = 1;
+        if (n > 64)
+            n = 64;
+        int dma_on = (soc->spi2_reg[0x30 >> 2] >> 28) & 1u; /* dma_tx_ena */
+        uint8_t tx[64], rx[64];
+        if (dma_on) {
+            int got = 0;
+            for (int k = 0; k < 3 && got < n; k++) {
+                int ch = (soc->gdma_out_last + 3 - k) % 3;
+                if (soc->gdma_out_peri_sel[ch] != P4_GDMA_PERI_SPI2 ||
+                    !soc->gdma_tx_desc_addr[ch])
+                    continue;
+                uint32_t daddr = soc->gdma_tx_desc_addr[ch];
+                while (daddr && got < n) {
+                    uint8_t *d = esp32p4_dma_ptr(soc, daddr);
+                    if (!d)
+                        break;
+                    uint32_t dw0, dw1, dw2;
+                    memcpy(&dw0, d, 4);
+                    memcpy(&dw1, d + 4, 4);
+                    memcpy(&dw2, d + 8, 4);
+                    uint32_t blen = (dw0 >> 12) & 0xFFFu;
+                    if (!blen)
+                        blen = dw0 & 0xFFFu;
+                    uint8_t *bp = esp32p4_dma_ptr(soc, dw1);
+                    if (!bp)
+                        break;
+                    for (uint32_t i = 0; i < blen && got < n; i++)
+                        tx[got++] = bp[i];
+                    if (!dw2)
+                        break;
+                    daddr = dw2;
+                }
+                break; /* first matching channel wins */
+            }
+            while (got < n)
+                tx[got++] = 0xFFu;
+        } else {
+            for (int i = 0; i < n; i++) {
+                int w = i >> 2;
+                int sh = 8 * (i & 3); /* HAL packs/reads buffer bytes LE */
+                tx[i] = (soc->spi2_reg[(0x98u + 4u * w) >> 2] >> sh) & 0xFFu;
+            }
         }
-        if (soc->spi2_jedec < 4) { /* mid JEDEC read: clock out next ID bytes */
+        if (soc->spi2_jedec < 4 && (n < 1 || tx[0] != 0x9Fu)) {
+            /* mid JEDEC read: clock out next ID bytes */
             static const uint8_t jedec_id[4] = { 0xEFu, 0x40u, 0x15u, 0xFFu };
             int idx = soc->spi2_jedec;
             for (int i = 0; i < n; i++) {
@@ -4346,7 +4420,7 @@ void esp32p4_periodic(riscv_t *rv)
             for (int i = 0; i < n; i++)
                 rx[i] = tx[i];
         }
-        for (int i = 0; i < 4; i++) /* MISO floats high for unused bits */
+        for (int i = 0; i < 16; i++) /* MISO floats high for unused bits */
             soc->spi2_reg[(0x98u + 4u * i) >> 2] = 0xFFFFFFFFu;
         for (int i = 0; i < n; i++) { /* response packed LE like the HAL reads */
             int w = i >> 2;
@@ -4354,8 +4428,28 @@ void esp32p4_periodic(riscv_t *rv)
             uint32_t *reg = &soc->spi2_reg[(0x98u + 4u * w) >> 2];
             *reg = (*reg & ~(0xFFu << sh)) | ((uint32_t)rx[i] << sh);
         }
+        /* RX under DMA also lands in the GDMA IN descriptor buffers. */
+        for (int ch = 0; ch < 3; ch++) {
+            if (!soc->gdma_rx_desc_addr[ch])
+                continue;
+            uint8_t *id = esp32p4_dma_ptr(soc, soc->gdma_rx_desc_addr[ch]);
+            if (!id)
+                continue;
+            uint32_t iw0, iw1;
+            memcpy(&iw0, id, 4);
+            memcpy(&iw1, id + 4, 4);
+            uint8_t *ib = esp32p4_dma_ptr(soc, iw1);
+            if (!ib)
+                continue;
+            uint32_t blen = (iw0 >> 12) & 0xFFFu;
+            if (!blen)
+                blen = iw0 & 0xFFFu;
+            for (uint32_t i = 0; i < blen && i < (uint32_t) n; i++)
+                ib[i] = rx[i];
+        }
         soc->spi2_reg[0x00 >> 2] &= ~(1u << 24); /* usr cleared */
-        soc->spi2_reg[0x3c >> 2] |= 1u << 12;    /* trans_done raw */
+        soc->spi2_reg[0x3c >> 2] |= P4_SPI2_TRANS_DONE_MASK; /* done */
+        esp32p4_spi2_int_update(soc);
     }
 
     /* TWAI0 TX completion: a tx_request was issued. No other node on the

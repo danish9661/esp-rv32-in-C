@@ -465,9 +465,9 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
   - DONE 2026-09-11: SMP peripheral proof, no emulator change needed.
     Extended `fw/p4ipc` so the APP-core `ipc_fn` drives GPIO8 high,
     reads back the pad input, and drives low; setup requires the
-    readback: `IPC_RES 0 0 3 1 1` + `IPC_DONE` + steady TICKs on
-    `-C esp32p4smp`, unpatched. GPIO driven and observed from hart1
-    through the existing OUT-echo model.
+     readback: `IPC_RES 0 0 3 1 1` + `IPC_DONE` + steady TICKs on
+     `-C esp32p4smp`, unpatched. GPIO driven and observed from hart1
+      through the existing OUT-echo model.
   - DONE 2026-09-11: cross-chip regression after the shared-core
     changes (value-based LR/SC, trap-pause budget, MINTSTATUS/
     MINTTHRESH CSRs). All green, zero faults: C3 esp32test blink
@@ -475,6 +475,46 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     TWAI/TSENS/ADC + DEMO_DONE); H2 hello+TICKs, gpio/gptimer/rmt DONE
     (incl. RMT_TX/WAIT OK). P4 matrix (18 tests incl. SMP) already
     green on this HEAD.
+  - DONE 2026-09-13: FS-write (NVS) + machine.SPI hang — both FIXED,
+    single PR (no commit per user). Root causes, all in the SoC model:
+    (1) SPI_MEM_CMD dedicated bits: the HAL's WREN/WRDI/PP/SE/BE/CE use
+    dedicated CMD bits (WREN=30 etc), which the old USR-only trigger
+    ignored, so WEL was never set and every flash write failed
+    verification with 0x105. Fixed with dedicated-bit handling on both
+    0x2000/0x3000 (C3/C6/H2; P4 already had USR path, got the same
+    treatment). (2) SPI_MEM MOSI_DLEN is at +0x24, not +0x2C
+    (RD_STATUS): USR page-programs wrote 1 byte systematically. Fixed +
+    MOSI pre-capture before W0 clear. (3) SPI2 TRANS_DONE is BIT(12) of
+    dma_int_raw (spi_struct.h field order), not BIT(0): polling
+    (`spi_hal_usr_is_done`) never saw completion with DMA. Fixed on all
+    four chips; GPSPI map corrected to 0x30 DMA_CONF / 0x34 ENA /
+    0x38 CLR / 0x3C RAW / 0x40 ST with idle-active RAW init +
+    level-following INTC line incl. remap re-evaluate (the ISR kick IDF
+    relies on). (4) DMA data path: with DMA the driver leaves TX in the
+    GDMA OUT descriptors (CPU data_buf reads zero) and consumes RX from
+    data_buf — so TX decodes from the GDMA OUT chain (any channel, newest
+    first, full DRAM addresses via link_addr helper) while RX lands in
+    data_buf AND is mirrored into the GDMA IN buffers. The old GDMA model
+    also used wrong offsets (0x70-block-relative instead of the
+    gdma_reg.h 0x70/0x80/0xA0/0xD0/0xE0/0x100 map), a 16-byte desc layout
+    (real align4 descs are 12 bytes), and an OUT->IN mem2mem copy for SPI
+    channels that corrupted RX — all fixed (C3; C6/H2/P4 use their own
+    GDMA walkers for TX/RX pairing). (5) C3 INTC priority gate: a
+    stuck-high level line nested until ISR/task stacks burst (SP into
+    MMIO, pc=0); gate same-or-lower lines on CPU_INT_THRESH (prio table
+    0x114+4*line vs thresh 0x194). Verified native: NVS
+    INIT/OPEN/SET/COMMIT/GET 0 VAL 12345678 on C3+C6+H2; raw
+    erase/write/read 32 B exact; spipoll/spinodma/spiisr all green with
+    RX EF 40 15 on C3+C6 (H2/P4 Arduino-SPI JEDEC path green; P4-SMP
+    SPI_JEDEC EF 40 15 SPI_DONE). Verified WASM(node): NVS green + SPI
+    poll green on C3. MicroPython v1.29.0 (IDF v5.5.4 build, polling
+    patch in machine_hw_spi.c kept): per-peripheral REPL matrix green on
+    C3 AND C6 — PIN1 1, I2C [80], ADC 1024, TIMER True, PWM_OK, SPI
+    constructor OK, UART OK, FS write+readback hello-mpy-fs + FSRW_OK,
+    SPI xfer [239, 64, 21, 255] (= EF 40 15 FF). H2/P4 have no upstream
+    MPY port (out of scope for MPY; Arduino matrix covers them).
+    Artifacts in /home/danish1075/mpywork (q_*.txt REPL feeders, r3/r6
+    logs, sketches/nvstest+spipoll+spiisr+spinodma+c6timer+nvsh2).
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,
@@ -485,20 +525,41 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     program-AND semantics + erase; unbuffered stdout (REPL prompt has
     no newline and was lost in libc buffering on kill); C3 UART RX
     file feed + `-U` + `/uartrx` WASM default (+C3/C6 RX_FILE runner
-    envs). FS images are prebuilt externally for now (littlefs-python,
-    2 MB @0x200000 + boot.py/main.py). KNOWN GAPS (logged, not
-    regressions): FS writes fail — narrowed hard via Arduino NVS
-    sketch with exact codes (INIT 0, OPEN 0x105) plus ELF disassembly:
-    `Page::initialize`'s partition header read returns 0x105 with ZERO
-    SPI traffic, while `esp_flash_get_size` works (so chip_check
-    passes; failure is post-check pre-SPI in the start/lock/verify
-    path, or a silent-zero MMU read masking a fault). Next step when
-    resumed: GDB with Arduino ELF symbols on the writeItem return.
-    Also: machine.SPI constructor hangs on C3 (likely DMA/SPI2 init
-    poll); long REPL inputs stall past ~250 fed bytes (use main.py for
-    long tests, which verified the full matrix on both chips: PIN 1,
-    I2C [80], ADC 1408, TIMER True, PWM_OK, ALL_OK); H2/P4 have no
-    upstream MicroPython port.
+     envs). FS images are prebuilt externally for now (littlefs-python,
+     2 MB @0x200000 + boot.py/main.py). KNOWN GAPS (logged, not
+     regressions): FS writes fail — ROOT-CAUSED 2026-09-12 via GDB
+     (ENABLE_GDBSTUB=1, riscv32-esp-elf-gdb): `spi_flash_chip_generic_write`
+     fails in `set_chip_write_protect(false)` → 0x105 because the HAL's
+     WREN uses the DEDICATED SPI_MEM_CMD.WREN bit (30), which the old
+     USR-only trigger ignored (WEL never set). Second bug in the same
+     path: SPI_MEM MOSI_DLEN is at +0x24, not +0x2C (RD_STATUS), so USR
+     page-programs wrote 1 byte systematically. Fix in `src/esp32c3.c`:
+     dedicated-bit WREN/WRDI/PP/SE/BE/CE/WRSR/RDSR/RDID/READ handling on
+     both 0x2000/0x3000, MOSI offset +0x24, MOSI pre-capture before W0
+     clear, USER(0x3000) path serviced. Verified native + WASM(node):
+     NVS INIT/OPEN/SET/COMMIT/GET 0 VAL 12345678; raw
+     erase/write/read 32 B exact. C6/H2/P4 share the HAL/driver, so they
+     have the same two bugs (their 0x2C MOSI + missing dedicated WREN);
+     port the same pattern there with per-chip NVS verification.
+     Also: machine.SPI hangs on C3 (ISR transfers, e.g. MPY
+     `write_readinto`, IDF `spi_device_transmit` with DMA): ROOT-CAUSED
+     2026-09-12 — NOT a status poll. queue_trans returns, transfer never
+     starts, get_result blocks forever: the v5.5 bus-lock runs transfers
+     in the SPI ISR (background), and the kick (TRANS_DONE kept active
+     when idle → esp_intr_enable invokes ISR) never arrives. Fixed the
+     peripheral side in `src/esp32c3.c` (TRANS_INT ENA/CLR/RAW/ST map at
+     0x30/0x34/0x38/0x3C, idle-active RAW init, level-following INTC
+     line incl. remap re-evaluate) — line-9 delivery now fires (TRAP
+     verified) — but the ISR then crashes (pc=0, SP garbage, nested
+     fault spiral draining SP). Vectors are valid (vec5/vec9 both jal to
+     _interrupt_handler) and GPTimer dynamic ISRs demonstrably work, so
+     the remaining bug is ISR-context state (mscratch/vector-target
+     suspect), not routing. Next: debug the ISR crash (GDB break at
+     spi_intr 0x42014868 with Arduino spiisr sketch), then MPY t_spi.
+     Unrelated: /tmp/opencode was wiped mid-session (all MPY bins +
+     t_*.txt + sketch builds lost); NVS/flashtest/spiisr sketches were
+     recreated (contents in session notes) and rebuilt; MPY FS
+     re-verification needs a fresh micropython C3 image.
   - DONE 2026-09-11: trap-pause de-scaffolding verdict: KEEP (it is
     load-bearing, not a hack). With the budget disabled, unpatched
     dual boot wedges in early bringup with zero further output: hart1

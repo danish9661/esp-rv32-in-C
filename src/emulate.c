@@ -2752,6 +2752,42 @@ void rv_step_debug(void *arg)
     rv_check_interrupt(rv);
 #endif
 
+    /* Drive SoC time/peripherals under the debugger too: without this,
+     * GDB `continue` runs guest code with frozen peripheral time, so any
+     * firmware wait-loop on a timer/UART never exits (observed: wedged in
+     * RTC init). Mirrors the ESP32 blocks of rv_step, except P4 hart
+     * switching (GDB drives one hart; hart1 stays parked — SMP debugging
+     * can inspect it but not run it). Batched every 32 steps: per-step
+     * driving is ~50x slower than the boot needs. */
+    {
+        static unsigned dbg_div = 0;
+        if ((dbg_div++ & 31u) == 0) {
+#if RV32_HAS(ESP32_C3)
+            if (PRIV(rv)->esp32c3) {
+                esp32c3_periodic(rv);
+                esp32c3_check_interrupt(rv);
+            }
+#endif
+#if RV32_HAS(ESP32_C6)
+            if (PRIV(rv)->esp32c6) {
+                esp32c6_periodic(rv);
+                esp32c6_check_interrupt(rv);
+            }
+#endif
+#if RV32_HAS(ESP32_H2)
+            if (PRIV(rv)->esp32h2) {
+                esp32h2_periodic(rv);
+                esp32h2_check_interrupt(rv);
+            }
+#endif
+#if RV32_HAS(ESP32_P4)
+            if (PRIV(rv)->esp32p4) {
+                esp32p4_smp_poll(rv);
+            }
+#endif
+        }
+    }
+
 #if !RV32_HAS(SYSTEM)
     /* on exit */
     if (unlikely(rv->PC == PRIV(rv)->exit_addr))

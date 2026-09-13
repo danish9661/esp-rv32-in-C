@@ -329,6 +329,7 @@ struct esp32c6_soc {
     uint32_t gdma_tx_desc_buf[3];  /* current descriptor buffer (full) */
     uint32_t gdma_tx_desc_len[3];  /* current descriptor length (bytes) */
     uint32_t gdma_tx_desc_left[3]; /* bytes still to push */
+    uint32_t gdma_out_last;        /* most recently started OUT channel */
     uint32_t gdma_tx_next_addr[3]; /* next descriptor address (DW2) */
     uint64_t gdma_tx_drain_cyc[3]; /* next cycle for the paced drain */
 
@@ -467,6 +468,25 @@ static void esp32_add_region(esp32c6_t *soc,
     assert(r->data || type == ESP32_REG_MMIO);
 }
 
+/* GPSPI2/SPI2 interrupt source (interrupts.h enum: GSPI2 = 72) */
+#define C6_SPI2_INTR_SOURCE 72u
+/* SPI2 TRANS_DONE is BIT(12) of dma_int_raw (per esp32c6 spi_struct.h
+ * field order). Kept active when idle so enabling the interrupt invokes
+ * the ISR (IDF spi_master relies on this to kick interrupt transfers). */
+#define C6_SPI2_TRANS_DONE_MASK 0x1000u
+/* GDMA peripheral select for SPI2 (gdma_channel.h:
+ * SOC_GDMA_TRIG_PERIPH_SPI2 = 0). */
+#define C6_GDMA_PERI_SPI2 0u
+/* GDMA link addresses are full DRAM addresses on C6 (gdma_start programs
+ * the whole addr field). If a link value is below SRAM, fall back to the
+ * legacy 20-bit window form. */
+static uint32_t esp32c6_gdma_link_addr(uint32_t link)
+{
+    if (link >= C6_SRAM_BASE && link < C6_SRAM_BASE + C6_SRAM_SIZE)
+        return link;
+    return C6_SRAM_BASE + (link & 0xFFFFFu);
+}
+
 /* ------------------------------------------------------------------ */
 /* SoC construction                                                    */
 /* ------------------------------------------------------------------ */
@@ -486,6 +506,8 @@ esp32c6_t *esp32c6_new(void)
     for (int i = 0; i < 16; i++)
         soc->spi2_dev_mem[i] = 0x40 + i;
     soc->spi2_jedec = 4;
+    /* SPI2 TRANS_DONE kept active when idle (see mask comment) */
+    soc->spi2_reg[0x3Cu >> 2] = C6_SPI2_TRANS_DONE_MASK;
     soc->gpio_in_prev = 0;
 
     /* flash backing shared by the i/d-cache window. Erased flash
@@ -557,6 +579,15 @@ esp32c6_t *esp32c6_new(void)
 #define C6_RMT_INTR_SOURCE 49u
 /* I2C_EXT0 interrupt source (intmatrix.h enum) */
 #define C6_I2C_EXT0_INTR_SOURCE 50u
+/* SPI2 TRANS_DONE level helper (mask above). */
+static void esp32c6_spi2_int_update(esp32c6_t *soc)
+{
+    uint32_t st = soc->spi2_reg[0x3Cu >> 2] & soc->spi2_reg[0x34u >> 2];
+    if (st)
+        soc->intc_status |= ((__uint128_t)1) << C6_SPI2_INTR_SOURCE;
+    else
+        soc->intc_status &= ~(((__uint128_t)1) << C6_SPI2_INTR_SOURCE);
+}
 /* TIMG0/TIMG1 timer interrupt sources (interrupts.h enum) */
 #define C6_TG0_T0_INTR_SOURCE 51u
 #define C6_TG1_T0_INTR_SOURCE 54u
@@ -1067,7 +1098,11 @@ static uint32_t esp32_mmio_read(esp32c6_t *soc, uint32_t addr)
     /* SPI2 (GPSPI2, 0x60081000-0x60081100) */
     if (addr >= C6_PERIPH_BASE + 0x81000u &&
         addr < C6_PERIPH_BASE + 0x81100u) {
-        return soc->spi2_reg[(addr - C6_PERIPH_BASE - 0x81000u) >> 2];
+        uint32_t o = addr - C6_PERIPH_BASE - 0x81000u;
+        if (o == 0x40u) /* dma_int_st = raw & ena */
+            return soc->spi2_reg[0x3Cu >> 2] &
+                   soc->spi2_reg[0x34u >> 2];
+        return soc->spi2_reg[o >> 2];
     }
 
     /* GDMA (0x60080000-0x600802B0): IN + OUT channels and per-channel
@@ -1799,10 +1834,19 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
         uint32_t *r = soc->spi2_reg + ((addr - C6_PERIPH_BASE - 0x81000u) >> 2);
         if (addr == C6_PERIPH_BASE + 0x81000u) { /* cmd */
             *r = val & ~(1u << 23); /* update self-clears: config applied */
-            if (val & (1u << 24))   /* usr: transfer begins */
+            if (val & (1u << 24)) { /* usr: transfer begins */
                 soc->spi2_transfer_pending = 1;
+                /* TRANS_DONE deasserts while busy */
+                soc->spi2_reg[0x3Cu >> 2] &= ~C6_SPI2_TRANS_DONE_MASK;
+                esp32c6_spi2_int_update(soc);
+            }
         } else if (addr == C6_PERIPH_BASE + 0x81038u) { /* dma_int_clr */
             soc->spi2_reg[0x3c >> 2] &= ~val; /* clear raw interrupt bits */
+            esp32c6_spi2_int_update(soc);
+        } else if (addr == C6_PERIPH_BASE + 0x81034u) { /* dma_int_ena */
+            *r = val;
+            esp32c6_spi2_int_update(soc);
+        } else if (addr == C6_PERIPH_BASE + 0x81040u) { /* dma_int_st RO */
         } else {
             *r = val;
         }
@@ -2147,8 +2191,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                     soc->gdma_in_link[c] =
                         val & ~0xF00000u; /* start/stop/restart/park WT */
                     if (val & (1u << 22)) { /* start */
-                        soc->gdma_rx_desc_addr[c] = C6_SRAM_BASE +
-                            (soc->gdma_in_link[c] & 0xFFFFFu);
+                        soc->gdma_rx_desc_addr[c] =
+                            esp32c6_gdma_link_addr(soc->gdma_in_link[c]);
                         soc->gdma_rx_sample[c] = 0;
                         esp32c6_gdma_load_rx_desc(soc, c);
                         soc->gdma_rx_run[c] = 1;
@@ -2187,8 +2231,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 soc->gdma_out_link[c] =
                     val & ~0x700000u; /* start/stop/restart are WT */
                 if (val & (1u << 21)) { /* start */
-                    soc->gdma_tx_desc_addr[c] = C6_SRAM_BASE +
-                        (soc->gdma_out_link[c] & 0xFFFFFu);
+                    soc->gdma_tx_desc_addr[c] =
+                        esp32c6_gdma_link_addr(soc->gdma_out_link[c]);
+                    soc->gdma_out_last = c;
                     esp32c6_gdma_load_desc(soc, c);
                     soc->gdma_tx_run[c] = 1;
                     soc->gdma_tx_drain_cyc[c] = rv->csr_cycle + 256u;
@@ -2393,6 +2438,89 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             }
         }
         mmio32[off >> 2] = val;
+        if (addr == C6_PERIPH_BASE + 0x2000u ||
+            addr == C6_PERIPH_BASE + 0x3000u) {
+            /* Dedicated-bit ops (HAL path, no USR): WREN/WRDI set/clear
+             * WEL; PP/SE/BE/CE program/erase; RDSR/RDID/READ return data.
+             * Without these every flash write fails verification with
+             * 0x105 (WEL never set). CMD bit map (TRM SPI_MEM_CMD):
+             * USR=18, CE=22, BE=23, SE=24, PP=25, WRSR=26, RDSR=27,
+             * RDID=28, WRDI=29, WREN=30, READ=31. */
+            uint32_t base = addr - C6_PERIPH_BASE;
+            uint32_t *w = mmio32 + ((base + SPI_DATA_BUF) >> 2);
+            uint32_t addrreg = mmio32[((base + SPI_ADDR_REG) >> 2)];
+            esp32_region_t *fi =
+                esp32_find_region(soc, C6_FLASH_I_BASE);
+            if (val & (1u << 30))
+                soc->flash_sr |= 0x02u; /* FLASH_WREN */
+            if (val & (1u << 29))
+                soc->flash_sr &= ~0x02u; /* FLASH_WRDI */
+            if (val & (1u << 22)) { /* FLASH_CE: chip erase */
+                memset(fi->data, 0xFF, C6_FLASH_SIZE);
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 23)) { /* FLASH_BE: block erase (64K) */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t bbase = faddr & ~65535u;
+                if (bbase < C6_FLASH_SIZE) {
+                    uint32_t len = C6_FLASH_SIZE - bbase;
+                    if (len > 65536u)
+                        len = 65536u;
+                    memset(fi->data + bbase, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 24)) { /* FLASH_SE: sector erase (4K) */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t sbase = faddr & ~4095u;
+                if (sbase < C6_FLASH_SIZE) {
+                    uint32_t len = C6_FLASH_SIZE - sbase;
+                    if (len > 4096u)
+                        len = 4096u;
+                    memset(fi->data + sbase, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 25)) { /* FLASH_PP: page program */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t plen = (addrreg >> 24) & 0xFFu;
+                if (plen == 0)
+                    plen = 256u;
+                if (plen > 64u)
+                    plen = 64u;
+                uint8_t *wb = (uint8_t *) w;
+                for (uint32_t i = 0; i < plen; i++)
+                    if (faddr + i < C6_FLASH_SIZE)
+                        fi->data[faddr + i] &= wb[i];
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 26)) { /* FLASH_WRSR */
+                soc->flash_sr = w[0] & 0xFFu;
+                soc->flash_sr2 = (w[0] >> 8) & 0xFFu;
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 27)) /* FLASH_RDSR */
+                w[0] = soc->flash_sr;
+            if (val & (1u << 28)) /* FLASH_RDID */
+                w[0] = 0x1640EFu;
+            if (val & (1u << 31)) { /* FLASH_READ */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t miso =
+                    (mmio32[((base + SPI_MISO_DLEN) >> 2)] & 0x3FFu) + 1u;
+                uint32_t rn = (miso + 7u) / 8u;
+                if (rn > 64u)
+                    rn = 64u;
+                if (faddr < C6_FLASH_SIZE)
+                    memcpy(w, fi->data + faddr, rn);
+            }
+            if (val & ~(0x40000u | 0x20000u)) {
+                /* Dedicated bits serviced above: self-clear so
+                 * poll_cmd_done (which spins on cmd==0) exits. USR
+                 * path below clears CMD itself after servicing. */
+                if (!(val & 0x40000u))
+                    mmio32[off >> 2] = 0;
+            }
+        }
         if ((addr == C6_PERIPH_BASE + 0x2000u ||
              addr == C6_PERIPH_BASE + 0x3000u) && (val & SPI_CMD_USR_BIT)) {
             /* SPI_USR command trigger: service the command into W0.. */
@@ -2406,6 +2534,17 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
             if (nbytes > 64u)
                 nbytes = 64u;
             esp32_region_t *fi = esp32_find_region(soc, C6_FLASH_I_BASE);
+            /* SPI_MEM MOSI_DLEN is at base+0x24 (MISO at +0x28); capture
+             * the payload BEFORE W0 is cleared below (program data would
+             * otherwise be destroyed). */
+            uint32_t mosiw =
+                (mmio32[(base + 0x24u) >> 2] & 0xFFFFFFu) + 1u;
+            uint32_t wnw = (mosiw + 7u) / 8u;
+            if (wnw > 64u)
+                wnw = 64u;
+            uint8_t mosi_data[64];
+            memset(mosi_data, 0, sizeof(mosi_data));
+            memcpy(mosi_data, w, wnw);
             memset(w, 0, nbytes);
             uint32_t faddr = mmio32[(base + SPI_ADDR_REG) >> 2];
             if (cmd == 0x9Fu) {
@@ -2443,17 +2582,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val)
                 if (faddr < C6_FLASH_SIZE)
                     memcpy(w, fi->data + faddr, nbytes);
             } else if (user & 0x08000000u) {
-                /* USR_MOSI: program data from W0 (flash can only
-                 * clear bits: AND. Length from MOSI_DLEN). */
-                uint32_t mosi =
-                    (mmio32[(base + 0x2Cu) >> 2] & 0x3FFu) + 1u;
-                uint32_t wn = (mosi + 7u) / 8u;
-                if (wn > 64u)
-                    wn = 64u;
-                uint8_t *wb = (uint8_t *) w;
-                for (uint32_t i = 0; i < wn; i++)
+                /* USR_MOSI: program data from the pre-captured MOSI
+                 * payload (flash can only clear bits: AND). */
+                for (uint32_t i = 0; i < wnw; i++)
                     if (faddr + i < C6_FLASH_SIZE)
-                        fi->data[faddr + i] &= wb[i];
+                        fi->data[faddr + i] &= mosi_data[i];
                 soc->flash_sr &= ~0x02u; /* program clears WEL */
             } else if (cmd == 0x20u || cmd == 0x52u || cmd == 0xD8u ||
                        cmd == 0x60u || cmd == 0xC7u) {
@@ -3256,22 +3389,64 @@ void esp32c6_periodic(riscv_t *rv)
 
     /* SPI2 transfer completion: cmd.usr was set. The virtual device (a
      * 16-byte SRAM, JEDEC ID 0xEF4015, echo fallback) decodes the TX bytes
-     * from the data buffer (little-endian byte order as the HAL packs it)
-     * and shifts its response back MSB-first; with no device selected the
-     * MISO line floats high so every received byte is 0xFF. */
+     * and shifts its response back. TX source: DMA OUT descriptor chain
+     * when dma_tx_ena (bit 28 of DMA_CONF 0x30), else the CPU data buffer
+     * at 0x98. RX always lands in the CPU data buffer (spi_hal_fetch_result
+     * path) and is mirrored into the GDMA IN descriptor buffers. */
     if (soc->spi2_transfer_pending) {
         soc->spi2_transfer_pending = 0;
-        uint32_t dlen = soc->spi2_reg[0x1c >> 2] & 0x3Fu; /* usr_mosi_dbitlen */
+        uint32_t dlen = soc->spi2_reg[0x1c >> 2] & 0x3FFFFu; /* ms_data_bitlen */
         int n = (dlen + 8) / 8; /* transferred bytes, byte-aligned */
-        if (n > 16)
-            n = 16;
-        uint8_t tx[16], rx[16];
-        for (int i = 0; i < n; i++) {
-            int w = i >> 2;
-            int sh = 8 * (i & 3); /* HAL packs/reads buffer bytes LE */
-            tx[i] = (soc->spi2_reg[(0x98u + 4u * w) >> 2] >> sh) & 0xFFu;
+        if (n < 1)
+            n = 1;
+        if (n > 64)
+            n = 64;
+        int dma_on = (soc->spi2_reg[0x30 >> 2] >> 28) & 1u; /* dma_tx_ena */
+        uint8_t tx[64], rx[64];
+        if (dma_on) {
+            /* TX bytes live in the GDMA OUT descriptor chain (12B align4
+             * layout: DW0 size[11:0]/length[23:12], DW1 buffer, DW2 next).
+             * Any channel may carry SPI: scan newest first. */
+            int got = 0;
+            for (int k = 0; k < 3 && got < n; k++) {
+                int ch = (soc->gdma_out_last + 3 - k) % 3;
+                if (soc->gdma_out_peri_sel[ch] != C6_GDMA_PERI_SPI2 ||
+                    !soc->gdma_tx_desc_addr[ch])
+                    continue;
+                uint32_t daddr = soc->gdma_tx_desc_addr[ch];
+                while (daddr && got < n) {
+                    uint8_t *d = esp32c6_dma_ptr(soc, daddr);
+                    if (!d)
+                        break;
+                    uint32_t dw0, dw1, dw2;
+                    memcpy(&dw0, d, 4);
+                    memcpy(&dw1, d + 4, 4);
+                    memcpy(&dw2, d + 8, 4);
+                    uint32_t blen = (dw0 >> 12) & 0xFFFu;
+                    if (!blen)
+                        blen = dw0 & 0xFFFu;
+                    uint8_t *bp = esp32c6_dma_ptr(soc, dw1);
+                    if (!bp)
+                        break;
+                    for (uint32_t i = 0; i < blen && got < n; i++)
+                        tx[got++] = bp[i];
+                    if (!dw2)
+                        break;
+                    daddr = dw2;
+                }
+                break; /* first matching channel wins */
+            }
+            while (got < n)
+                tx[got++] = 0xFFu;
+        } else {
+            for (int i = 0; i < n; i++) {
+                int w = i >> 2;
+                int sh = 8 * (i & 3); /* HAL packs/reads buffer bytes LE */
+                tx[i] = (soc->spi2_reg[(0x98u + 4u * w) >> 2] >> sh) & 0xFFu;
+            }
         }
-        if (soc->spi2_jedec < 4) { /* mid JEDEC read: clock out next ID bytes */
+        if (soc->spi2_jedec < 4 && (n < 1 || tx[0] != 0x9Fu)) {
+            /* mid JEDEC read: clock out next ID bytes */
             static const uint8_t jedec_id[4] = { 0xEFu, 0x40u, 0x15u, 0xFFu };
             int idx = soc->spi2_jedec;
             for (int i = 0; i < n; i++) {
@@ -3299,7 +3474,7 @@ void esp32c6_periodic(riscv_t *rv)
             for (int i = 0; i < n; i++)
                 rx[i] = tx[i];
         }
-        for (int i = 0; i < 4; i++) /* MISO floats high for unused bits */
+        for (int i = 0; i < 16; i++) /* MISO floats high for unused bits */
             soc->spi2_reg[(0x98u + 4u * i) >> 2] = 0xFFFFFFFFu;
         for (int i = 0; i < n; i++) { /* response packed LE like the HAL reads */
             int w = i >> 2;
@@ -3307,8 +3482,28 @@ void esp32c6_periodic(riscv_t *rv)
             uint32_t *reg = &soc->spi2_reg[(0x98u + 4u * w) >> 2];
             *reg = (*reg & ~(0xFFu << sh)) | ((uint32_t)rx[i] << sh);
         }
+        /* RX under DMA also lands in the GDMA IN descriptor buffers. */
+        for (int ch = 0; ch < 3; ch++) {
+            if (!soc->gdma_rx_desc_addr[ch])
+                continue;
+            uint8_t *id = esp32c6_dma_ptr(soc, soc->gdma_rx_desc_addr[ch]);
+            if (!id)
+                continue;
+            uint32_t iw0, iw1;
+            memcpy(&iw0, id, 4);
+            memcpy(&iw1, id + 4, 4);
+            uint8_t *ib = esp32c6_dma_ptr(soc, iw1);
+            if (!ib)
+                continue;
+            uint32_t blen = (iw0 >> 12) & 0xFFFu;
+            if (!blen)
+                blen = iw0 & 0xFFFu;
+            for (uint32_t i = 0; i < blen && i < (uint32_t) n; i++)
+                ib[i] = rx[i];
+        }
         soc->spi2_reg[0x00 >> 2] &= ~(1u << 24); /* usr cleared */
         soc->spi2_reg[0x3c >> 2] |= 1u << 12;    /* trans_done raw */
+        esp32c6_spi2_int_update(soc);
     }
 
     /* TWAI0 TX completion: a tx_request was issued. No other node on the
