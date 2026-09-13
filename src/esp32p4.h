@@ -24,7 +24,7 @@
 #define P4_LP_SRAM_SIZE 0x8000u /* 32 KB */
 #define P4_FLASH_I_BASE 0x40000000u /* i/d-cache window (64 MB decode) */
 #define P4_FLASH_WINDOW_SIZE 0x4000000u /* flash cache window (64 MB) */
-#define P4_FLASH_SIZE 0x400000u /* 4 MB flash */
+#define P4_FLASH_SIZE 0x1000000u /* 16 MB flash (MPY P4 board = 16 MB part) */
 #define P4_MMIO_BASE 0x50000000u
 #define P4_MMIO_SIZE 0x130000u /* 0x50000000-0x50130000: HP+LP peripherals */
 /* Internal C6-style dispatch base: guest P4 peripheral addresses are

@@ -511,10 +511,38 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     patch in machine_hw_spi.c kept): per-peripheral REPL matrix green on
     C3 AND C6 — PIN1 1, I2C [80], ADC 1024, TIMER True, PWM_OK, SPI
     constructor OK, UART OK, FS write+readback hello-mpy-fs + FSRW_OK,
-    SPI xfer [239, 64, 21, 255] (= EF 40 15 FF). H2/P4 have no upstream
-    MPY port (out of scope for MPY; Arduino matrix covers them).
+    SPI xfer [239, 64, 21, 255] (= EF 40 15 FF).
     Artifacts in /home/danish1075/mpywork (q_*.txt REPL feeders, r3/r6
     logs, sketches/nvstest+spipoll+spiisr+spinodma+c6timer+nvsh2).
+  - DONE 2026-09-13: MicroPython H2 — upstream HAS a port
+    (ESP32_GENERIC_H2, IDF v5.5.4 build from source). Boots to REPL on
+    `-C esp32h2` with zero model changes (H2 SPI/GDMA work from the prior
+    commit already covers the MPY DMA path). Matrix green via chunked
+    REPL feeders (yh_a..e logs): PIN1 1, I2C [80], ADC 1024 (Pin 1; Pin 0
+    is not ADC-capable on H2 — upstream table starts at GPIO 1),
+    TIMER True, PWM_OK (Pin 2), SPI xfer [239,64,21,255], UART_OK,
+    FS hello-mpy-fs + FSRW_OK. Note: the shared q_*.txt feeders use C3
+    pin numbers (ADC Pin 0, SPI sck 6/mosi 7/miso 2) which are invalid on
+    H2; H2-specific qh_*.txt feeders carry the right pins. Large single
+    feeders stall the UART RX path, so the matrix runs in ≤250-byte
+    chunks (a/b/c/d/e splits).
+  - WIP 2026-09-13: MicroPython P4 — upstream HAS a port
+    (ESP32_GENERIC_P4, PRE_REV3 variant for rev < 3). Emulator-side
+    progress this session (src/esp32p4.c/.h, NOT the MPY tree): 16 MB
+    flash backing (MPY P4 board = 16 MB part; old 4 MB truncated the app
+    → ROM "invalid header"), eFuse wafer rev reports v3.0 (PRE_REV3
+    build skips the check anyway; default board needs >= v3.0),
+    MSPI(MPLL) CAL_END + handshake on ANA_PLL_CTRL0, LPPERI reset
+    defaults, PSRAM MSPI plain-storage block, flash backing init to
+    0xFF. PSRAM-less NOPSRAM board variant added in the MPY tree
+    (boards/ESP32_GENERIC_P4/mpconfigvariant_NOPSRAM.cmake +
+    /home/danish1075/mpywork/sdkconfig.nopsram) to isolate the PSRAM
+    bringup. Status: P4 MPY boots through bootloader + app start, then
+    stalls in ROM MD5Transform (pc 0x4fc06416, called from app boot code
+    path) — both with and without PSRAM. Arduino P4 matrix unaffected
+    (patched HELLO+TICK, SMP SPI EF 40 15 re-verified green on this
+    tree). Next: trace what the MD5 call guards (likely image/sha verify
+    or early-console path) and find the unmodeled register behind it.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,

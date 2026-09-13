@@ -415,10 +415,13 @@ struct esp32p4_soc {
     uint32_t appcpu_boot_addr;
     uint8_t smp_enabled;
     unsigned long smp_toggle;
-    /* LP_PERI_CLKRST (0x50120000): clk_en/reset_en are plain storage so
-     * clock-gate read-backs (e.g. regi2c ck_en_lp_i2cmst, asserted by the
-     * bootloader) see the enabled bit. */
+    /* LP_PERI (LPPERI, 0x50120000): clk_en @+0x0 (ck_en_lp_i2cmst=27,
+     * reset default 1), reset_en @+0x4. Plain read-back storage with
+     * reset defaults so clock-gate polls see enabled bits. */
     uint32_t lpperi_reg[4];
+    /* PSRAM MSPI controllers (0x5008E000-0x50090000): plain read-back
+     * storage so driver register programming sticks. */
+    uint32_t psram_reg[2048];
     /* HP_SYS_CLKRST (0x500E6000, 4KB) + PMU (0x50115000, 4KB): plain
      * read-back storage so clock-tree configuration (PLL selects,
      * dividers, enables written by the ROM/bootloader/SDK) sticks and
@@ -592,10 +595,16 @@ esp32p4_t *esp32p4_new(void)
     /* SPI2 TRANS_DONE kept active when idle (level kick for the ISR) */
     soc->spi2_reg[0x3Cu >> 2] = P4_SPI2_TRANS_DONE_MASK;
     soc->gpio_in_prev = 0;
+    /* LPPERI reset defaults: clk_en has all peripheral clocks on except
+     * bit 31 (ck_en_lp_core = 0); reset_en all deasserted. */
+    soc->lpperi_reg[0] = 0x7FFFFFFFu;
 
     /* flash backing shared by the i/d-cache window */
     uint8_t *flash = calloc(1, P4_FLASH_SIZE);
     assert(flash);
+    /* Erased flash reads 0xFF (real HW); bootloader/app empty checks
+     * and NVS rely on it. (calloc gives 0x00; C3/C6/H2 memset to 0xFF.) */
+    memset(flash, 0xFF, P4_FLASH_SIZE);
 
     esp32_add_region(soc, P4_TCM_BASE, P4_TCM_SIZE, ESP32_REG_RAM);
     esp32_add_region(soc, P4_SRAM_BASE, P4_SRAM_SIZE, ESP32_REG_RAM);
@@ -1370,14 +1379,25 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return 0;
     }
 
-    /* eFuse block (0x5012D000): unmodeled fields read as zero. The
-     * bootloader only needs plausible chip-version/revision fields;
-     * zeros select the default revision path. */
-    if (addr >= 0x5012D000u && addr < 0x5012D400u)
+    /* eFuse block (0x5012D000): report a v3.0 chip so revision-gated
+     * images (e.g. MicroPython P4, REV_MIN_300) pass the bootloader's
+     * revision check. RD_MAC_SYS_2 @+0x4C: MINOR[3:0]=0,
+     * MAJOR_LO[5:4]=3, MAJOR_HI[23]=0 (major = HI<<2|LO = 3). */
+    if (addr >= 0x5012D000u && addr < 0x5012D400u) {
+        if (addr == 0x5012D000u + 0x4Cu)
+            return (3u << 4); /* wafer major 3, minor 0 */
         return 0;
+    }
 
-    /* LP_PERI_CLKRST (0x50120000): clk_en/core_clk_sel/reset_en/cpu are
-     * plain read-back storage. */
+    /* PSRAM MSPI controllers (0x5008E000/0x5008F000, SPIMEM2 blocks):
+     * plain read-back storage (like the other clock/reset blocks) so
+     * the PSRAM driver's register programming sticks and its status
+     * polls observe configured values. */
+    if (addr >= 0x5008E000u && addr < 0x50090000u)
+        return soc->psram_reg[(addr - 0x5008E000u) >> 2];
+
+    /* LP_PERI (LPPERI, 0x50120000): clk_en @+0x0 (ck_en_lp_i2cmst=27,
+     * reset default 1), reset_en @+0x4. Plain read-back storage. */
     if (addr >= 0x50120000u && addr < 0x50120010u)
         return soc->lpperi_reg[(addr - 0x50120000u) >> 2];
 
@@ -1387,7 +1407,8 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         uint32_t o = addr - 0x500E6000u;
         uint32_t v = soc->hpsys_reg[o >> 2];
         if (addr == 0x500E60BCu)
-            v |= 0x5u; /* ANA_PLL_CTRL0: PLL CAL_END x2 (instant) */
+            v |= 0x5u | (1u << 8); /* ANA_PLL_CTRL0: PLL CAL_END x2 +
+                                    * MSPI(MPLL) CAL_END (instant) */
         if (addr == 0x500E6004u)
             /* ROOT_CLK_CTRL0 SOC_CLK_DIV_UPDATE (bit 4) is WT: the
              * hardware self-clears it once the divider update applies.
@@ -2071,6 +2092,19 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
     /* HP_SYS_CLKRST + PMU: plain read-back storage. */
     if (addr >= 0x500E6000u && addr < 0x500E7000u) {
         soc->hpsys_reg[(addr - 0x500E6000u) >> 2] = val;
+        /* MPLL/CPLL calibration handshake: CLEAR (start) must clear the
+         * CAL_END status so the driver's wait-for-done observes the
+         * transition; SET (stop) asserts CAL_END (instant cal). */
+        if (addr == 0x500E60BCu) {
+            if (val & (1u << 9))
+                soc->hpsys_reg[(0xBCu) >> 2] |= (1u << 8); /* MSPI END */
+            else
+                soc->hpsys_reg[(0xBCu) >> 2] &= ~(1u << 8);
+            if (val & (1u << 1))
+                soc->hpsys_reg[(0xBCu) >> 2] |= (1u << 0); /* CPU PLL END */
+            else
+                soc->hpsys_reg[(0xBCu) >> 2] &= ~(1u << 0);
+        }
         return;
     }
     if (addr >= 0x50115000u && addr < 0x50116000u) {
@@ -2081,6 +2115,13 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
     /* LP_PERI_CLKRST (0x50120000): plain read-back storage. */
     if (addr >= 0x50120000u && addr < 0x50120010u) {
         soc->lpperi_reg[(addr - 0x50120000u) >> 2] = val;
+        return;
+    }
+
+    /* PSRAM MSPI controllers (0x5008E000-0x50090000): plain read-back
+     * storage. */
+    if (addr >= 0x5008E000u && addr < 0x50090000u) {
+        soc->psram_reg[(addr - 0x5008E000u) >> 2] = val;
         return;
     }
 
