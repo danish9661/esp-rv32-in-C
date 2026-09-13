@@ -526,23 +526,54 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     H2; H2-specific qh_*.txt feeders carry the right pins. Large single
     feeders stall the UART RX path, so the matrix runs in ≤250-byte
     chunks (a/b/c/d/e splits).
-  - WIP 2026-09-13: MicroPython P4 — upstream HAS a port
-    (ESP32_GENERIC_P4, PRE_REV3 variant for rev < 3). Emulator-side
-    progress this session (src/esp32p4.c/.h, NOT the MPY tree): 16 MB
-    flash backing (MPY P4 board = 16 MB part; old 4 MB truncated the app
-    → ROM "invalid header"), eFuse wafer rev reports v3.0 (PRE_REV3
-    build skips the check anyway; default board needs >= v3.0),
-    MSPI(MPLL) CAL_END + handshake on ANA_PLL_CTRL0, LPPERI reset
-    defaults, PSRAM MSPI plain-storage block, flash backing init to
-    0xFF. PSRAM-less NOPSRAM board variant added in the MPY tree
-    (boards/ESP32_GENERIC_P4/mpconfigvariant_NOPSRAM.cmake +
-    /home/danish1075/mpywork/sdkconfig.nopsram) to isolate the PSRAM
-    bringup. Status: P4 MPY boots through bootloader + app start, then
-    stalls in ROM MD5Transform (pc 0x4fc06416, called from app boot code
-    path) — both with and without PSRAM. Arduino P4 matrix unaffected
-    (patched HELLO+TICK, SMP SPI EF 40 15 re-verified green on this
-    tree). Next: trace what the MD5 call guards (likely image/sha verify
-    or early-console path) and find the unmodeled register behind it.
+   - WIP 2026-09-13: MicroPython P4 — upstream HAS a port
+     (ESP32_GENERIC_P4, PRE_REV3 variant for rev < 3). Emulator-side
+     progress this session (src/esp32p4.c/.h, NOT the MPY tree): 16 MB
+     flash backing (MPY P4 board = 16 MB part; old 4 MB truncated the app
+     → ROM "invalid header"), eFuse wafer rev reports v1.0 (PRE_REV3
+     bootloader skips max-rev at its own stage but the APP image carries
+     max_rev_full=199, so v1.x < v3 default-board images fail rev check —
+     v1.0 is the compatible middle), MSPI(MPLL) CAL_END + handshake on
+     ANA_PLL_CTRL0, LPPERI reset defaults, PSRAM MSPI plain-storage block,
+     flash backing init to 0xFF, LP_CLKRST (0x50111000) read-back storage,
+     TIMG RTC-calibration count fix (`<< 7` + RDY on both TIMG0/1 and the
+     translated 0x60008068 path; the old formula hashed wrong counts and
+     rtc_clk_cal looped forever). PSRAM-less NOPSRAM board variant added
+     in the MPY tree (boards/ESP32_GENERIC_P4/mpconfigvariant_NOPSRAM.cmake
+     + /home/danish1075/mpywork/sdkconfig.nopsram) to isolate the PSRAM
+     bringup. Root causes fixed this session:
+       * ROM ABI skew: the bundled rev0 HP ROM dump carries the BASE jal
+         table (MD5 5EC/5F0/5F4, SHA 614/620/62C/630) but IDF v5.5 links
+         the ECO5 table (-0xC: MD5 5E0/5E4/5E8, SHA 608/614/620/624).
+         Base slots point at CRC helpers / LP-core stubs (the 0x4fc06416
+         "MD5Transform stall" was really the CRC byte loop entered as
+         MD5Update; SHA 62C/630 point at unmapped 0x4fb0xxxx). Fix
+         (p4_remap_rom_slots at SoC init): re-encode each base slot JAL
+         for its address from the eco slot's TARGET (NOT a raw word copy
+         — JAL is PC-relative; a word copy lands +12 into the body and
+         skips MD5Init's buf[0] store). All 19 eco5 bodies verified
+         in-dump HP code; MD5Init now runs natively.
+       * MD5Update/Final bodies die on illegal words mid-body (rv32emu
+         lacks the encoding) → host esp_rom_md5 ports via execution-gated
+         ifetch hooks (rv->PC == addr gate is load-bearing: translate-time
+         fetches carry garbage X[] and corrupted ctx before the gate).
+         Verified byte-exact vs python (empty/abc/fox/96B/split updates)
+         and live: partition-table MD5 8405a9bb… matches stored digest.
+       * SHA block model rewritten to START/CONTINUE compression into
+         H_MEM (old per-word feed + re-pad double-hashed: 21ff…/4d07…).
+         ROM feeds full blocks + padded tail through M_MEM; sha_h IS the
+         digest at H_MEM read (bswap per word). Bootloader SHA-256
+         ab352405… now verifies; no more "comparison failed".
+       * ets_delay_us (ROM 0x4fc012f8 MCYCLE spin) skipped via ifetch hook
+         (MCYCLE advances ~3/step; 9000us needs ~10M steps). 0x4ffbff90
+         factor forced to 360 (P4 CPU MHz).
+     Status: bootloader + partition MD5 + bootloader SHA all pass; app
+     boots into clock init (rtc_clk_cal now completes, past slow-src set
+     into 32k-cal loop → fixed by TIMG count fix; now progressing through
+     app init, ~8.5B cycles in log). Arduino P4 matrix unaffected
+     (patched HELLO+TICK, SMP SPI EF 40 15 re-verified green on this
+     tree). Next: drive app to REPL, then strip TEMP scaffolding and run
+     the Arduino matrix + C3/C6/H2 sanity.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,

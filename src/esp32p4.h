@@ -16,7 +16,7 @@
  * peripherals at 0x50110000/0x50120000. */
 #define P4_TCM_BASE 0x30100000u
 #define P4_TCM_SIZE 0x2000u /* 8 KB TCM */
-#define P4_ROM_BASE 0x40000000u
+#define P4_ROM_LINK 0x4FC00000u /* ROM linked view (API symbols, reset vector) */
 #define P4_ROM_SIZE 0x20000u /* 128 KB HP mask ROM (wokwi/esp32-roms) */
 #define P4_SRAM_BASE 0x4FF00000u
 #define P4_SRAM_SIZE 0xC0000u /* 768 KB HP SRAM (I- and D-bus same address) */

@@ -39,42 +39,48 @@
 /* Memory model                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Software SHA-256: the ROM feeds message blocks to the SHA accelerator
- * (0x60089080-0x600890BF = M_MEM), then reads the digest from H_MEM
- * (0x60089040-0x6008907F). SHA_MODE (0x60089000) is written before every
- * block, so a session is reset only on the first mode write after a digest
- * read. SHA_START (0x60089010) begins a session, SHA_CONTINUE (0x60089014)
- * appends; the final padded block is built and fed by the ROM itself. */
+/* Software SHA-256 (host-side model of the P4 crypto SHA block at
+ * 0x50091000 = DR_REG_SHA_BASE: M_MEM +0x80/64B message, H_MEM +0x40/64B
+ * digest, START +0x10 / CONTINUE +0x14 run a block, BUSY +0x18 polls 0).
+ * The ROM's ets_sha_update feeds whole blocks register-by-register into
+ * M_MEM (little-endian words, matching sha_ll_fill_text_block's plain
+ * REG_WRITE of the input words); START runs block 0 from the SHA-256
+ * IV, CONTINUE chains from the H_MEM digest; BUSY reads 0 (instant).
+ * ets_sha_finish pads per FIPS-180 (0x80 + zeros + 64-bit BE bit length)
+ * and returns the H_MEM digest bytes in order — i.e. this model computes
+ * a plain byte-stream SHA-256 of the fed message. */
 static uint8_t sha_msg[0x200000]; /* large enough for full app image hash */
-static uint32_t sha_len;
-static uint32_t sha_digest[8];
-static int sha_computed;
-static int sha_reset_pending;
+static uint32_t sha_len;     /* buffered fed bytes (for tail recompress) */
+static uint32_t sha_msg_len; /* total fed bytes = ROM T_LENGTH (pad basis) */
 static unsigned dbg_trap_deliv;   /* times a trap was actually delivered */
 static unsigned dbg_gdma_intrwr;  /* guest writes to GDMA intr regs */
 static unsigned dbg_gdma_intrwr_clear; /* ...that cleared bit 69 */
 
+/* Current running digest as big-endian words (H_MEM convention: the ROM
+ * reads H_MEM[i] and byte-swaps per word into ctx->state, i.e. H_MEM
+ * holds the digest byte stream in order). Initialized on first use via
+ * esp32_sha_reset (called at SoC init); the reset helper below writes
+ * the SHA-256 IV. */
+static uint32_t sha_h[8];
+
 static void esp32_sha_reset(void)
 {
     sha_len = 0;
-    sha_computed = 0;
+    sha_msg_len = 0;
+    sha_h[0] = 0x6a09e667;
+    sha_h[1] = 0xbb67ae85;
+    sha_h[2] = 0x3c6ef372;
+    sha_h[3] = 0xa54ff53a;
+    sha_h[4] = 0x510e527f;
+    sha_h[5] = 0x9b05688c;
+    sha_h[6] = 0x1f83d9ab;
+    sha_h[7] = 0x5be0cd19;
 }
 
-static void esp32_sha_feed_word(uint32_t val)
+static void esp32_sha_compress(const uint32_t *be_words, uint32_t h[8])
 {
-    if (sha_len + 4 <= sizeof(sha_msg)) {
-        sha_msg[sha_len++] = val & 0xff;
-        sha_msg[sha_len++] = (val >> 8) & 0xff;
-        sha_msg[sha_len++] = (val >> 16) & 0xff;
-        sha_msg[sha_len++] = (val >> 24) & 0xff;
-    }
-    sha_computed = 0;
-}
-
-static uint32_t esp32_sha_digest_word(unsigned idx)
-{
-    if (!sha_computed) {
-        static const uint32_t k[64] = {
+    /* One SHA-256 compression of 16 big-endian words into h[8]. */
+    static const uint32_t k[64] = {
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
             0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
             0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -92,67 +98,101 @@ static uint32_t esp32_sha_digest_word(unsigned idx)
             0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
             0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
         };
-        /* the ROM builds and feeds the final padded block itself
-         * (0x80 + zeros + 64-bit BE length); hash the accumulated
-         * message as-is */
-        size_t total = (sha_len + 63) & ~(size_t) 63;
-        uint32_t w[64];
-        uint32_t h[8] = {
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-        };
-        for (size_t block = 0; block < total; block += 64) {
-            for (int i = 0; i < 16; i++)
-                w[i] = ((uint32_t) sha_msg[block + 4 * i] << 24) |
-                       ((uint32_t) sha_msg[block + 4 * i + 1] << 16) |
-                       ((uint32_t) sha_msg[block + 4 * i + 2] << 8) |
-                       sha_msg[block + 4 * i + 3];
-            for (int i = 16; i < 64; i++) {
-                uint32_t s0 = ((w[i - 15] >> 7) | (w[i - 15] << 25)) ^
-                              ((w[i - 15] >> 18) | (w[i - 15] << 14)) ^
-                              (w[i - 15] >> 3);
-                uint32_t s1 = ((w[i - 2] >> 17) | (w[i - 2] << 15)) ^
-                              ((w[i - 2] >> 19) | (w[i - 2] << 13)) ^
-                              (w[i - 2] >> 10);
-                w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-            }
-            uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
-            uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
-            for (int i = 0; i < 64; i++) {
-                uint32_t S1 = ((e >> 6) | (e << 26)) ^
-                              ((e >> 11) | (e << 21)) ^
-                              ((e >> 25) | (e << 7));
-                uint32_t ch = (e & f) ^ (~e & g);
-                uint32_t t1 = hh + S1 + ch + k[i] + w[i];
-                uint32_t S0 = ((a >> 2) | (a << 30)) ^
-                              ((a >> 13) | (a << 19)) ^
-                              ((a >> 22) | (a << 10));
-                uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-                uint32_t t2 = S0 + maj;
-                hh = g;
-                g = f;
-                f = e;
-                e = d + t1;
-                d = c;
-                c = b;
-                b = a;
-                a = t1 + t2;
-            }
-            h[0] += a;
-            h[1] += b;
-            h[2] += c;
-            h[3] += d;
-            h[4] += e;
-            h[5] += f;
-            h[6] += g;
-            h[7] += hh;
-        }
-        for (int i = 0; i < 8; i++)
-            sha_digest[i] = ((h[i] >> 24) & 0xff) | ((h[i] >> 8) & 0xff00) |
-                            ((h[i] << 8) & 0xff0000) | (h[i] << 24);
-        sha_computed = 1;
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = be_words[i];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ((w[i - 15] >> 7) | (w[i - 15] << 25)) ^
+                      ((w[i - 15] >> 18) | (w[i - 15] << 14)) ^
+                      (w[i - 15] >> 3);
+        uint32_t s1 = ((w[i - 2] >> 17) | (w[i - 2] << 15)) ^
+                      ((w[i - 2] >> 19) | (w[i - 2] << 13)) ^
+                      (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
-    return sha_digest[idx];
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+    uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = ((e >> 6) | (e << 26)) ^
+                      ((e >> 11) | (e << 21)) ^
+                      ((e >> 25) | (e << 7));
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = hh + S1 + ch + k[i] + w[i];
+        uint32_t S0 = ((a >> 2) | (a << 30)) ^
+                      ((a >> 13) | (a << 19)) ^
+                      ((a >> 22) | (a << 10));
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + maj;
+        hh = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    h[0] += a;
+    h[1] += b;
+    h[2] += c;
+    h[3] += d;
+    h[4] += e;
+    h[5] += f;
+    h[6] += g;
+    h[7] += hh;
+}
+
+/* Running digest (see sha_h above, initialized by esp32_sha_reset). */
+
+static void esp32_sha_feed_block_be(const uint32_t *le_words, int first);
+
+static void esp32_sha_feed_block_be(const uint32_t *le_words, int first)
+{
+    /* One 16-word block from M_MEM: words arrive LITTLE-ENDIAN (plain
+     * REG_WRITE of the input stream — verified: bootloader block 0 m0 =
+     * 0x400203e9 = LE bytes e9 03 02 40 = file bytes). Swap to big-endian
+     * for compression. sha_msg retains the fed byte stream; sha_msg_len
+     * counts every fed byte (the ROM's T_LENGTH: total length for the
+     * finish-time padding), including bytes re-fed with the tail. */
+    uint32_t be[16];
+    for (int i = 0; i < 16; i++) {
+        uint32_t v = le_words[i];
+        be[i] = ((v >> 24) & 0xff) | ((v >> 8) & 0xff00) |
+                ((v << 8) & 0xff0000) | (v << 24);
+        if (sha_len + 4 <= sizeof(sha_msg)) {
+            sha_msg[sha_len++] = v & 0xff;
+            sha_msg[sha_len++] = (v >> 8) & 0xff;
+            sha_msg[sha_len++] = (v >> 16) & 0xff;
+            sha_msg[sha_len++] = (v >> 24) & 0xff;
+        }
+        sha_msg_len += 4;
+    }
+    if (first) {
+        sha_h[0] = 0x6a09e667;
+        sha_h[1] = 0xbb67ae85;
+        sha_h[2] = 0x3c6ef372;
+        sha_h[3] = 0xa54ff53a;
+        sha_h[4] = 0x510e527f;
+        sha_h[5] = 0x9b05688c;
+        sha_h[6] = 0x1f83d9ab;
+        sha_h[7] = 0x5be0cd19;
+    }
+    esp32_sha_compress(be, sha_h);
+}
+
+static uint32_t esp32_sha_digest_word(unsigned idx)
+{
+    /* H_MEM read: the ROM's finish ALREADY fed ctx->buffer + FIPS padding
+     * through M_MEM as real START/CONTINUE blocks, so sha_h IS the final
+     * digest. Byte order: H_MEM word i is the digest byte stream
+     * (bytes 4i..4i+3 in order). The ROM reads H_MEM[i] and bswap32s into
+     * ctx->state (so state[i] = bswap(H_MEM[i])), then the caller memcpys
+     * state out as the digest bytes. sha_h[i] is the big-endian
+     * compression word = digest bytes in order, so return bswap(sha_h[i])
+     * to match the (swapped) H_MEM convention. */
+    uint32_t v = sha_h[idx];
+    return ((v >> 24) & 0xff) | ((v >> 8) & 0xff00) | ((v << 8) & 0xff0000) |
+           (v << 24);
 }
 
 typedef enum { ESP32_REG_RAM, ESP32_REG_MMIO } esp32_reg_type_t;
@@ -429,6 +469,9 @@ struct esp32p4_soc {
      * forced by the specific handlers below. */
     uint32_t hpsys_reg[1024];
     uint32_t pmu_reg[1024];
+    /* LP_CLKRST (0x50111000): plain read-back storage (clk enables,
+     * slow-clock select written by rtc_clk_slow_src_set). */
+    uint32_t lpclk_reg[1024];
     /* AXI_GDMA (0x5008A000): minimal OUT/IN channel state for the
      * crypto-DMA engines (AES peri_sel 4, SHA peri_sel 5). The SHA/AES
      * drivers walk SRAM descriptors directly on DMA_START (synchronous
@@ -498,6 +541,12 @@ static esp32_region_t *esp32_find_region(esp32p4_t *soc, uint32_t addr)
     return NULL;
 }
 
+/* Flash cache window translation (forward declaration: the MMU table
+ * lives in the SoC struct defined below; full definition with the memory
+ * accessors). */
+static uint32_t esp32_flash_window_off(struct esp32p4_soc *soc, uint32_t addr);
+static void p4_install_crypto_hooks_wrap(esp32p4_t *soc);
+
 /* Host pointer for guest RAM (DMA descriptors and data buffers always live
  * in SRAM/LP-SRAM; flash windows are never DMA targets). */
 static uint8_t *esp32p4_dma_ptr(esp32p4_t *soc, uint32_t addr)
@@ -515,6 +564,13 @@ uint8_t *esp32p4_guest_to_host(esp32p4_t *soc, uint32_t addr)
     esp32_region_t *r = esp32_find_region(soc, addr);
     if (!r || r->type != ESP32_REG_RAM || !r->data)
         return NULL;
+    /* flash-window addresses go through the MMU, not the raw backing. */
+    if (r->base == P4_FLASH_I_BASE) {
+        uint32_t off = esp32_flash_window_off(soc, addr);
+        if (off == ~0u)
+            return NULL;
+        return r->data + off;
+    }
     return r->data + (addr - r->base);
 }
 
@@ -580,6 +636,7 @@ esp32p4_t *esp32p4_new(void)
 {
     esp32p4_t *soc = calloc(1, sizeof(esp32p4_t));
     assert(soc);
+    esp32_sha_reset(); /* SHA running digest starts at the FIPS IV */
     soc->systimer_conf = 0x40000000u; /* TIMER_UNIT0_WORK_EN default 1 */
     soc->strap_b0410 = 1; /* reset cause: POWERON (1); strapping handled via GPIO_STRAP */
     soc->uart_rx_fd = -1;
@@ -640,13 +697,16 @@ esp32p4_t *esp32p4_new(void)
     assert(soc->rom);
     assert(esp32p4_rom_bin_len <= P4_ROM_SIZE);
     memcpy(soc->rom, esp32p4_rom_bin, esp32p4_rom_bin_len);
+    /* Remap the ROM jal-table slots to the eco5 ABI (see p4_remap_rom_slots):
+     * IDF v5.5 firmware links the eco5 table, the dump carries rev0. */
+    p4_install_crypto_hooks_wrap(soc);
 
     /* The 128KB mask ROM is linked at 0x4FC00000 (all ROM API symbols and
      * position-dependent startup code use that view; the HP core resets
      * there). Alias the same bytes at 0x4FC00000. */
     {
         esp32_region_t *alias = &soc->regions[soc->nregions++];
-        alias->base = 0x4FC00000u;
+        alias->base = P4_ROM_LINK;
         alias->size = P4_ROM_SIZE;
         alias->type = ESP32_REG_RAM;
         alias->data = soc->rom;
@@ -740,6 +800,12 @@ riscv_t *esp32p4_smp_target(riscv_t *rv)
         return h1;
     if (rv_has_halted(h1))
         return h0;
+    /* Keep both hart cycle counters in lockstep: hart1 is created fresh
+     * (cycle 0) long after hart0 has run, and peripherals (SYSTIMER
+     * TARGET compare, delay loops, GDMA pacing) key off hart0's counter.
+     * Sync h1 forward whenever it lags (never backward). */
+    if (h1->csr_cycle < h0->csr_cycle)
+        h1->csr_cycle = h0->csr_cycle;
     return (soc->smp_toggle++ & 1) ? h1 : h0;
 }
 
@@ -760,8 +826,293 @@ void esp32p4_smp_poll(riscv_t *rv)
 }
 
 /* ------------------------------------------------------------------ */
-/* UART0 (0x60000000)                                                  */
-/* ------------------------------------------------------------------ */
+/* ROM slot remap (rev0 HP dump -> eco5 ABI): the bundled P4 ROM dump is
+ * the BASE (rev0) table at 0x4fc005ec..0x4fc00634, but IDF v5.5 firmware
+ * (arduino + MicroPython, bootloader and app) links the ECO5 table,
+ * shifted -0xC (MD5 5E0/5E4/5E8, crc32_le 5EC, sha enable 608/init 614/
+ * process 618/starts 61C/update 620/finish 624/clone 628). The remap
+ * (p4_remap_rom_slots, at SoC init) copies each eco5-slot word into its
+ * base slot, so all firmware ROM calls run real in-dump HP bodies. The
+ * host MD5/SHA helpers below are retained for the peripheral crypto
+ * block model (SHA M_MEM/H_MEM compression) — no ROM patching beyond
+ * the slot copy. */
+/* ROM slot remap (rev0 HP dump -> eco5 ABI): see p4_remap_rom_slots below.
+ * The host MD5/SHA helpers that follow are retained for the peripheral
+ * crypto block model (SHA M_MEM/H_MEM compression) — no ROM patching
+ * beyond the slot copy. */
+/* One MD5 64-byte block transform (RFC 1321). Input bytes load
+ * little-endian (the ROM's byteReverse(in,16) is a no-op on LE hosts:
+ * it writes back the LE word that was already there). */
+static void p4_md5_transform(uint32_t st[4], const uint8_t blk[64])
+{
+    static const uint32_t s[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+    };
+    static const uint32_t k[64] = {
+        0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu,
+        0xf57c0fafu, 0x4787c62au, 0xa8304613u, 0xfd469501u,
+        0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu,
+        0x6b901122u, 0xfd987193u, 0xa679438eu, 0x49b40821u,
+        0xf61e2562u, 0xc040b340u, 0x265e5a51u, 0xe9b6c7aau,
+        0xd62f105du, 0x02441453u, 0xd8a1e681u, 0xe7d3fbc8u,
+        0x21e1cde6u, 0xc33707d6u, 0xf4d50d87u, 0x455a14edu,
+        0xa9e3e905u, 0xfcefa3f8u, 0x676f02d9u, 0x8d2a4c8au,
+        0xfffa3942u, 0x8771f681u, 0x6d9d6122u, 0xfde5380cu,
+        0xa4beea44u, 0x4bdecfa9u, 0xf6bb4b60u, 0xbebfbc70u,
+        0x289b7ec6u, 0xeaa127fau, 0xd4ef3085u, 0x04881d05u,
+        0xd9d4d039u, 0xe6db99e5u, 0x1fa27cf8u, 0xc4ac5665u,
+        0xf4292244u, 0x432aff97u, 0xab9423a7u, 0xfc93a039u,
+        0x655b59c3u, 0x8f0ccc92u, 0xffeff47du, 0x85845dd1u,
+        0x6fa87e4fu, 0xfe2ce6e0u, 0xa3014314u, 0x4e0811a1u,
+        0xf7537e82u, 0xbd3af235u, 0x2ad7d2bbu, 0xeb86d391u
+    };
+    uint32_t a = st[0], b = st[1], c = st[2], d = st[3], f, g, i;
+    uint32_t m[16];
+    for (i = 0; i < 16; i++)
+        m[i] = (uint32_t) blk[i * 4] | ((uint32_t) blk[i * 4 + 1] << 8) |
+               ((uint32_t) blk[i * 4 + 2] << 16) |
+               ((uint32_t) blk[i * 4 + 3] << 24);
+    for (i = 0; i < 64; i++) {
+        if (i < 16) {
+            f = (b & c) | (~b & d);
+            g = i;
+        } else if (i < 32) {
+            f = (d & b) | (~d & c);
+            g = (5u * i + 1u) & 15u;
+        } else if (i < 48) {
+            f = b ^ c ^ d;
+            g = (3u * i + 5u) & 15u;
+        } else {
+            f = c ^ (b | ~d);
+            g = (7u * i) & 15u;
+        }
+        f += a + k[i] + m[g];
+        a = d;
+        d = c;
+        c = b;
+        b += (((f) << (s[i])) | ((f) >> (32u - (s[i]))));
+    }
+    st[0] += a;
+    st[1] += b;
+    st[2] += c;
+    st[3] += d;
+}
+
+static uint32_t p4_crc32_le(uint32_t crc, const uint8_t *buf, uint32_t len)
+    __attribute__((unused));
+static uint32_t p4_crc32_le(uint32_t crc, const uint8_t *buf, uint32_t len)
+{
+    crc = ~crc;
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int j = 0; j < 8; j++)
+            crc = (crc & 1u) ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
+    }
+    return ~crc;
+}
+
+/* Host MD5 (esp_rom_md5 port, linux/esp_rom_md5.c): used for MD5Update +
+ * MD5Final, whose in-dump bodies die on illegal words mid-body. MD5Init
+ * runs natively (prologue-only: writes IV constants, returns). Guest
+ * MD5Context layout (rom/md5_hash.h): buf[4] @+0, bits[2] @+16, in[64]
+ * @+24. ifetch routes body entry PCs here and returns RET. */
+void p4_md5_update_pub(esp32p4_t *soc, uint32_t ctx, uint32_t buf,
+                       uint32_t len)
+{
+    /* NOTE: buf may live in the flash-cache window (e.g. the partition
+     * table at 0x40008000, mmap'd for verify): guest_to_host covers it
+     * via the MMU. Chunk the copy so a region edge can't truncate it. */
+    uint8_t *p = esp32p4_guest_to_host(soc, ctx);
+    if (!p)
+        return;
+    uint8_t data[256];
+    {
+        uint32_t got = 0;
+        while (got < len && got < sizeof(data)) {
+            uint8_t *b = esp32p4_guest_to_host(soc, buf + got);
+            if (!b)
+                break;
+            data[got++] = *b;
+        }
+        if (got < len) {
+            /* input not fully readable: feed what we have (ROM would
+             * fault; bootloader inputs are always mapped). */
+            len = got;
+        }
+    }
+    uint32_t bits0, bits1;
+    memcpy(&bits0, p + 16, 4);
+    memcpy(&bits1, p + 20, 4);
+    uint32_t t = bits0;
+    bits0 = t + (len << 3);
+    if (bits0 < t)
+        bits1++;
+    bits1 += len >> 29;
+    memcpy(p + 16, &bits0, 4);
+    memcpy(p + 20, &bits1, 4);
+    t = (t >> 3) & 0x3Fu;
+    uint8_t *inb = p + 24;
+    uint8_t tmp[64];
+    uint32_t off = 0;
+    const uint8_t *src_all = data;
+    if (t) {
+        uint32_t part = 64u - t;
+        if (len < part) {
+            memcpy(inb + t, src_all, len);
+            return;
+        }
+        {
+            memcpy(inb + t, src_all, part);
+            memcpy(tmp, inb, 64);
+            uint32_t st[4];
+            memcpy(st, p, 16);
+            p4_md5_transform(st, tmp);
+            memcpy(p, st, 16);
+        }
+        off = part;
+    }
+    while (off + 64 <= len) {
+        memcpy(tmp, src_all + off, 64);
+        uint32_t st[4];
+        memcpy(st, p, 16);
+        p4_md5_transform(st, tmp);
+        memcpy(p, st, 16);
+        off += 64;
+    }
+    {
+        memcpy(inb, src_all + off, len - off);
+    }
+}
+
+void p4_md5_final_pub(esp32p4_t *soc, uint32_t digest, uint32_t ctx)
+{
+    /* Faithful port of esp_rom_md5_final: pad to 56 mod 64, append the
+     * 64-bit LE bitcount, transform, then byteReverse(buf,4) into digest. */
+    uint8_t *p = esp32p4_guest_to_host(soc, ctx);
+    uint8_t *dp = esp32p4_guest_to_host(soc, digest);
+    if (!p || !dp)
+        return;
+    uint32_t bits0, bits1;
+    memcpy(&bits0, p + 16, 4);
+    memcpy(&bits1, p + 20, 4);
+    uint8_t *inb = p + 24;
+    /* ROM logic: count = bytes-mod-64 BEFORE the 0x80; need = 63 - count
+     * bytes of padding (incl. the 0x80). Fewer than 8 trailing bytes means
+     * the length won't fit: pad out the block, transform, start fresh. */
+    {
+        uint32_t c0 = (bits0 >> 3) & 0x3Fu;
+        uint32_t need = 64u - 1u - c0;
+        inb[c0] = 0x80u;
+        if (need < 8u) {
+            memset(inb + c0 + 1u, 0, need);
+            uint8_t tmp[64];
+            memcpy(tmp, inb, 64);
+            uint32_t st[4];
+            memcpy(st, p, 16);
+            p4_md5_transform(st, tmp);
+            memcpy(p, st, 16);
+            memset(inb, 0, 56);
+        } else {
+            memset(inb + c0 + 1u, 0, need - 8u);
+        }
+    }
+    /* in[14..15] = bitcount LE (byteReverse(in,14) is a nop: the length
+     * words are already LE in memory). */
+    memcpy(inb + 56, &bits0, 4);
+    memcpy(inb + 60, &bits1, 4);
+    {
+        uint8_t tmp[64];
+        memcpy(tmp, inb, 64);
+        uint32_t st[4];
+        memcpy(st, p, 16);
+        p4_md5_transform(st, tmp);
+        memcpy(p, st, 16);
+    }
+    /* byteReverse(buf,4): digest bytes are the LE state words. */
+    memcpy(dp, p, 16);
+}
+
+/* ROM ABI note: the bundled HP ROM dump carries the BASE (rev0) jal
+ * table at 0x4fc005ec..0x4fc00634 (MD5 5EC/5F0/5F4, crc32_le 5F8, SHA
+ * enable 614/init 620/process 624/starts 628/update 62C/finish 630/
+ * clone 634), but IDF v5.5 firmware links the ECO5 table, shifted -0xC
+ * (MD5 5E0/5E4/5E8, crc32_le 5EC, sha enable 608/init 614/process 618/
+ * starts 61C/update 620/finish 624/clone 628). Every eco5 slot decodes
+ * as a JAL to a valid in-dump HP body (e.g. eco5 MD5Init @5E0 ->
+ * 0x4fc06e92 writes the MD5 IV constants; eco5 crc32_le @5EC ->
+ * 0x4fc0639e is the table crc loop; eco5 sha_update @620 -> 0x4fc0484a
+ * drives the crypto SHA block at 0x50091000, which the MMIO model below
+ * implements with START/CONTINUE block compression). The BASE slots, by
+ * contrast, point at CRC-16/8 helpers (5EC/5F0/5F4) and LP-core stubs
+ * (SHA 62C/630 -> 0x4fb0xxxx, unmapped). So at SoC init, copy each eco5
+ * slot word into its base slot: afterwards every firmware ROM call —
+ * whether linked base-style (arduino bootloader per its disassembly) or
+ * eco5-style (MPY per build.ninja `-T esp32p4.rom.ld`... actually both
+ * use base .ld; see below) — lands on a real HP body.
+ * NOTE 2026-09-13: MPY links `-T esp32p4.rom.ld` (BASE), i.e. it calls
+ * 5EC/5F0/5F4 + 614/620/62C/630. Those base slots hold CRC helpers / LP
+ * stubs, NOT MD5/SHA — hence the historical hang at pc 0x4fc06416 (CRC
+ * byte loop entered as MD5Update) and SHA Nilsson-mismatch. The slot
+ * copy maps each base slot to the eco5 body (slot-0xC's target), which
+ * is the correct MD5/SHA implementation. Verified per-slot: all 19
+ * eco5 bodies are in-dump HP code. */
+static void p4_remap_rom_slots(esp32p4_t *soc)
+{
+    /* CRITICAL: slots hold PC-relative JALs, so a raw word copy lands
+     * +12 past the intended body (the skew that broke MD5Init: buf[0]
+     * never initialized). Re-encode each JAL for its base address from
+     * the eco slot's TARGET: new_imm = eco_target - base_addr. */
+    static const uint32_t base_slots[] = {
+        0x4FC005ECu, 0x4FC005F0u, 0x4FC005F4u, 0x4FC005F8u, 0x4FC005FCu,
+        0x4FC00600u, 0x4FC00604u, 0x4FC00608u, 0x4FC0060Cu, 0x4FC00610u,
+        0x4FC00614u, 0x4FC00618u, 0x4FC0061Cu, 0x4FC00620u, 0x4FC00624u,
+        0x4FC00628u, 0x4FC0062Cu, 0x4FC00630u, 0x4FC00634u,
+    };
+    /* NOTE: eco slots (base-0xC) OVERLAP the base slots, so snapshot all
+     * eco words BEFORE writing (in-place copy cascades corruption). */
+    uint32_t eco_words[sizeof(base_slots) / sizeof(base_slots[0])];
+    for (unsigned i = 0; i < sizeof(base_slots) / sizeof(base_slots[0]);
+         i++) {
+        uint32_t eoff = base_slots[i] - 0xCu - P4_ROM_LINK;
+        eco_words[i] = 0;
+        if (eoff + 4 <= P4_ROM_SIZE)
+            memcpy(&eco_words[i], soc->rom + eoff, 4);
+    }
+    for (unsigned i = 0; i < sizeof(base_slots) / sizeof(base_slots[0]);
+         i++) {
+        uint32_t eco = eco_words[i];
+        /* expect JAL x0 (opcode 0x6f, rd 0); else leave slot alone. */
+        if ((eco & 0xFFFu) != 0x06Fu)
+            continue;
+        int32_t eimm = ((eco >> 31) & 1) << 20 | ((eco >> 21) & 0x3FF) << 1 |
+                       ((eco >> 20) & 1) << 11 | ((eco >> 12) & 0xFF) << 12;
+        if (eimm & 0x100000)
+            eimm -= 0x200000;
+        uint32_t target =
+            (uint32_t) ((int32_t) (base_slots[i] - 0xCu) + eimm);
+        int32_t nimm = (int32_t) (target - base_slots[i]);
+        /* JAL range is +/-1MB; all ROM targets are in range. */
+        uint32_t u = (uint32_t) nimm;
+        uint32_t njal = (((u >> 20) & 1) << 31) | (((u >> 1) & 0x3FF) << 21) |
+                        (((u >> 11) & 1) << 20) | (((u >> 12) & 0xFF) << 12) |
+                        0x6Fu;
+        uint32_t boff = base_slots[i] - P4_ROM_LINK;
+        if (boff + 4 <= P4_ROM_SIZE)
+            memcpy(soc->rom + boff, &njal, 4);
+        eco_words[i] = njal; /* for the boot log below */
+    }
+    (void) 0; /* slots verified during bring-up; silent in normal runs */
+}
+
+/* Wrap shim (defined after the installer): esp32p4_new calls this before
+ * the installer's definition site; keeps the call typed as esp32p4_t. */
+static void p4_install_crypto_hooks_wrap(esp32p4_t *soc)
+{
+    p4_remap_rom_slots(soc);
+}
 
 #define UART_FIFO_REG 0x00u
 #define UART_INT_RAW_REG 0x04u
@@ -1310,11 +1661,18 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
     if (addr == 0x50110164u)
         return soc->appcpu_boot_addr;
 
-    /* LP_CLKRST_RESET_CAUSE_REG (0x50111010): HPCORE0 cause bits[12:7]
-     * (6'h1 = POR) + LPCORE cause bits[5:0] (6'h1 = POR). The ROM prints
-     * "invalid reset" and halts on an unknown cause. */
+    /* LP_CLKRST (0x50111000, 4KB): RC32K/RTC clock control + reset cause.
+     * RESET_CAUSE @+0x10: HPCORE0 cause bits[12:7] (6'h1 = POR) + LPCORE
+     * cause bits[5:0] (6'h1 = POR). CLK_CTRL @+0x0 bit 2 (ena_rc32k) and
+     * SLOW_CLK_SEL @+0x4 are plain storage; rtc_clk_slow_src_set() sets
+     * the source then spins esp_rom_delay_us(300) — the delay model
+     * (0x4ffbff90 factor) terminates it. */
     if (addr == 0x50111010u)
         return (1u << 7) | 1u;
+    if (addr == 0x50111000u)
+        return soc->lpclk_reg[0];
+    if (addr == 0x50111004u)
+        return soc->lpclk_reg[1];
 
     /* LP_TIMER (0x50112000): TAR0_LO/HI (0x00/0x04) arm the target,
      * UPDATE (0x10, bit 28) latches the free-running counter into
@@ -1379,13 +1737,17 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return 0;
     }
 
-    /* eFuse block (0x5012D000): report a v3.0 chip so revision-gated
-     * images (e.g. MicroPython P4, REV_MIN_300) pass the bootloader's
-     * revision check. RD_MAC_SYS_2 @+0x4C: MINOR[3:0]=0,
-     * MAJOR_LO[5:4]=3, MAJOR_HI[23]=0 (major = HI<<2|LO = 3). */
+    /* eFuse block (0x5012D000): report a v1.0 chip. MicroPython P4
+     * PRE_REV3 images accept rev >= 0 with max-rev check disabled at the
+     * bootloader stage (min_rev_full=18, max empty), while the default
+     * P4 board build requires >= v3.0 — v1.x satisfies neither max nor
+     * min for all images, so v1.0 is the compatible middle: PRE_REV3
+     * boots (min 0), and factory-app max-rev (<= v1.99) passes.
+     * RD_MAC_SYS_2 @+0x4C: MINOR[3:0]=0, MAJOR_LO[5:4]=1,
+     * MAJOR_HI[23]=0 (major = HI<<2|LO = 1). */
     if (addr >= 0x5012D000u && addr < 0x5012D400u) {
         if (addr == 0x5012D000u + 0x4Cu)
-            return (3u << 4); /* wafer major 3, minor 0 */
+            return (1u << 4); /* wafer major 1, minor 0 */
         return 0;
     }
 
@@ -1880,20 +2242,16 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
             return mmio32[off >> 2];
         }
     }
-    /* (P4 LP-system blocks — LP_CLKRST/PMU/eFuse/TRNG/CACHE — are handled
-     * by the P4-specific prologue above; the C6 0x600Bxxxx/0x600Cxxxx
-     * absolute blocks do not apply.) */
-    /* SHA accelerator */
+    /* SHA accelerator (crypto block 0x50091000): BUSY polls 0
+     * (instant completion); H_MEM (+0x40/32B) reads the running digest
+     * words, which finalizes any pending padding on first read. */
     if (addr >= P4_PERIPH_BASE + 0x89000u && addr < P4_PERIPH_BASE + 0x8A000u) {
         if (addr == P4_PERIPH_BASE + 0x89018u)
             return 0; /* SHA_BUSY: instant completion (poll spins while 1) */
         if (addr >= P4_PERIPH_BASE + 0x89040u &&
-            addr < P4_PERIPH_BASE + 0x89080u) {
-            uint32_t w = esp32_sha_digest_word((addr - P4_PERIPH_BASE -
-                                                0x89040u) >>
-                                               2);
-            sha_reset_pending = 1;
-            return w;
+            addr < P4_PERIPH_BASE + 0x89060u) {
+            return esp32_sha_digest_word((addr - P4_PERIPH_BASE - 0x89040u) >>
+                                         2);
         }
         return mmio32[off >> 2];
     }
@@ -2197,6 +2555,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         return;
     }
 
+    /* LP_CLKRST (0x50111000): plain read-back storage. */
+    if (addr >= 0x50111000u && addr < 0x50112000u) {
+        soc->lpclk_reg[(addr - 0x50111000u) >> 2] = val;
+        return;
+    }
+
     /* LP_TIMER (0x50112000): TAR0_LO/HI (0x00/0x04) arm the target
      * (enable in bit 31 of hi); UPDATE (0x10, bit 28) advances the
      * free-running counter; INT_CLR (0x34) clears the wakeup flag. */
@@ -2287,30 +2651,26 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
     uint32_t off = addr - P4_PERIPH_BASE;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
 
-    /* SHA (translated 0x60089000): the mask ROM / esp-idf feed the message
-     * one 32-bit word at a time into SHA_M_MEM (0x80..0xBF); the running
-     * digest is read from SHA_H_MEM (0x40..0x7F) which triggers the
-     * synchronous compute. SHA_MODE (0x00) starts a new session. */
+    /* SHA crypto block (translated 0x60089000 = 0x50091000): the ROM writes
+     * each 64-byte message block into M_MEM (+0x80, 16 LE words) then
+     * pulses START (+0x10, first block from IV) or CONTINUE (+0x14,
+     * chained) to compress into H_MEM. MODE (+0x00) selects the algorithm
+     * (no need to reset: START/CONTINUE fully determine chaining).
+     * T_STRING (+0x04, for SHA-512/t) is plain storage. */
     if (addr >= P4_PERIPH_BASE + 0x89000u && addr < P4_PERIPH_BASE + 0x8A000u) {
-        if (addr == P4_PERIPH_BASE + 0x89000u) {        /* SHA_MODE: new session */
-            if (sha_reset_pending) {
-                esp32_sha_reset();
-                sha_reset_pending = 0;
-            }
+        if (addr == P4_PERIPH_BASE + 0x89010u) { /* SHA_START: 1st block */
+            uint32_t m[16];
+            for (int i = 0; i < 16; i++)
+                m[i] = mmio32[((0x89080u >> 2) + i)];
+            esp32_sha_feed_block_be(m, 1);
             mmio32[(addr - P4_PERIPH_BASE) >> 2] = val;
             return;
         }
-        if (addr == P4_PERIPH_BASE + 0x89010u) {        /* SHA_START */
-            mmio32[(addr - P4_PERIPH_BASE) >> 2] = val;
-            return;
-        }
-        if (addr == P4_PERIPH_BASE + 0x89014u) {        /* SHA_CONTINUE */
-            mmio32[(addr - P4_PERIPH_BASE) >> 2] = val;
-            return;
-        }
-        if (addr >= P4_PERIPH_BASE + 0x89080u &&
-            addr < P4_PERIPH_BASE + 0x890C0u) {          /* SHA M_MEM words */
-            esp32_sha_feed_word(val);
+        if (addr == P4_PERIPH_BASE + 0x89014u) { /* SHA_CONTINUE: chained */
+            uint32_t m[16];
+            for (int i = 0; i < 16; i++)
+                m[i] = mmio32[((0x89080u >> 2) + i)];
+            esp32_sha_feed_block_be(m, 0);
             mmio32[(addr - P4_PERIPH_BASE) >> 2] = val;
             return;
         }
@@ -2585,12 +2945,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 p4_intc_clear(soc, P4_TG0_T0_INTR_SOURCE);
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
-            /* RTC slow-clock calibration: on START the hardware counts the
-             * number of slow-clock cycles in a window of RTC_CALI_MAX periods
-             * of a reference clock (XTAL/128). It latches the count into the
-             * RTCCALI_VALUE field (bits[31:7]) of RTCCALICFG1 and sets
-             * RTC_CALI_RDY. The firmware reads the value back as (RTCCALICFG1
-             * >> 7). */
+            /* RTC slow-clock calibration (see translated-block comment at
+             * 0x60008068): count = max * 40MHz / slow_hz, latched << 7. */
             r[o >> 2] = val;
             if (val & 0x80000000u) { /* TIMG_RTC_CALI_START */
                 uint32_t clk_hz, max = (val >> 16) & 0x7FFFu;
@@ -2599,9 +2955,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 case 1: clk_hz = 20000000u; break;  /* RC_FAST */
                 default: clk_hz = 32768u; break;    /* XTAL32K/RC32K/OSC_SLOW */
                 }
-                /* count = max * slow_freq / (XTAL/128) */
-                uint32_t count = (uint32_t) ((uint64_t) max * clk_hz
-                                             * 128u / 40000000u);
+                uint32_t count = (uint32_t) ((uint64_t) max * 40000000u /
+                                             clk_hz);
                 r[TIMG_RTCCALICFG1 >> 2] = count << 7;
                 r[o >> 2] |= 0x8000u; /* TIMG_RTC_CALI_RDY */
             }
@@ -2659,6 +3014,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 p4_intc_clear(soc, P4_TG1_T0_INTR_SOURCE);
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
+            /* Same calibration model as TIMG0 (count << 7 + RDY). */
             r[o >> 2] = val;
             if (val & 0x80000000u) {
                 uint32_t clk_hz, max = (val >> 16) & 0x7FFFu;
@@ -2667,9 +3023,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 case 1: clk_hz = 20000000u; break;
                 default: clk_hz = 32768u; break;
                 }
-                r[TIMG_RTCCALICFG1 >> 2] =
-                    (uint32_t) ((uint64_t) max * 40000000u / clk_hz);
+                uint32_t count = (uint32_t) ((uint64_t) max * 40000000u /
+                                             clk_hz);
+                r[TIMG_RTCCALICFG1 >> 2] = count << 7;
                 r[o >> 2] |= 0x8000u;
+                r[o >> 2] &= ~(1u << 12); /* START_CYCLING idle */
             }
         } else if (o == TIMG_WDT_WPROTECT) {
             soc->wdt_unlock[1] = (val == TIMG_WDT_MAGIC);
@@ -3096,10 +3454,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             addr < P4_PERIPH_BASE + 0x2000u + SPI_MMU_PAGE_MODE + 4u) {
             switch (addr - P4_PERIPH_BASE - 0x2000u) {
             case SPI_MMU_ITEM_CONTENT: {
-                static unsigned long mq = 0;
-                if ((val & 0x1000u) && mq++ < 40 && soc->mmu_index < 1024)
-                    fprintf(stderr, "[MMU] map vpage %u -> %08x (pc=%08x)\n",
-                            soc->mmu_index, val, rv->PC);
+                /* P4 MMU entries: VALID = bit 12; INVALID pattern written
+                 * by unmap_all must invalidate the page (window read falls
+                 * back to ROM/zero). Note the bootloader also writes small
+                 * raw values (e.g. 0 = unmapped) — only entries with VALID
+                 * map (see esp32_flash_window_off). */
                 if (soc->mmu_index < 1024)
                     soc->mmu[soc->mmu_index] = val;
                 return;
@@ -3418,8 +3777,14 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
     }
     /* TIMG0 RTCCALICFG (translated 0x60008068): one-off slow-clock
      * calibration. On START the hardware counts XTAL (40 MHz) cycles over
-     * RTC_CALI_MAX cycles of the selected calibration clock, then sets
-     * RTC_CALI_RDY and latches the count into RTCCALICFG1 (0x6000806C). */
+     * RTC_CALI_MAX cycles of the selected slow clock, then sets
+     * RTC_CALI_RDY and latches (count << 7) into RTCCALICFG1 (0x6000806C);
+     * firmware reads back (RTCCALICFG1 >> 7). So RTCCALICFG1 =
+     * (max * 40MHz / slow_hz) << 7. NOTE: the count is XTAL cycles for
+     * max SLOW cycles (not divided): the SDK computes the slow period as
+     * xtal_cycles*2^19/(xtal_hz*slow_cycles). RTCCALICFG2 (+0x80) TIMEOUT
+     * bit stays 0 (never times out); START_CYCLING (RTCCALICFG bit 12)
+     * reads 0 (no cycling run in progress). */
     if (addr == P4_PERIPH_BASE + 0x8068u) {
         mmio32[off >> 2] = val;
         if (val & 0x80000000u) { /* TIMG_RTC_CALI_START */
@@ -3429,9 +3794,13 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             case 1: clk_hz = 20000000u; break;  /* RC_FAST */
             default: clk_hz = 32768u; break;    /* XTAL32K / RC32K / OSC_SLOW */
             }
-            mmio32[(0x806Cu) >> 2] =
+            uint32_t count =
                 (uint32_t) ((uint64_t) max * 40000000u / clk_hz);
+            mmio32[(0x806Cu) >> 2] = count << 7;
             mmio32[off >> 2] |= 0x8000u; /* TIMG_RTC_CALI_RDY */
+            mmio32[off >> 2] &= ~(1u << 12); /* START_CYCLING idle */
+            /* RTCCALICFG2 (+0x80): TIMEOUT bit 0 stays 0. */
+            mmio32[(0x8080u) >> 2] &= ~1u;
         }
         return;
     }
@@ -3454,7 +3823,7 @@ static inline esp32_region_t *esp32_lookup(riscv_t *rv, uint32_t addr)
  * through the MMU with fixed 64KB pages, programmed via
  * SPI_MEM_C_MMU_ITEM_INDEX/CONTENT. Unmapped pages return ~0u; reads
  * then fall back to the mask ROM (low 128 KB) or zero. */
-static inline uint32_t esp32_flash_window_off(esp32p4_t *soc, uint32_t addr)
+static uint32_t esp32_flash_window_off(esp32p4_t *soc, uint32_t addr)
 {
     if (addr >= P4_FLASH_I_BASE && addr < P4_FLASH_I_BASE + P4_FLASH_WINDOW_SIZE) {
         uint32_t shift = esp32_mmu_page_shift(soc);
@@ -3476,9 +3845,11 @@ static inline uint32_t esp32_flash_window_off(esp32p4_t *soc, uint32_t addr)
     return ~0u;
 }
 
-    /* Window read with mask-ROM fallback (P4 shares the ROM address range
-     * with the flash cache until the MMU maps flash over it). Assembles the
-     * value byte-wise so reads spanning the ROM end are safe. */
+    /* Window read with mask-ROM fallback: the flash-cache window shares
+     * its low 128 KB of address range with the HP mask ROM's LINKED view
+     * (0x4FC00000; the ROM is also addressed at the window base
+     * 0x40000000 by early-boot code). Assembles the value byte-wise so
+     * reads spanning the ROM end are safe. */
 static uint32_t esp32_window_read(esp32p4_t *soc, uint8_t *flash, uint32_t addr,
                                   unsigned size)
 {
@@ -3488,8 +3859,12 @@ static uint32_t esp32_window_read(esp32p4_t *soc, uint8_t *flash, uint32_t addr,
         uint8_t b;
         if (off != ~0u)
             b = flash[off + i];
-        else if (addr + i >= P4_ROM_BASE && addr + i < P4_ROM_BASE + P4_ROM_SIZE)
-            b = soc->rom[addr + i - P4_ROM_BASE];
+        else if (addr + i >= P4_ROM_LINK &&
+                 addr + i < P4_ROM_LINK + P4_ROM_SIZE)
+            b = soc->rom[addr + i - P4_ROM_LINK];
+        else if (addr + i >= P4_FLASH_I_BASE &&
+                 addr + i < P4_FLASH_I_BASE + P4_ROM_SIZE)
+            b = soc->rom[addr + i - P4_FLASH_I_BASE];
         else
             b = 0;
         val |= (uint32_t) b << (8 * i);
@@ -3538,6 +3913,14 @@ uint32_t esp32p4_read_w(riscv_t *rv, uint32_t addr)
         }
         return esp32_window_read(soc, r->data, addr, 4);
     }
+    /* ROM ets_delay_us factor at 0x4ffbff90 (ticks-per-us, MCYCLE ticks
+     * per microsecond = MHz). SRAM starts zeroed; the ROM setter only
+     * runs on some paths, so force 360 (P4 HP core at 360MHz: the app's
+     * cpu_freq query returns 360M; the ROM factor tracks CPU MHz) so
+     * delay spins terminate at the MCYCLE rate (~3.2M ticks for the
+     * 9000us MSPI delay at 360 ticks/us). */
+    if (addr == 0x4ffbff90u)
+        return 360u;
     if (addr == 0x4ffbfeecu || addr == 0x4ffbffe8u) {
         static unsigned long rq = 0;
         if (rq++ < 8) {
@@ -3677,22 +4060,75 @@ void esp32p4_write_b(riscv_t *rv, uint32_t addr, uint8_t val)
     r->data[addr - r->base] = val;
 }
 
+/* Route a guest PC to its backing bytes for instruction fetch.
+ * Used ONLY when the fetch PC needs special handling:
+ *  - MD5Final wrapper (0x4FC005F4): runs the host esp_rom_md5_final port
+ *    by returning an ECALL instruction; the P4 ecall handler (installed
+ *    below) emulates final and returns to ra. MD5Init/Update run the real
+ *    in-dump HP bodies natively (see slot remap), so only Final traps.
+ *    ECALL is block-terminal so no translator/chaining corruption.
+ *  - 0x4fc0b2c8 (ROM abort spin: zeros where a jal target decodes as
+ *    illegal): return a tight `j .` (0xa001) so the guest spins instead
+ *    of killing translation. (The caller — partition-MD5 mismatch — is
+ *    diagnosed separately; spinning keeps the emulator alive.)
+ * Anything else falls through to the normal region/window read. */
+bool p4_md5_ecall; /* set when fetch patches MD5Final */
+void esp32p4_ecall_handler(riscv_t *rv); /* defined after install_io */
+
 uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
 {
+    /* EXECUTION-TIME GATE (critical): ifetch also runs at block-TRANSLATE
+     * time, when rv->PC is the block start and X[] hold translator scratch
+     * — not guest call args. Hooks below must fire ONLY when the guest
+     * really jumps here: rv->PC == addr means the fetch is the execution
+     * entry (retired jal/jalr landed). At translate time rv->PC is the
+     * caller block start, so the hook is skipped and translation sees the
+     * real JAL word (harmless: the JAL lands back here at execution and
+     * the hook fires then, terminating the block with RET). */
+    bool live = (rv->PC == addr);
+    /* ROM ets_delay_us (0x4fc012f8: MCYCLE spin `mul a0,us,factor;
+     * csrr a4,mcycle; csrr a5,mcycle; sub; bltu loop`): the emulator's
+     * MCYCLE advances ~3/step, so a 9000us delay needs ~10M steps (~1hr
+     * wall). Skip it: set PC = ra (a0 arg ignored; delay is a nop). */
+    if (addr == 0x4fc012f8u && live) {
+        rv->PC = rv->X[1];
+        p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
+        return 0x00000073u; /* ecall (block-terminal) */
+    }
+    /* MD5 bodies: MD5Init runs natively (prologue-only, no illegals), so
+     * NO hook here — the old init hook's X[10]=0 clobber was harmless but
+     * pointless. Update/Final run the host ports (bodies die on illegal
+     * words mid-body). ra on entry is the original caller (caller's jalr
+     * set it; the wrapper jal has rd=x0 so it preserves ra). */
+    if ((addr == 0x4fc06ec4u || addr == 0x4FC005F0u) && live) {
+        p4_md5_update_pub(PRIV(rv)->esp32p4, rv->X[10], rv->X[11], rv->X[12]);
+        rv->PC = rv->X[1]; /* return to caller; ECALL ends the block */
+        p4_md5_ecall = true;
+        return 0x00000073u; /* ecall (block-terminal; handler skips PC+4) */
+    }
+    /* MD5Final body (remapped 0x4fc06f8c = eco5 MD5Final): same treatment
+     * (calls the 0x4fc0658a helper which dies on illegal words). */
+    if ((addr == 0x4fc06f8cu || addr == 0x4FC005F4u) && live) {
+        p4_md5_final_pub(PRIV(rv)->esp32p4, rv->X[10], rv->X[11]);
+        rv->X[10] = 0;
+        rv->PC = rv->X[1]; /* return to caller; ECALL ends the block */
+        p4_md5_ecall = true;
+        return 0x00000073u; /* ecall (block-terminal; handler skips PC+4) */
+    }
+    /* 0x4fc0b2c8: ROM abort spin slot (a zero word where a jal target
+     * decodes as illegal). Return a tight `j .` so a guest that gets here
+     * spins instead of killing block translation. */
+    if (addr == 0x4fc0b2c8u)
+        return 0xa001u; /* c.j . */
     esp32_region_t *r = esp32_lookup(rv, addr);
     if (!r || r->type != ESP32_REG_RAM) {
-        /* code fetch outside RAM: decode as 0 (illegal) and log once */
-        fprintf(stderr,
-                "esp32p4: ifetch at non-RAM 0x%08x (guest pc=0x%08x, r=%p)\n",
-                addr, rv->PC, (void *) r);
+        /* code fetch outside RAM: decode as 0 (illegal) and log once. */
+        static unsigned long nq = 0;
+        if (nq++ < 10)
+            fprintf(stderr,
+                    "esp32p4: ifetch at non-RAM 0x%08x (guest pc=0x%08x, r=%p)\n",
+                    addr, rv->PC, (void *) r);
         return 0;
-    }
-    /* TEMP: catch entry into the suspect zero area */
-    if (addr >= 0x4ff4f000u && addr < 0x4ff50000u) {
-        static unsigned long fq = 0;
-        if (fq++ < 6)
-            fprintf(stderr, "[FETCH] %08x (ra=%08x sp=%08x)\n", addr, rv->X[1],
-                    rv->X[2]);
     }
     uint32_t val;
     if (r->base == P4_FLASH_I_BASE)
@@ -3725,13 +4161,26 @@ void esp32p4_install_io(riscv_t *rv)
         .mmu_write_w = esp32p4_write_w,
         .mmu_write_s = esp32p4_write_s,
         .mmu_write_b = esp32p4_write_b,
-        .on_ecall = NULL,
+        .on_ecall = esp32p4_ecall_handler,
         .on_ebreak = NULL,
         .on_memcpy = NULL,
         .on_memset = NULL,
         .on_trap = trap_handler,
     };
     memcpy(&rv->io, &io, sizeof(riscv_io_t));
+}
+
+/* ecall handler: the MD5 hooks above already ran inline and set PC = ra;
+ * the trailing ECALL only ends the block. Skip it WITHOUT touching PC
+ * (PC already points at the caller). Any other ECALL is unexpected on
+ * bare metal: skip it (PC+4). */
+void esp32p4_ecall_handler(riscv_t *rv)
+{
+    if (p4_md5_ecall) {
+        p4_md5_ecall = false;
+        return;
+    }
+    rv->PC += 4;
 }
 
 /* ------------------------------------------------------------------ */
@@ -3780,10 +4229,10 @@ uint32_t esp32p4_boot(esp32p4_t *soc, const char *elf_path)
         size_t got = fread(fd->data, 1, P4_FLASH_SIZE, f);
         fclose(f);
         fprintf(stderr, "esp32p4: loaded %zu bytes of flash image\n", got);
-        /* boot from the ROM reset vector (0x4FC00000, the ROM's linked
-         * view): ROM code initializes the system then loads the 2nd-stage
+        /* boot from the ROM reset vector (the ROM's linked view): ROM
+         * code initializes the system then loads the 2nd-stage
          * bootloader from flash offset 0 and jumps to the app. */
-        return 0x4FC00000u;
+        return P4_ROM_LINK;
     }
 
     FILE *f = fopen(elf_path, "rb");
@@ -4148,127 +4597,6 @@ void esp32p4_periodic(riscv_t *rv)
     esp32p4_t *soc = PRIV(rv)->esp32p4;
     if (!soc)
         return;
-    /* one-shot probe: ets_delay_us spin state (app phase only). */
-    if (rv->PC == 0x4fc01308u && rv->csr_cycle > 100000000ull) {
-        static unsigned long k = 0;
-        if (k++ < 6) {
-            uint8_t *tp = esp32p4_guest_to_host(soc, 0x4ffbf90u);
-            fprintf(stderr, "[DLY] a0=%08x a4=%08x ticks=%08x ra=%08x mcycle=%llu\n",
-                    rv->X[10], rv->X[14], tp ? *(uint32_t *) tp : 0xDEADu,
-                    rv->X[1], (unsigned long long) rv->csr_cycle);
-        }
-    }
-    /* mie transition watch (tick enable hunt). */
-    {
-        static uint32_t last_mie = 0;
-        static unsigned long mc = 0;
-        if (rv->csr_mie != last_mie && mc++ < 10) {
-            last_mie = rv->csr_mie;
-            fprintf(stderr, "[MIE] -> %08x (pc=%08x mstatus=%08x)\n",
-                    rv->csr_mie, rv->PC, rv->csr_mstatus);
-        }
-    }
-    if (rv->PC == 0x4000949au) {
-        static unsigned long c7 = 0;
-        if (c7++ < 4)
-            fprintf(stderr, "[HALT] mie=%08x mip=%08x mstatus=%08x mtvec=%08x st0=%08x ena=%08x cmp0=%016llx cnt=%llu\n",
-                    rv->csr_mie, rv->csr_mip, rv->csr_mstatus, rv->csr_mtvec,
-                    soc->systimer_int_raw, soc->systimer_int_ena,
-                    (unsigned long long) soc->systimer_comp0,
-                    (unsigned long long) rv->csr_cycle);
-    }
-    if (rv->PC == 0x4000313au || rv->PC == 0x4ff493c8u ||
-        rv->PC == 0x400030d2u) {
-        static unsigned long c5 = 0;
-        if (c5++ < 8)
-            fprintf(stderr, "[ENTRY] pc=%08x sp=%08x ra=%08x\n", rv->PC,
-                    rv->X[2], rv->X[1]);
-    }
-    /* scheduler progress probe (first pcs inside vTaskStartScheduler). */
-    if (rv->PC >= 0x4ff46c8cu && rv->PC < 0x4ff46d80u) {
-        static unsigned long c6 = 0;
-        if (c6++ < 60)
-            fprintf(stderr, "[YIELD] pc=%08x sp=%08x ra=%08x a0=%08x a1=%08x mstatus=%08x mie=%08x mip=%08x\n",
-                    rv->PC, rv->X[2], rv->X[1], rv->X[10], rv->X[11],
-                    rv->csr_mstatus, rv->csr_mie, rv->csr_mip);
-    }
-    if (rv->PC == 0x400094c0u) {
-        static unsigned long c4 = 0;
-        if (c4++ < 4) {
-            uint32_t base = rv->X[9] - 1212u;
-            uint8_t *pb = esp32p4_guest_to_host(soc, base);
-            uint8_t *pb2 = esp32p4_guest_to_host(soc, base + 1u);
-            fprintf(stderr, "[FLAGW] s1=%08x flag=%08x,%08x b0=%02x b1=%02x local=%08x\n",
-                    rv->X[9], base, base + 1u,
-                    pb ? *pb : 0xDDu, pb2 ? *pb2 : 0xDDu, rv->X[14]);
-        }
-    }
-    if (rv->PC == 0x4fc0639eu) {
-        static unsigned long c2 = 0;
-        if (c2++ < 6) {
-            uint8_t *av = esp32p4_guest_to_host(soc, 0x4fc005ecu);
-            uint32_t s0 = rv->X[8];
-            uint8_t *sp0 = esp32p4_guest_to_host(soc, s0);
-            uint32_t mm8 = soc->mmu[((s0 - P4_FLASH_I_BASE) >> 16) & 0x3FFu];
-            fprintf(stderr, "[CRC] a0=%08x a1(buf)=%08x a2(len)=%08x ra=%08x s0=%08x s1=%08x s2=%08x s3=%08x api5ec=%08x\n",
-                    rv->X[10], rv->X[11], rv->X[12], rv->X[1],
-                    rv->X[8], rv->X[9], rv->X[18], rv->X[19],
-                    av ? *(uint32_t *) av : 0xDEADu);
-            if (sp0) {
-                uint32_t w0, w1;
-                memcpy(&w0, sp0, 4);
-                memcpy(&w1, sp0 + 4, 4);
-                fprintf(stderr, "[CRC] s0data=%08x %08x mmu8=%08x\n", w0, w1,
-                        mm8);
-            } else {
-                /* s0 in flash window: read via window path */
-                esp32_region_t *wr = esp32_find_region(soc, s0);
-                if (wr && wr->base == P4_FLASH_I_BASE) {
-                    uint32_t v0 = esp32_window_read(soc, wr->data, s0, 4);
-                    uint32_t v1 = esp32_window_read(soc, wr->data, s0 + 4, 4);
-                    fprintf(stderr, "[CRC] s0win=%08x %08x mmu8=%08x\n", v0,
-                            v1, mm8);
-                } else {
-                    fprintf(stderr, "[CRC] s0 unmapped (r=%p)\n",
-                            (void *) wr);
-                }
-            }
-        }
-    }
-    /* one-shot probe: bootloader indirect call target before crc. */
-    if (rv->PC == 0x4ff2f396u) {
-        static unsigned long c3 = 0;
-        if (c3++ < 4) {
-            uint32_t taddr = rv->X[1] + 0x25Au;
-            esp32_region_t *tr = esp32_find_region(soc, taddr);
-            uint32_t tgt = 0xDEADu;
-            if (tr && tr->type == ESP32_REG_RAM &&
-                taddr + 4 <= tr->base + tr->size)
-                memcpy(&tgt, tr->data + (taddr - tr->base), 4);
-            fprintf(stderr, "[CALL] jalr target [ra+25a]=[%08x]=%08x a0=%08x\n",
-                    taddr, tgt, rv->X[10]);
-        }
-    }
-    if (rv->PC == 0x4fc102b2u) {
-        static unsigned long c = 0;
-        if (c++ < 4) {
-            uint8_t *pp = esp32p4_guest_to_host(soc, 0x4ffbffe8u);
-            uint32_t ptr = pp ? *(uint32_t *) pp : 0xDEADu;
-            uint8_t *q = (ptr >= 0x4ff00000u && ptr < 0x4ffc0000u) ?
-                         esp32p4_guest_to_host(soc, ptr) : NULL;
-            fprintf(stderr, "[CFG] a0(id)=%08x a1(size)=%08x ptr=%08x chip_size=%08x\n",
-                    rv->X[10], rv->X[11], ptr,
-                    q ? *(uint32_t *) (q + 4) : 0xDEADu);
-        }
-    }
-    /* low-rate progress sampler (temporary). */
-    {
-        static unsigned long n = 0;
-        if ((n++ & 0xFFFFFu) == 0)
-            fprintf(stderr, "[DIAG] pc=%08x sp=%08x ra=%08x cycle=%llu\n",
-                    rv->PC, rv->X[2], rv->X[1],
-                    (unsigned long long) rv->csr_cycle);
-    }
     (void) rv->PC;
     uint32_t *mmio32 = (uint32_t *) soc->mmio;
     /* Virtual button: input pin 7 toggles every ~2^18 cycles. The change
