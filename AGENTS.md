@@ -526,11 +526,11 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
     H2; H2-specific qh_*.txt feeders carry the right pins. Large single
     feeders stall the UART RX path, so the matrix runs in ≤250-byte
     chunks (a/b/c/d/e splits).
-   - WIP 2026-09-13: MicroPython P4 — upstream HAS a port
+   - WIP 2026-09-13/14: MicroPython P4 — upstream HAS a port
      (ESP32_GENERIC_P4, PRE_REV3 variant for rev < 3). Emulator-side
-     progress this session (src/esp32p4.c/.h, NOT the MPY tree): 16 MB
-     flash backing (MPY P4 board = 16 MB part; old 4 MB truncated the app
-     → ROM "invalid header"), eFuse wafer rev reports v1.0 (PRE_REV3
+     progress (src/esp32p4.c/.h, NOT the MPY tree): 16 MB flash backing
+     (MPY P4 board = 16 MB part; old 4 MB truncated the app → ROM
+     "invalid header"), eFuse wafer rev reports v1.0 (PRE_REV3
      bootloader skips max-rev at its own stage but the APP image carries
      max_rev_full=199, so v1.x < v3 default-board images fail rev check —
      v1.0 is the compatible middle), MSPI(MPLL) CAL_END + handshake on
@@ -541,18 +541,29 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      rtc_clk_cal looped forever). PSRAM-less NOPSRAM board variant added
      in the MPY tree (boards/ESP32_GENERIC_P4/mpconfigvariant_NOPSRAM.cmake
      + /home/danish1075/mpywork/sdkconfig.nopsram) to isolate the PSRAM
-     bringup. Root causes fixed this session:
-       * ROM ABI skew: the bundled rev0 HP ROM dump carries the BASE jal
-         table (MD5 5EC/5F0/5F4, SHA 614/620/62C/630) but IDF v5.5 links
-         the ECO5 table (-0xC: MD5 5E0/5E4/5E8, SHA 608/614/620/624).
-         Base slots point at CRC helpers / LP-core stubs (the 0x4fc06416
-         "MD5Transform stall" was really the CRC byte loop entered as
-         MD5Update; SHA 62C/630 point at unmapped 0x4fb0xxxx). Fix
-         (p4_remap_rom_slots at SoC init): re-encode each base slot JAL
-         for its address from the eco slot's TARGET (NOT a raw word copy
-         — JAL is PC-relative; a word copy lands +12 into the body and
-         skips MD5Init's buf[0] store). All 19 eco5 bodies verified
-         in-dump HP code; MD5Init now runs natively.
+     bringup. CORRECTED 2026-09-14 — the "ECO5 skew" theory was WRONG
+     (disproved by the linked ELF symtabs + dump disassembly): the rev0
+     dump carries the BASE table (MD5 5EC/5F0/5F4, SHA 614..634) and IDF
+     v5.5.4 links BASE too; Arduino's ECO5 .ld only renames the SLOT
+     addresses (-0xC) while the bodies alias (MD5Update/Final both JAL to
+     the same body). The committed p4_remap_rom_slots REWRITE is what
+     broke Arduino (it redirected Arduino's crc32_le @5EC into MD5Init
+     and its sha paths into the wrong bodies — the Sep-14 "Segment 0
+     load address 0x42c4b0e3 doesn't match data 0x00010020" failure on
+     previously-green patched.bin). Fix (uncommitted WIP in src/esp32p4.c,
+     /tmp/wip_current.patch): NEVER rewrite the slots. Arduino ECO5
+     slots run their real in-dump bodies natively (incl. MMIO SHA block);
+     MPY BASE MD5Update/Final + BASE SHA group (LP stubs / illegal words)
+     trap in ifetch and run host ports (execution-gated by rv->PC,
+     load-bearing). MD5 streaming cap removed (bootloader hashes
+     multi-KB segments; the 256 B cap corrupted every segment SHA/MD5).
+     Sub-word MMIO merge added (sb/sh Missing — the HAL's sb to
+     SPIMEM1 CONTENT and the ROM's sw to SPIMEM0 CONTENT share one
+     soc->mmu; UART FIFO stays byte-single). New hooks: esp_rom_spiflash_
+     read (memcpy host-side), cache/MMU nops (incl. Set_Secure/suspend/
+     enable), 0x4ffc0000 spin (invalid-header landing pad). Debug
+     fprintf scaffolding stripped (kept: boot/ELF/error paths).
+     Root causes fixed earlier this session:
        * MD5Update/Final bodies die on illegal words mid-body (rv32emu
          lacks the encoding) → host esp_rom_md5 ports via execution-gated
          ifetch hooks (rv->PC == addr gate is load-bearing: translate-time
@@ -567,13 +578,22 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
        * ets_delay_us (ROM 0x4fc012f8 MCYCLE spin) skipped via ifetch hook
          (MCYCLE advances ~3/step; 9000us needs ~10M steps). 0x4ffbff90
          factor forced to 360 (P4 CPU MHz).
-     Status: bootloader + partition MD5 + bootloader SHA all pass; app
-     boots into clock init (rtc_clk_cal now completes, past slow-src set
-     into 32k-cal loop → fixed by TIMG count fix; now progressing through
-     app init, ~8.5B cycles in log). Arduino P4 matrix unaffected
-     (patched HELLO+TICK, SMP SPI EF 40 15 re-verified green on this
-     tree). Next: drive app to REPL, then strip TEMP scaffolding and run
-     the Arduino matrix + C3/C6/H2 sanity.
+     Status 2026-09-14: MPY NOPSRAM app image loads segments + MD5-OK,
+     reaches clock init (5× rtc_clk warnings, no E-errors — same point as
+     the committed tree). Arduino P4 REGRESSED by the committed remap
+     (patched.bin + fresh rebuild + stock HEAD all fail identically with
+     the segment-mismatch, i.e. NOT caused by the WIP): root cause is
+     TOOLCHAIN-side — the Sep-4-built app image itself violates the
+     bootloader's seg0 alignment check ((data_off % 64K) vs (load % 64K)
+     differ for every non-cache segment: seg1 a60-vs-0, etc.), while the
+     bootloader (built from the same IDF) enforces it. Sep-13 HELLO+TICK
+     logs predate this; no green Arduino P4 run exists on current images.
+     The committed 5883df1 message ("MPY P4 boots to app") overstates:
+     MPY reaches app clock init, no REPL yet. Next: (a) rebuild the P4
+     Arduino app with a current arduino-core/IDF and confirm the image
+     passes its OWN bootloader check on HW semantics (or find why seg
+     data_off alignment drifted); (b) then re-verify HELLO+TICK with the
+     slot-preserving WIP; (c) drive MPY app to REPL.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,
