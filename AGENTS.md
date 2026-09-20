@@ -648,13 +648,19 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      Sep-4 `patched.bin` boots clean to app entry `0x4ff40c04` + HELLO
      (native 60 s window). Later 500 s tail: guest reaches `Partition
      table MD5 mismatch → 0x103` (partition MD5, next).
-   - DONE 2026-09-20 (commit): Arduino RE-GREEN + MPY fixes committed
-     on top of 082c04d (`src/esp32p4.c`, `src/emulate.c` FRM CSR,
-     `src/rv32_constopt.c` MULHU, docs). Trace-free (zero TEMP tags;
-     kept `[SHAGUARD]` guard + boot/ELF/error paths). Native 60 s:
-     ROM banner → `entry 0x4ffac2c0` → app `0x4ff40c04` → HELLO, no
-     abort/mismatch. Next: WASM rebuild + node regression, then MPY
-     parked-hart trace → REPL.
+   - DONE 2026-09-20 (commit `0ae930e`): Arduino RE-GREEN + MPY fixes
+     committed on top of 082c04d (`src/esp32p4.c`, `src/emulate.c` FRM
+     CSR, `src/rv32_constopt.c` MULHU, docs). Trace-free (zero TEMP
+     tags; kept `[SHAGUARD]` guard + boot/ELF/error paths). Native
+     60 s: ROM banner → `entry 0x4ffac2c0` → app `0x4ff40c04` → HELLO,
+     no abort/mismatch. WASM node regression 2026-09-20 (fresh
+     `wasmc6_defconfig` build, wasm 1301098 B): H2 hello + 20 TICKs,
+     C6 demotest full report + DEMO_DONE, P4 2nd-stage `entry
+     0x4ffac2c0` clean (no HELLO within 120 s window — WASM ~10x
+     slower than native here; native HELLO+TICK is the green gate).
+     C3 run inconclusive (pre-existing `DBG:` print floods in
+     `src/esp32c3.c`, untouched by this commit). Next: MPY
+     parked-hart trace → REPL, then P4 partition-MD5 (`0x103`).
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,
