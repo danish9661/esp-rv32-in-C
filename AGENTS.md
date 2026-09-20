@@ -648,12 +648,14 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      Sep-4 `patched.bin` boots clean to app entry `0x4ff40c04` + HELLO
      (native 60 s window). Later 500 s tail: guest reaches `Partition
      table MD5 mismatch → 0x103` (partition MD5, next).
-   - DONE 2026-09-20 (commit `0ae930e`): Arduino RE-GREEN + MPY fixes
+   - DONE 2026-09-20 (commit `0ae930e`): Arduino fixes + MPY fixes
      committed on top of 082c04d (`src/esp32p4.c`, `src/emulate.c` FRM
      CSR, `src/rv32_constopt.c` MULHU, docs). Trace-free (zero TEMP
      tags; kept `[SHAGUARD]` guard + boot/ELF/error paths). Native
-     60 s: ROM banner → `entry 0x4ffac2c0` → app `0x4ff40c04` → HELLO,
-     no abort/mismatch. WASM node regression 2026-09-20 (fresh
+     60 s (working tree at commit time): ROM banner → `entry
+     0x4ffac2c0` → app `0x4ff40c04` → HELLO, no abort/mismatch
+     (HEAD-clean rebuild: entry + silent park — HELLO leg needs the
+     follow-ups below). WASM node regression 2026-09-20 (fresh
      `wasmc6_defconfig` build, wasm 1301098 B): H2 hello + 20 TICKs,
      C6 demotest full report + DEMO_DONE, P4 2nd-stage `entry
      0x4ffac2c0` clean (no HELLO within 120 s window — WASM ~10x
@@ -661,6 +663,17 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      C3 run inconclusive (pre-existing `DBG:` print floods in
      `src/esp32c3.c`, untouched by this commit). Next: MPY
      parked-hart trace → REPL, then P4 partition-MD5 (`0x103`).
+   - 2026-09-20 (post-commit, STASHED not committed): MPY `Image hash
+     failed` root-caused (repeat `0x62C` feeds chain past ifetch —
+     only the first 24 B feed executes host logic; fix = mark-only
+     ifetch + per-execution ecall handler). The WIP also tried a
+     620-ECO5-feed, a `~0` crc32 stub, and exact-address SHAGUARD —
+     all three REGRESSED Arduino (both app slots invalid magic) and
+     were reverted; WIP stashed as `stash@{0}` (patch saved at
+     `/tmp/opencode/wip_ecall_refactor.patch`, 385 lines) for a
+     split Arduino-gated re-apply. HEAD-clean Arduino re-verified
+     green (`entry 0x4ffac2c0`, silent park). MPY next: ecall-handler
+     move + eFuse `0x810` + ra-gated MD5Init, each Arduino-verified.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,
