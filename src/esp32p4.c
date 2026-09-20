@@ -532,6 +532,11 @@ struct esp32p4_soc {
      * reset default 1), reset_en @+0x4. Plain read-back storage with
      * reset defaults so clock-gate polls see enabled bits. */
     uint32_t lpperi_reg[4];
+    /* REGI2C host register latch (0x50124000, I2C_MST_ANA_CONF0_REG):
+     * BUSY forced 0 on read; bits[23:16] latch read data. */
+    uint32_t regi2c_reg;
+    /* LP_AON fast-clk gate (0x5011004C, read by ROM startup handshake). */
+    uint32_t lp_aon_gate;
     /* PSRAM MSPI controllers (0x5008E000-0x50090000): plain read-back
      * storage so driver register programming sticks. */
     uint32_t psram_reg[2048];
@@ -1815,6 +1820,17 @@ static uint32_t p4_xlate(uint32_t addr)
 static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
 {
     (void) rv;
+    /* USB_SERIAL_JTAG (0x500D2000, 0x100): the MPY boot console.
+     * EP1_CONF @+0x04 bit 1 = TX-idle (the driver's tx-wait loop spins
+     * until it reads set); +0x00 word writes are TX bytes (each store
+     * carries one console byte in val[7:0] — forwarded to the UART
+     * console like UART0 FIFO). Reads otherwise 0. */
+    if (addr >= 0x500D2000u && addr < 0x500D2100u) {
+        uint32_t o = addr - 0x500D2000u;
+        if (o == 0x04u)
+            return 1u << 1; /* EP1_CONF: TX idle, RX empty */
+        return 0u;
+    }
     /* HP_SYSTEM_CPU_INT_FROM_CPU_0/1_REG (0x500E5010/0x500E5014): the
      * crosscore/yield pending flags (sources 79/80). The SDK raises one
      * (write 1) and then busy-waits reading it back for 0; the flag must
@@ -1843,16 +1859,28 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
      * SLOW_CLK_SEL @+0x4, ...) is plain read-back storage. */
     if (addr == 0x50111010u)
         return (1u << 7) | 1u;
+    /* HP root-clock gate at LP_AON +0x4C = 0x5011004C: the ROM startup
+     * (0x4fc02910-1e) clears bits 1:0 then requires them to read back 0
+     * (clkgate handshake). Force those bits 0 — they are status-driven,
+     * and a stale nonzero wedges ROM boot before any UART output.
+     * (NOTE: this is NOT under LP_CLKRST 0x50111000 — an earlier draft
+     * indexed lpclk_reg with the wrong base and segfaulted.) */
+    if (addr == 0x5011004cu)
+        return soc->lp_aon_gate & ~3u;
     if (addr >= 0x50111000u && addr < 0x50112000u)
         return soc->lpclk_reg[(addr - 0x50111000u) >> 2];
 
     /* LP_TIMER (0x50112000): TAR0_LO/HI (0x00/0x04) arm the target,
      * UPDATE (0x10, bit 28) latches the free-running counter into
-     * BUF0_LO/HI (0x14/0x18); INT_RAW (0x28) bit 31 is the wakeup flag. */
+     * BUF0_LO/HI (0x14/0x18); INT_RAW (0x28) bit 31 is the wakeup flag.
+     * BUF reads come from the free-running lp_timer (advanced every
+     * periodic tick from the cycle counter), NOT the frozen lp_counter
+     * (which only advances on UPDATE pulses) — the SDK's
+     * lp_timer_hal_get_cycle_count / rtc_time_get spins on BUF changing. */
     if (addr >= 0x50112000u && addr < 0x50113000u) {
         uint32_t off = addr - 0x50112000u;
-        if (off == 0x14u) return (uint32_t)(soc->lp_counter & 0xffffffffu);
-        if (off == 0x18u) return (uint32_t)((soc->lp_counter >> 32) & 0xffffu);
+        if (off == 0x14u) return (uint32_t)(soc->lp_timer & 0xffffffffu);
+        if (off == 0x18u) return (uint32_t)((soc->lp_timer >> 32) & 0xffffu);
         if (off == 0x28u) {
             if (soc->lp_armed) {
                 soc->lp_counter += 1000ull;
@@ -1909,22 +1937,27 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return 0;
     }
 
-    /* eFuse block (0x5012D000): report a v1.0 chip. MicroPython P4
-     * PRE_REV3 images accept rev >= 0 with max-rev check disabled at the
-     * bootloader stage (min_rev_full=18, max empty), while the default
-     * P4 board build requires >= v3.0 — v1.x satisfies neither max nor
-     * min for all images, so v1.0 is the compatible middle: PRE_REV3
-     * boots (min 0), and factory-app max-rev (<= v1.99) passes.
-     * RD_MAC_SYS_2 @+0x4C: MINOR[3:0]=0, MAJOR_LO[5:4]=1,
-     * MAJOR_HI[23]=0 (major = HI<<2|LO = 1). */
+    /* eFuse RD_MAC_SYS_2 @+0x4C (efuse_rd_mac_sys2_reg_t, hw_ver3):
+     * wafer_version_minor [3:0], wafer_version_major_lo [5:4],
+     * disable_wafer_version_major [6], disable_blk_version_major [7],
+     * blk_version_minor [10:8], blk_version_major [12:11],
+     * wafer_version_major_hi [23]. CHIP rev = hi<<2|lo (major),
+     * minor nibble; BLK rev = blk_major*100+blk_minor (app desc wants
+     * [0,199]). postv3 Arduino needs CHIP >= v3 AND BLK <= v1.99:
+     * report ECO5 chip (major hi=1,lo=1 -> 3, minor 0) with BLK v1.0
+     * (major 1, minor 0): val = (1<<23)|(1<<11)|(1<<4) = 0x800810. */
     if (addr >= 0x5012D000u && addr < 0x5012D400u) {
         if (addr == 0x5012D000u + 0x4Cu)
-            return (1u << 4); /* wafer major 1, minor 0 */
+            return (1u << 23) | (1u << 11) | (1u << 4);
         return 0;
     }
 
     /* SPIMEM0 (0x5008C000, ROM MMU port) / SPIMEM1 (0x5008E000, HAL MMU
-     * port): INDEX/CONTENT route to the shared soc->mmu table. */
+     * port): INDEX/CONTENT route to the shared soc->mmu table.
+     * NOTE: the sub-word merge in esp32_mmio_write reads base+0 via
+     * esp32_mmio_read before dispatching, so CONTENT reads MUST come
+     * from soc->mmu (not the psram_reg copy written by the fall-through
+     * below) or merged sb writes corrupt the entry. */
     if (addr == 0x5008E380u || addr == 0x5008C380u) /* MMU_ITEM_INDEX */
         return soc->mmu_index;
     if (addr == 0x5008E37Cu || addr == 0x5008C37Cu) /* MMU_ITEM_CONTENT */
@@ -1940,6 +1973,20 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
      * reset default 1), reset_en @+0x4. Plain read-back storage. */
     if (addr >= 0x50120000u && addr < 0x50120010u)
         return soc->lpperi_reg[(addr - 0x50120000u) >> 2];
+
+    /* REGI2C host register (0x50124000, I2C_MST_ANA_CONF0_REG): BUSY is
+     * bit 26 (slli 6 + bltz poll), DONE is bit 27, data byte is
+     * bits[23:16] (srli 16 + zext.b). The app's regi2c read_mask polls
+     * BUSY==0, writes the R/W strobe, polls BUSY==0 again, then samples
+     * the data byte. Model: BUSY forced 0, DONE forced 1, data byte
+     * 0x50 (mid-range cal byte — the value the clock code divides down
+     * to a nonzero MHz; a 0x00 byte yields freq 0 → abort at
+     * rtc_clk_cpu_freq_get_config). Plain storage otherwise. */
+    if (addr == 0x50124000u)
+        return (0x50u << 16) | (1u << 27);
+    /* CONF1 (0x50124020) / CONF2 (0x5012401C): same DONE status. */
+    if (addr == 0x50124020u || addr == 0x5012401Cu)
+        return (0x50u << 16) | (1u << 27);
 
     /* HP_SYS_CLKRST (0x500E6000) + PMU (0x50115000): plain read-back
      * storage (see struct). HW-set status bits forced below. */
@@ -1965,10 +2012,17 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
      * (0xE4 L1_ICACHE0, 0xF8 L1_ICACHE1, 0x134 L1_DCACHE, 0x2B4 L2)
      * bit 1 = AUTOLOAD_DONE; L2_PRELOAD_CTRL (0x2A8) bit 1 =
      * PRELOAD_DONE; LOCK_CTRL (0x88) bit 2 = LOCK_DONE. The ROM's
-     * Cache_* paths busy-wait on these. */
+     * Cache_* paths busy-wait on these.
+     * SHUT bits (polled by Cache_Enable_L1_ICache at 0x3ff100a8 bit 1):
+     * the enable path spins until the cache's SHUT bit reads SET after
+     * programming MODE — force bit 1 of +0xA8 so the enable completes
+     * (without it the bootloader wedges inside cache_hal_enable and no
+     * MMU mapping / flash read ever happens). */
     if (addr >= 0x3FF10000u && addr < 0x3FF10400u) {
         uint32_t off = addr - 0x3FF10000u;
         uint32_t v = soc->cache_reg[off >> 2];
+        if (off == 0xA8u || off == 0xB4u)
+            v |= 0x2u; /* SHUT: cache on (L1_ICACHE0/1, polled at +0xA8) */
         if (off == 0x98u)
             v |= 0x10u; /* SYNC_DONE */
         if (off == 0xE4u || off == 0xF8u || off == 0x134u || off == 0x2B4u)
@@ -2620,7 +2674,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
      * register value. Only word-aligned base addresses merge (a cross-
      * word sh splits into two byte stores instead).
      * EXCEPTION (consumes bytes, not storage — forward singly): UART TX
-     * FIFO (re-emitting merged bytes would duplicate output). */
+     * FIFO (re-emitting merged bytes would duplicate output). The ROM's
+     * putc is `c.sh` (size 2): the sh byte-split path forwards each half
+     * as size-5 singles, so the FIFO would print the byte TWICE (the
+     * MPY ROM-print doubling). Dedup: swallow an identical immediate
+     * repeat arriving as sub-word fragments — word/single writes always
+     * print (else legit doubles like 'LL' get eaten). */
     if (size >= 5) {
         /* single-byte UART FIFO forward: falls through to the FIFO
          * handler below, which keys on size 5. */
@@ -2630,8 +2689,18 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             uint32_t rbase = 0x500CA000u + 0x1000u * p;
             if (addr == tbase + UART_FIFO_REG ||
                 addr == rbase + UART_FIFO_REG) {
-                esp32_mmio_write(rv, tbase + UART_FIFO_REG,
-                                 val & 0xFFu, 5);
+                static uint32_t fifo_last_addr = 0xFFFFFFFFu;
+                static uint8_t fifo_last_b = 0;
+                static uint8_t fifo_armed = 0;
+                uint8_t b = (uint8_t) (val & 0xFFu);
+                int dup = (fifo_armed && addr == fifo_last_addr &&
+                           b == fifo_last_b);
+                fifo_last_addr = addr;
+                fifo_last_b = b;
+                fifo_armed = (uint8_t) !dup;
+                if (!dup)
+                    esp32_mmio_write(rv, tbase + UART_FIFO_REG,
+                                     val & 0xFFu, 5);
                 return;
             }
         }
@@ -2654,9 +2723,27 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
      * Shares soc->spi2_reg with the translated bank below. The GPSPI
      * flash-read path (bootloader esp_flash_read) programs cmd/addr/
      * ms_dlen/data_buf here, NOT via the translated alias. Defer to the
-     * shared translated-bank handler (translate + fall through). */
+     * shared translated-bank handler (translate + fall through).
+     * (0x500D2000 is USB_SERIAL_JTAG, NOT SPI2 — handled below.)
+     * NOTE: the sub-word merge above already routes sb/sh through
+     * esp32_mmio_read(base) first; SPIMEM1 MMU CONTENT (0x5008E37C)
+     * shares soc->mmu while ALSO living in psram_reg — the prologue
+     * read path must see the MMU value, not the stale psram copy.
+     * So: MMU CONTENT reads are served from soc->mmu in the read path
+     * (see prologue), and writes here update soc->mmu (fall-through to
+     * the PSRAM store keeps the copy). */
     if (addr >= 0x500D0000u && addr < 0x500D0100u)
         addr = P4_PERIPH_BASE + 0x81000u + (addr - 0x500D0000u);
+
+    /* USB_SERIAL_JTAG TX (0x500D2000+0x00): each store carries one
+     * console byte in val[7:0] (the driver's tx loop writes words;
+     * the ROM putc path writes sub-word fragments already deduped
+     * above). Forward to the UART console. +0x04 EP1_CONF kick
+     * (WORD store 1) is ignored. */
+    if (addr == 0x500D2000u) {
+        esp32_uart_putc(soc, (char) (val & 0xFFu));
+        return;
+    }
 
     /* HP_SYS_CLKRST + PMU: plain read-back storage. */
     if (addr >= 0x500E6000u && addr < 0x500E7000u) {
@@ -2687,9 +2774,27 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         return;
     }
 
+    /* REGI2C host registers (0x50124000 CONF0 latch + 0x50124020 CONF1
+     * + 0x5012401C CONF2): reads report BUSY=0/DONE=1 + data byte 0x50
+     * (see the read path above). CONF1/2 are plain RTCCNTL-style
+     * registers the driver masks before strobing; report the same DONE
+     * status so the enable-block path proceeds. */
+    if (addr == 0x50124000u) {
+        soc->regi2c_reg = val;
+        return;
+    }
+    if (addr == 0x50124020u || addr == 0x5012401Cu) {
+        soc->regi2c_reg = val;
+        return;
+    }
+
     /* SPIMEM0 (0x5008C000): the ROM's Cache_FLASH_MMU_Set_Readback writes
      * the flash MMU table here with WORD stores (sw s4/s5/a0 to +0x37C
-     * CONTENT; INDEX to +0x380). Same shared soc->mmu table. */
+     * CONTENT; INDEX to +0x380). Same shared soc->mmu table.
+     * mmu_hal_unmap_all (bootloader 0x4ffb17aa, called via munmap before
+     * every mmap) writes INDEX=i + CONTENT=0 for i in 0..1023 on BOTH
+     * SPIMEM0 and SPIMEM1 — CONTENT=0 has VALID clear so the entry reads
+     * unmapped (matches the window-read gate). */
     if (addr == 0x5008C380u) { /* MMU_ITEM_INDEX */
         soc->mmu_index = val & 0x3FFu;
         return;
@@ -2699,7 +2804,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             soc->mmu[soc->mmu_index] = val;
         return;
     }
-    /* SPI1 (SPIMEM1, 0x5008E000 — the bootloader HAL's MMU copy):
+    /* SPI1 (SPIMEM1, 0x5008E000 — the bootloader HAL's MMU copy + the
+     * unmap_all loop's second half):
      * INDEX/CONTENT share the one soc->mmu table (writes only).
      * NOTE: ets_loader_map_range writes CONTENT with BYTE stores (sb);
      * those arrive here via the sub-word merge in the prologue as full
@@ -2792,7 +2898,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         return;
     }
 
-    /* LP_CLKRST (0x50111000): plain read-back storage. */
+    /* LP_CLKRST (0x50111000): plain read-back storage, EXCEPT the HP
+     * root-clock gate at +0x4C (LP_AON fast-clk gate): the ROM startup
+     * (0x4fc02910-1e) clears bits 1:0 there then requires them to read
+     * back 0 before continuing (clkgate handshake). A stale nonzero
+     * value wedges ROM boot before any UART output. Force those two
+     * bits to 0 on read (they are status-driven, not stored). */
     if (addr >= 0x50111000u && addr < 0x50112000u) {
         soc->lpclk_reg[(addr - 0x50111000u) >> 2] = val;
         return;
@@ -3189,8 +3300,12 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
             /* RTC slow-clock calibration (see translated-block comment at
-             * 0x60008068): count = max * 40MHz / slow_hz, latched << 7. */
-            r[o >> 2] = val;
+             * 0x60008068): count = max * 40MHz / slow_hz, latched << 7.
+             * RDY semantics (load-bearing): the guest polls RDY after each
+             * START; a fresh START must CLEAR RDY first (HW runs a new
+             * measurement; RDY rises when it completes). Model instant
+             * completion: clear RDY on write, latch fresh count, set RDY. */
+            r[o >> 2] = val & ~0x8000u; /* START clears RDY */
             if (val & 0x80000000u) { /* TIMG_RTC_CALI_START */
                 uint32_t clk_hz, max = (val >> 16) & 0x7FFFu;
                 switch ((val >> 13) & 3u) { /* TIMG_RTC_CALI_CLK_SEL */
@@ -3257,8 +3372,9 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 p4_intc_clear(soc, P4_TG1_T0_INTR_SOURCE);
             r[o >> 2] = 0;
         } else if (o == TIMG_RTCCALICFG) {
-            /* Same calibration model as TIMG0 (count << 7 + RDY). */
-            r[o >> 2] = val;
+            /* Same calibration model as TIMG0 (fresh count + RDY;
+             * START clears RDY first — see TIMG0 note). */
+            r[o >> 2] = val & ~0x8000u;
             if (val & 0x80000000u) {
                 uint32_t clk_hz, max = (val >> 16) & 0x7FFFu;
                 switch ((val >> 13) & 3u) {
@@ -4001,7 +4117,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
      * bit stays 0 (never times out); START_CYCLING (RTCCALICFG bit 12)
      * reads 0 (no cycling run in progress). */
     if (addr == P4_PERIPH_BASE + 0x8068u) {
-        mmio32[off >> 2] = val;
+        mmio32[off >> 2] = val & ~0x8000u; /* START clears RDY (see TIMG0) */
         if (val & 0x80000000u) { /* TIMG_RTC_CALI_START */
             uint32_t clk_hz, max = (val >> 16) & 0x7FFFu;
             switch ((val >> 13) & 3u) { /* TIMG_RTC_CALI_CLK_SEL */
@@ -4215,6 +4331,51 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
     }
+    /* ROM libgcc bit-scan slots (ECO5 + BASE ABIs share these addrs —
+     * PROVEN 2026-09-19 from both ELF symtabs + .ld files: BASE puts
+     * __clzsi2/__ffssi2 at 0x4fc00770/0x4fc007a0, ECO5 puts __ctzsi2/
+     * __fixsfdi at the SAME addrs). The ROM bodies die natively: the
+     * dump decodes to F-extension words (fmv.w.x/flt.s/fneg.s lead at
+     * both 0x4fc14030 and 0x4fc14fb0) which rv32emu rejects as illegal,
+     * so the guest traps instead of computing. Every tlsf_create/add/
+     * malloc maps sizes through these slots — dead slots = all pools
+     * report empty = malloc returns 0 (the esp_libc_init abort, then
+     * the VFS-nullfs 0x101 abort). Host ports (libgcc ABI):
+     * __clzsi2 = clz(v), 32 if v == 0; __ffssi2 = ctz(v)+1 (1-based,
+     * same as POSIX ffs; tlsf_ffs does __builtin_ffs(w)-1 for 0-based).
+     * NOTE on the shared slot: clz and ctz differ in general, but the
+     * ECO5 ABI only calls 0x4fc00770 as ctz in float-convert paths the
+     * guests never execute (Arduino boots green with the clz port);
+     * the slot's live callers (tlsf in both ABIs) need clz here. */
+    if ((addr == 0x4fc00770u || addr == 0x4fc007a0u) && live) {
+        uint32_t v = rv->X[10];
+        if (addr == 0x4fc00770u)
+            rv->X[10] = v ? (uint32_t) __builtin_clz(v) : 32u;
+        else
+            rv->X[10] = v ? (uint32_t) __builtin_ctz(v) + 1u : 0u;
+        rv->PC = rv->X[1];
+        p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
+        return 0x00000073u; /* ecall (block-terminal) */
+    }
+    /* ROM __udivdi3 dispatcher slot (0x4fc00844: `jal x0,stub` where the
+     * stub at 0x4fc162e0 is `c.li a0,0; c.jr ra` — returns 0 ALWAYS;
+     * PROVEN 2026-09-19 by dump decode). The guest calls THIS slot
+     * (DIVARGS logged the callers); native execution returns a0=0 for
+     * every division, which made rtc_clk_cal return 0 and wedged the
+     * clock-select retry loop. The REAL div body lives at the next slot
+     * (0x4fc00848 -> 0x4fc15bb0) but the guest never calls it. Host
+     * port: 64-bit (a1:a0)/(a3:a2), lo in a0 (hi in a1, 0 here —
+     * quotients fit 32 bits); div-by-zero -> ~0U (RISC-V divu). */
+    if (addr == 0x4fc00844u && live) {
+        uint64_t divd = ((uint64_t) rv->X[11] << 32) | rv->X[10];
+        uint64_t divr = ((uint64_t) rv->X[13] << 32) | rv->X[12];
+        uint64_t q = divr ? divd / divr : 0xFFFFFFFFFFFFFFFFull;
+        rv->X[10] = (uint32_t) (q & 0xFFFFFFFFull);
+        rv->X[11] = (uint32_t) (q >> 32);
+        rv->PC = rv->X[1];
+        p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
+        return 0x00000073u; /* ecall (block-terminal) */
+    }
     /* ROM esp_rom_spiflash_read (0x4fc00158: read(src, dest, len) with
      * a0=src flash offset, a1=dest RAM, a2=len): serve flash bytes
      * directly from the image. The ROM body programs the MSPI controller
@@ -4254,13 +4415,20 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
          addr == 0x4fc004e0u || addr == 0x4fc004f0u || addr == 0x4fc00500u ||
          addr == 0x4fc003d4u || addr == 0x4fc00404u || addr == 0x4fc00504u ||
          addr == 0x4fc11520u || addr == 0x4fc11684u || addr == 0x4fc118eeu ||
-         addr == 0x4fc118c8u || addr == 0x4fc11f76u || addr == 0x4ffb19f0u ||
-         addr == 0x4ffb1a58u) &&
+         addr == 0x4fc118c8u || addr == 0x4fc11f76u) &&
         live) {
         rv->PC = rv->X[1];
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
     }
+    /* cache_hal_disable/enable (bootloader 0x4ffb19f0/0x4ffb1a58): these
+     * call the ROM disables/enables above then update the bootloader's
+     * cache-state ctx (s_update_cache_state at 0x4ffb1998) from a0/a1/a2.
+     * The state byte is only consumed by later cache_hal calls, so run
+     * the body NATIVELY (do NOT nop-hook: the ROM calls must execute to
+     * program the MMU/cache state the flash_read path depends on).
+     * The ROM enable bodies poll SHUT-done at 0x3FF100A8/0xB4 (forced
+     * SET in the cache-control read path) so they terminate. */
     /* MD5Update bodies (BASE 0x4fc06ec4 via slot 5F0; ECO5 0x4fc06ec4 via
      * slot 5E4 — SAME body: the tables alias here, both JAL to 0x4fc06ec4;
      * that body dies on illegal words mid-body): run the host port for
@@ -4313,15 +4481,18 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
              * 2 = SHA2_256); update lengths are never this small for
              * image hashing (bootloader feeds 24/1024+). Reset session. */
             p4_sha_session_reset();
-        } else {
-            /* ECO5 update(ctx, data, len): returning ECALL skips the
-             * native body, so feed the session here identically to 62C. */
-            p4_sha_session_feed(PRIV(rv)->esp32p4, rv->X[11], rv->X[12]);
+            rv->X[10] = 0;
+            rv->PC = rv->X[1];
+            p4_md5_ecall = true;
+            return 0x00000073u; /* ecall (block-terminal) */
         }
-        rv->X[10] = 0;
-        rv->PC = rv->X[1];
-        p4_md5_ecall = true;
-        return 0x00000073u; /* ecall (block-terminal) */
+        /* ECO5 update(ctx, data, len): RUN NATIVELY. The ECO5 slot
+         * body (0x4fc0484a) fills the caller's ctx buffer + length via
+         * the MMIO SHA block, and the ECO5 finish (slot 624, native)
+         * hashes that ctx. Hooking here (host-session feed + ECALL
+         * return) would SUPPRESS the native ctx fill, leaving the
+         * finish hashing an empty message (sha256('') = e3b0c442… —
+         * the observed seg0 clobber). Fall through to the real word. */
     }
     if (addr == 0x4FC0062Cu && live) {
         /* BASE ets_sha_update(ctx=a0, in=a1, len=a2, upd=a3) */
@@ -4332,8 +4503,23 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         return 0x00000073u; /* ecall (block-terminal) */
     }
     if (addr == 0x4FC00630u && live) {
-        /* BASE ets_sha_finish(ctx=a0, digest=a1) */
-        p4_sha_session_finish(PRIV(rv)->esp32p4, rv->X[11]);
+        /* BASE ets_sha_finish(ctx=a0, digest=a1).
+         * SHAGUARD: the Arduino bootloader hashes the app image header
+         * IN PLACE and asks for the digest INSIDE the same 64 B metadata
+         * window (digest 0x4ffbcc24 overlaps segments[0] at 0x4ffbcc0c).
+         * The finish memcpy would clobber segments[0] BEFORE the loader
+         * reads it ("Segment 0 load address 0x42c4b0e3"). Skip the write
+         * on overlap (the digest is only compared against flash, never
+         * consumed from RAM here); still return success. Non-overlapping
+         * digests write normally (MPY path). */
+        uint32_t dgst = rv->X[11];
+        if ((dgst & ~0x3Fu) != ((dgst + 32u) & ~0x3Fu)) {
+            /* digest spans a 64 B boundary with the hashed header:
+             * overlap — skip the write, return success. */
+            fprintf(stderr, "[SHAGUARD] skip digest write to %08x\n", dgst);
+        } else {
+            p4_sha_session_finish(PRIV(rv)->esp32p4, dgst);
+        }
         rv->X[10] = 0;
         rv->PC = rv->X[1];
         p4_md5_ecall = true;
@@ -5195,28 +5381,23 @@ void esp32p4_periodic(riscv_t *rv)
     /* UART TXFIFO_EMPTY interrupt: the esp-idf uart driver only moves bytes
      * from its software ring buffer into the HW FIFO inside the TX ISR, which
      * fires on TXFIFO_EMPTY. The model transmits instantly, so the HW FIFO is
-     * always empty; we therefore raise TXFIFO_EMPTY periodically (throttled
-     * to avoid a storm) whenever the source is enabled and not already
-     * pending, so the SDK ISR can drain whatever the app has queued. */
-    /* TXFIFO_EMPTY raise DISABLED: continuous re-arm starves the main task
-     * (interrupt storm). Re-enable only when the app has data to drain.
+     * always empty; we therefore raise TXFIFO_EMPTY whenever the source is
+     * enabled and not already pending (level-following, like HW: the line
+     * stays asserted while the FIFO is empty — no throttle needed since
+     * the ISR clears the source when it has nothing to send). */
     for (int p = 0; p < 2; p++) {
         uint32_t base = P4_PERIPH_BASE + 0x1000u * p;
-        if (soc->uart_tx_cnt[p])
-            soc->uart_tx_cnt[p]--;
         uint32_t *raw =
             &mmio32[(base + UART_INT_RAW_REG - P4_PERIPH_BASE) >> 2];
         uint32_t *ena =
             &mmio32[(base + UART_INT_ENA_REG - P4_PERIPH_BASE) >> 2];
-        if ((soc->uart_tx_cnt[p] & 0x1FFu) == 0 &&
-            (*ena & UART_TXFIFO_EMPTY_BIT) &&
+        if ((*ena & UART_TXFIFO_EMPTY_BIT) &&
             !(*raw & UART_TXFIFO_EMPTY_BIT)) {
             *raw |= UART_TXFIFO_EMPTY_BIT;
             int src = (p == 0) ? P4_UART0_INTR_SOURCE : P4_UART1_INTR_SOURCE;
             p4_intc_set(soc, src);
         }
     }
-    */
 
     /* LEDC output drive: enabled channels drive their routed pads. The
      * GPIO matrix FUNCx_OUT_SEL (0x60091554 + 4*pin) picks the signal

@@ -463,8 +463,12 @@ CONSTOPT(mulhsu, {
 CONSTOPT(mulhu, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
-        ir->imm = ((int64_t) info->const_val[ir->rs1] *
-                   (int64_t) info->const_val[ir->rs2]) >>
+        /* UNSIGNED operands: zero-extend (const_val is uint32_t). A
+         * signed cast sign-extends bit31-set values and misfolds e.g.
+         * mulhu(0x80000000, x). (Runtime op was already correct; only
+         * this const-fold was wrong.) */
+        ir->imm = ((uint64_t) info->const_val[ir->rs1] *
+                   (uint64_t) info->const_val[ir->rs2]) >>
                   32;
         info->const_val[ir->rd] = ir->imm;
         ir->opcode = rv_insn_lui;

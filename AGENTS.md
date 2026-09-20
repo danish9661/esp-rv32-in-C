@@ -590,10 +590,71 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      logs predate this; no green Arduino P4 run exists on current images.
      The committed 5883df1 message ("MPY P4 boots to app") overstates:
      MPY reaches app clock init, no REPL yet. Next: (a) rebuild the P4
-     Arduino app with a current arduino-core/IDF and confirm the image
-     passes its OWN bootloader check on HW semantics (or find why seg
-     data_off alignment drifted); (b) then re-verify HELLO+TICK with the
-     slot-preserving WIP; (c) drive MPY app to REPL.
+      Arduino app with a current arduino-core/IDF and confirm the image
+      passes its OWN bootloader check on HW semantics (or find why seg
+      data_off alignment drifted); (b) then re-verify HELLO+TICK with the
+      slot-preserving WIP; (c) drive MPY app to REPL.
+   - DONE 2026-09-18: P4 Arduino HELLO+TICK green + DIAG trim + WASM
+     regression (uncommitted working tree on top of 082c04d). The Sep-15
+     seg0-hunt framing is CLOSED: the Sep-4 `p4hellov3` image
+     (`merged.bin` md5 `f4acedc1…`, `patched.bin` `15ce4229…`) boots clean
+     on the current tree — `[APPENTRY] pc=4ff40c04`, `HELLO_UART_OK`,
+     steady TICKs, zero `abort()/comparison failed/doesn't match`, native
+     AND WASM node (`run_p4.js`: 46-51 TICKs/120 s, `/tmp/wasm_p4hello.log`,
+     `/tmp/rg_p4hello_posttrim.log`). Fixes confirmed live: SHA MMIO bswap
+     per M_MEM word, slot `0x4FC00620` ECO5-update falls through native
+     (hook only `a1<=8` BASE-init), XTAL store `0x00280028`, REGI2C
+     DONE=bit27 + `0x50` data byte, root-clk readback masked to XTAL.
+     DIAG scaffolding fully trimmed from `src/esp32p4.c` + `rv32_template.c`
+     (zero tag hits repo-wide); kept `[APPENTRY]` boot marker + `[SHAGUARD]`
+     overlap guard + boot/ELF/error paths. Regression (WASM node, zero
+     faults): C3 blink stable, C6 demotest `DEMO_DONE`, H2 hello + full
+     11-test matrix DONE, P4 18-test matrix incl SMP (`-C esp32p4smp`
+     16-17 TICKs) DONE.      `HANDOVER_P4_SEG0_2026-09-15.md` §5/§9/§12-§13
+     (CRC-stall claim) is superseded. `stash@{0}` (Sep-14 WIP) reviewed
+     hunk-by-hunk 2026-09-18 and DROPPED per user decision (superseded —
+     tree carries its functional bits; rejected: LPSTORE reg-file,
+     `EF4018` JEDEC, MD5 snapshot, SPI1-xlate, body-addr MD5 hooks, sync
+     `spi2_complete`). Next: MPY P4 → REPL (separate track).
+   - IN PROGRESS 2026-09-19: MPY P4 past malloc/VFS aborts, both harts
+     parked (uncommitted minimal tree on top of 082c04d, zero trace tags).
+     Root causes (all `src/esp32p4.c` ifetch ECALL ports unless noted):
+     `__udivdi3` slot `0x4fc00844` (stub returns 0 → select loop spun;
+     host 64-bit divide); TLSF bit-scan slots `0x4fc00770`/`0x4fc007a0`
+     (bodies decode to F-words, illegal → all pools empty → malloc 0;
+     host `clz` / `ctz+1` 1-based ports — the bare-`ctz` version was an
+     off-by-one); RTCCALICFG RDY-sticky (fresh START must clear RDY;
+     TIMG0/TIMG1/`0x60008068`); FRM CSR `0x002` (`src/emulate.c`);
+     MULHU constopt sign bug (`src/rv32_constopt.c`); USB_SERIAL_JTAG
+     model (`0x500D2000`); UART FIFO sub-word dedup (ROM `c.sh` doubling);
+     LP_TIMER BUF0 from free-running `lp_timer`. Boot now passes
+     `esp_libc_init` (malloc returns `0x301002c0`), VFS registration
+     (nullfs `0x101` abort gone), `do_system_init_fn` with no abort;
+     harts parked at `0x40008a90` (hart0, `start_cpu0` returned) /
+     `0x4011d456` (hart1, scheduler-flag poll). Slot ABI note: BASE
+     `.ld` puts `__clzsi2/__ffssi2` here, ECO5 puts `__ctzsi2/__fixsfdi`
+     at the SAME addrs — live callers (tlsf, both ABIs) need clz/ffs.
+     Evidence logs kept in-repo (`mpy_ffssi1_keep.log`,
+     `mpy_heartfix_keep.log`; /tmp gets wiped). Next: trace hart0's
+     `esp_startup_start_app` chain to app main → REPL. Arduino P4 note
+     (SUPERSEDED 2026-09-20 — the Sep-19 red claim was a working-tree
+     artifact): the tree then failed early with `Segment 0 load address
+     0x42c4b0e3` on BOTH Sep-4 and fresh images. Root causes found +
+     fixed Sep-20: the `0x4FC00620` hook fed the host SHA session AND
+     returned ECALL (suppressing the native ECO5 ctx fill → empty
+     digest over seg0) + eFuse reported v1.0 (postv3 rev gate). With
+     620-native + ECO5/BLKv1.0 eFuse (`(1<<23)|(1<<11)|(1<<4)`) + cache
+     SHUT-done + REGI2C/CONF1-2 + LP_AON-gate + level TXFIFO_EMPTY, the
+     Sep-4 `patched.bin` boots clean to app entry `0x4ff40c04` + HELLO
+     (native 60 s window). Later 500 s tail: guest reaches `Partition
+     table MD5 mismatch → 0x103` (partition MD5, next).
+   - DONE 2026-09-20 (commit): Arduino RE-GREEN + MPY fixes committed
+     on top of 082c04d (`src/esp32p4.c`, `src/emulate.c` FRM CSR,
+     `src/rv32_constopt.c` MULHU, docs). Trace-free (zero TEMP tags;
+     kept `[SHAGUARD]` guard + boot/ELF/error paths). Native 60 s:
+     ROM banner → `entry 0x4ffac2c0` → app `0x4ff40c04` → HELLO, no
+     abort/mismatch. Next: WASM rebuild + node regression, then MPY
+     parked-hart trace → REPL.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,

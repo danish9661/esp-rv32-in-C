@@ -434,6 +434,13 @@ static uint32_t *csr_get_ptr(riscv_t *rv, uint32_t csr)
 #if RV32_HAS(EXT_F)
     case CSR_FFLAGS:
         return (uint32_t *) (&rv->csr_fcsr);
+    case CSR_FRM:
+        /* Floating-point dynamic rounding mode = fcsr.frm (bits 7:5).
+         * The ROM's softfloat div init reads frm on entry (csrrs); a
+         * missing CSR returns NULL -> csrrs yields 0 without trap and
+         * rounding state is silently wrong. Point at fcsr; the
+         * csrrw/csrrs/csrrc wrappers below mask to bits 7:5. */
+        return (uint32_t *) (&rv->csr_fcsr);
     case CSR_FCSR:
         return (uint32_t *) (&rv->csr_fcsr);
 #endif
@@ -520,6 +527,8 @@ static uint32_t csr_csrrw(riscv_t *rv,
 #if RV32_HAS(EXT_F)
     if (csr == CSR_FFLAGS)
         out &= FFLAG_MASK;
+    else if (csr == CSR_FRM)
+        out = (out >> 5) & 0x7u; /* frm = fcsr[7:5] */
 #endif
 
 #if RV32_HAS(SYSTEM)
@@ -583,6 +592,8 @@ static uint32_t csr_csrrs(riscv_t *rv,
 #if RV32_HAS(EXT_F)
     if (csr == CSR_FFLAGS)
         out &= FFLAG_MASK;
+    else if (csr == CSR_FRM)
+        out = (out >> 5) & 0x7u; /* frm = fcsr[7:5] */
 #endif
 
 #if RV32_HAS(SYSTEM)
@@ -631,6 +642,8 @@ static uint32_t csr_csrrc(riscv_t *rv,
 #if RV32_HAS(EXT_F)
     if (csr == CSR_FFLAGS)
         out &= FFLAG_MASK;
+    else if (csr == CSR_FRM)
+        out = (out >> 5) & 0x7u; /* frm = fcsr[7:5] */
 #endif
 
 #if RV32_HAS(SYSTEM)
