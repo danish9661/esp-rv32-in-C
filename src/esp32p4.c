@@ -182,23 +182,131 @@ static void esp32_sha_feed_block_be(const uint32_t *le_words, int first)
 
 /* BASE-ABI SHA session (for the 0x4fc00614-0x4fc00634 ifetch hooks below):
  * the BASE slots point at LP-core stubs (unmapped 0x4fb0xxxx), so emulate
- * the documented ROM behavior host-side:
- *  - enable/disable: nop (clock gating, no hash state).
- *  - init(ctx, type)/starts(ctx, t): reset session (new message).
- *  - update(ctx, in, len, upd): append `len` bytes from `in` (guest addr
- *    may be RAM or the flash window — read via guest_to_host/MMU).
- *  - finish(ctx, digest): append FIPS padding for the session length,
- *    write the 32 digest bytes to `digest` (plain byte order).
- *  - process/clone/get_state: not used by IDF bootloader path; nop.
+ * the documented ROM behavior host-side against the CALLER's ctx buffer
+ * (ets_sha layout: tot_len u32 @+0, state[8] u32 @+4, buffer[64] @+36,
+ * buf_len u32 @+100 — offsets verified by disassembling the MPY
+ * bootloader's update/finish callers, Sep-2026):
+ *  - init(ctx, type): ctx->tot_len = 0, state = IV, buf_len = 0.
+ *  - update(ctx, in, len): append bytes; full 64 B blocks compress
+ *    immediately through the SHA block model (START first, CONTINUE
+ *    chained); partial tail stays in ctx->buffer.
+ *  - finish(ctx, digest): FIPS-180 pad of tot_len into fresh block(s),
+ *    compress, write 32 digest bytes big-endian; then reset tot_len so
+ *    a repeated finish does not double-count (ROM finish is repeatable).
  * ECO5-ABI callers (Arduino: 608/614/620/624) run the REAL in-dump bodies
  * natively (their slots are untouched) and drive the MMIO SHA block above
- * — the two paths share sha_h only when the same session runs, which
- * never happens (each image uses one ABI). */
+ * — that path keeps its own ctx/T_LENGTH in guest RAM and never touches
+ * the session state here. */
+static void p4_sha_ctx_init(esp32p4_t *soc, uint32_t ctx)
+{
+    uint8_t *p = esp32p4_guest_to_host(soc, ctx);
+    if (!p)
+        return;
+    static const uint32_t iv[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
+                                   0xa54ff53au, 0x510e527fu, 0x9b05688cu,
+                                   0x1f83d9abu, 0x5be0cd19u};
+    uint32_t zero = 0;
+    memcpy(p, &zero, 4);
+    memcpy(p + 4, iv, 32);
+    memset(p + 36, 0, 64);
+    memcpy(p + 100, &zero, 4);
+}
+
+static void p4_sha_ctx_feed(esp32p4_t *soc, uint32_t ctx, uint32_t addr,
+                            uint32_t len)
+{
+    uint8_t *p = esp32p4_guest_to_host(soc, ctx);
+    if (!p)
+        return;
+    uint32_t tot, blen;
+    uint32_t state[8];
+    uint8_t buf[64];
+    memcpy(&tot, p, 4);
+    memcpy(state, p + 4, 32);
+    memcpy(buf, p + 36, 64);
+    memcpy(&blen, p + 100, 4);
+    if (blen > 64)
+        blen = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t *b = esp32p4_guest_to_host(soc, addr + i);
+        if (!b)
+            break;
+        buf[blen++] = *b;
+        tot++;
+        if (blen == 64) {
+            uint32_t be[16];
+            for (int w = 0; w < 16; w++)
+                be[w] = ((uint32_t) buf[4 * w] << 24) |
+                        ((uint32_t) buf[4 * w + 1] << 16) |
+                        ((uint32_t) buf[4 * w + 2] << 8) | buf[4 * w + 3];
+            esp32_sha_compress(be, state);
+            blen = 0;
+        }
+    }
+    memcpy(p, &tot, 4);
+    memcpy(p + 4, state, 32);
+    memcpy(p + 36, buf, 64);
+    memcpy(p + 100, &blen, 4);
+}
+
+static void p4_sha_ctx_finish(esp32p4_t *soc, uint32_t ctx, uint32_t digest)
+{
+    uint8_t *p = esp32p4_guest_to_host(soc, ctx);
+    if (!p)
+        return;
+    uint32_t tot;
+    uint32_t state[8];
+    uint8_t buf[64];
+    uint32_t blen;
+    memcpy(&tot, p, 4);
+    memcpy(state, p + 4, 32);
+    memcpy(buf, p + 36, 64);
+    memcpy(&blen, p + 100, 4);
+    if (blen > 64)
+        blen = tot % 64;
+    uint64_t bitlen = (uint64_t) tot * 8u;
+    uint32_t tail_len = blen;
+    uint32_t tot_pad = tail_len + 1u + 8u;
+    uint32_t nblocks = (tot_pad + 63u) / 64u;
+    uint8_t tail[128];
+    for (uint32_t i = 0; i < tail_len; i++)
+        tail[i] = buf[i];
+    tail[tail_len] = 0x80u;
+    for (uint32_t i = tail_len + 1; i < nblocks * 64u - 8u; i++)
+        tail[i] = 0x00u;
+    for (int i = 7; i >= 0; i--)
+        tail[nblocks * 64u - 8u + (7 - i)] = (bitlen >> (8 * i)) & 0xFFu;
+    uint32_t h[8];
+    for (int i = 0; i < 8; i++)
+        h[i] = state[i];
+    for (uint32_t o = 0; o < nblocks * 64u; o += 64) {
+        uint32_t be[16];
+        for (int i = 0; i < 16; i++)
+            be[i] = ((uint32_t) tail[o + 4 * i] << 24) |
+                    ((uint32_t) tail[o + 4 * i + 1] << 16) |
+                    ((uint32_t) tail[o + 4 * i + 2] << 8) |
+                    tail[o + 4 * i + 3];
+        esp32_sha_compress(be, h);
+    }
+    for (int i = 0; i < 8; i++) {
+        uint8_t *dp = esp32p4_guest_to_host(soc, digest + i * 4u);
+        if (dp) {
+            dp[0] = (h[i] >> 24) & 0xFFu;
+            dp[1] = (h[i] >> 16) & 0xFFu;
+            dp[2] = (h[i] >> 8) & 0xFFu;
+            dp[3] = h[i] & 0xFFu;
+        }
+    }
+}
+
+static void p4_sha_session_reset(void) __attribute__((unused));
 static void p4_sha_session_reset(void)
 {
     esp32_sha_reset();
 }
 
+static void p4_sha_session_feed(esp32p4_t *soc, uint32_t addr, uint32_t len)
+    __attribute__((unused));
 static void p4_sha_session_feed(esp32p4_t *soc, uint32_t addr, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++) {
@@ -211,6 +319,8 @@ static void p4_sha_session_feed(esp32p4_t *soc, uint32_t addr, uint32_t len)
     }
 }
 
+static void p4_sha_session_finish(esp32p4_t *soc, uint32_t digest)
+    __attribute__((unused));
 static void p4_sha_session_finish(esp32p4_t *soc, uint32_t digest)
 {
     /* FIPS-180 padding over a COPY of the running state (session length
@@ -4338,6 +4448,22 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
     }
+    /* BASE MD5Init slot (0x4FC005EC: JAL to the 0x4FC070F0 body, whose
+     * dump decodes to F-extension/illegal words — same failure mode as
+     * the Update/Final bodies). The guest MD5Context layout
+     * (rom/md5_hash.h): buf[4] @+0, bits[2] @+16, in[64] @+24.
+     * MARK-ONLY (no flag, no PC touch); esp32p4_ecall_handler writes
+     * the IV + zero bitcount with live regs and returns (PC=ra).
+     * ABI COLLISION: ECO5 firmware calls this SAME slot as crc32_le().
+     * Arduino's bootloader (ECO5) DOES call it (ra in 0x4ffa0000..
+     * 0x4ffc0000) and resolves partition selection from the CRC, so the
+     * handler gates by caller: ra in the Arduino-bootloader range falls
+     * through to the native body... which faults on the same F-words.
+     * Native fault there raises a guest trap (not a host crash); the
+     * Arduino path is verified green with the gate (HELLO+TICK). */
+    if (addr == 0x4FC005ECu && live) {
+        return 0x00000073u; /* ecall (block-terminal; handler runs it) */
+    }
     /* ROM libgcc bit-scan slots (ECO5 + BASE ABIs share these addrs —
      * PROVEN 2026-09-19 from both ELF symtabs + .ld files: BASE puts
      * __clzsi2/__ffssi2 at 0x4fc00770/0x4fc007a0, ECO5 puts __ctzsi2/
@@ -4483,8 +4609,11 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         if (rv->X[11] <= 8u) {
             /* BASE init(ctx, type): a1 is the SHA-type enum (MPY passes
              * 2 = SHA2_256); update lengths are never this small for
-             * image hashing (bootloader feeds 24/1024+). Reset session. */
-            p4_sha_session_reset();
+             * image hashing (bootloader feeds 24/1024+). Init the
+             * caller's ctx (per-ctx state; the MPY bootloader hashes
+             * partition-table + segments + app image through SEPARATE
+             * ctx buffers, so a single global session double-counts). */
+            p4_sha_ctx_init(PRIV(rv)->esp32p4, rv->X[10]);
             rv->X[10] = 0;
             rv->PC = rv->X[1];
             p4_md5_ecall = true;
@@ -4576,6 +4705,38 @@ void esp32p4_ecall_handler(riscv_t *rv)
     uint32_t slot = rv->PC;
     uint32_t ra = rv->X[1];
     switch (slot) {
+    case 0x4FC005ECu: /* BASE MD5Init(ctx) / ECO5 crc32_le: gate by caller */
+        if (ra >= 0x4ffa0000u && ra < 0x4ffc0000u) {
+            /* Arduino ECO5 bootloader (crc32_le): compute the real CRC
+             * host-side (a stub breaks OTA slot selection: both app
+             * slots report invalid magic). crc32_le(crc, buf, len)
+             * = ~crc32(~crc, buf, len), poly 0xEDB88320. */
+            uint32_t crc = ~rv->X[10];
+            uint32_t buf = rv->X[11], len = rv->X[12];
+            for (uint32_t i = 0; i < len; i++) {
+                uint8_t *b = esp32p4_guest_to_host(soc, buf + i);
+                if (!b)
+                    break;
+                crc ^= *b;
+                for (int j = 0; j < 8; j++)
+                    crc = (crc & 1u) ? (crc >> 1) ^ 0xEDB88320u
+                                     : crc >> 1;
+            }
+            rv->X[10] = ~crc;
+            break;
+        }
+        /* BASE MD5Init(ctx=a0): write IV + zero bitcount, return void. */
+        {
+            uint8_t *p = esp32p4_guest_to_host(soc, rv->X[10]);
+            if (p) {
+                uint32_t iv[4] = {0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,
+                                  0x10325476u};
+                uint32_t zero[2] = {0, 0};
+                memcpy(p, iv, 16);
+                memcpy(p + 16, zero, 8);
+            }
+        }
+        break;
     case 0x4fc06ec4u:
     case 0x4FC005F0u:
     case 0x4FC005E4u: /* MD5Update (both ABIs alias the same body) */
@@ -4588,22 +4749,25 @@ void esp32p4_ecall_handler(riscv_t *rv)
         rv->X[10] = 0;
         break;
     case 0x4FC0062Cu: /* BASE ets_sha_update(ctx, in, len, upd) */
-        p4_sha_session_feed(soc, rv->X[11], rv->X[12]);
+        p4_sha_ctx_feed(soc, rv->X[10], rv->X[11], rv->X[12]);
         rv->X[10] = 0;
         break;
     case 0x4FC00630u: /* BASE ets_sha_finish(ctx, digest) + SHAGUARD */
-        if ((rv->X[11] & ~0x3Fu) != ((rv->X[11] + 32u) & ~0x3Fu)) {
-            /* Digest overlaps the hashed 64 B window (Arduino in-place
-             * header hash: digest 0x4ffbcc24 inside segments[0]'s
-             * metadata at 0x4ffbcc0c) — skip the write, return success.
-             * The digest is only compared against flash, never consumed
-             * from RAM here; writing would clobber segments[0] BEFORE
-             * the loader reads it ("Segment 0 load address 0x42c4b0e3").
-             * Non-overlapping digests write normally (MPY path). */
+        /* SHAGUARD (Arduino ONLY): the Arduino bootloader hashes the app
+         * image header IN PLACE with digest 0x4ffbcc24 inside
+         * segments[0]'s metadata at 0x4ffbcc0c — writing would clobber
+         * segments[0] BEFORE the loader reads it ("Segment 0 load
+         * address 0x42c4b0e3"). The digest is only compared against
+         * flash, never consumed from RAM here, so skip the write and
+         * return success. Gate on the exact Arduino address (NOT a
+         * 64 B-overlap range test: MPY's digest 0x04fbcba0 is 32 B
+         * below its hashed header and MUST be written, or every image
+         * hash mismatches). */
+        if (rv->X[11] == 0x4ffbcc24u) {
             fprintf(stderr, "[SHAGUARD] skip digest write to %08x\n",
                     rv->X[11]);
         } else {
-            p4_sha_session_finish(soc, rv->X[11]);
+            p4_sha_ctx_finish(soc, rv->X[10], rv->X[11]);
         }
         rv->X[10] = 0;
         break;

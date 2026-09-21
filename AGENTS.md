@@ -663,17 +663,26 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      C3 run inconclusive (pre-existing `DBG:` print floods in
      `src/esp32c3.c`, untouched by this commit). Next: MPY
      parked-hart trace → REPL, then P4 partition-MD5 (`0x103`).
-   - 2026-09-20 (post-commit, STASHED not committed): MPY `Image hash
-     failed` root-caused (repeat `0x62C` feeds chain past ifetch —
-     only the first 24 B feed executes host logic; fix = mark-only
-     ifetch + per-execution ecall handler). The WIP also tried a
-     620-ECO5-feed, a `~0` crc32 stub, and exact-address SHAGUARD —
-     all three REGRESSED Arduino (both app slots invalid magic) and
-     were reverted; WIP stashed as `stash@{0}` (patch saved at
-     `/tmp/opencode/wip_ecall_refactor.patch`, 385 lines) for a
-     split Arduino-gated re-apply. HEAD-clean Arduino re-verified
-     green (`entry 0x4ffac2c0`, silent park). MPY next: ecall-handler
-     move + eFuse `0x810` + ra-gated MD5Init, each Arduino-verified.
+   - DONE 2026-09-21: MPY P4 partition-table green + per-ctx SHA/MD5Init
+     rework (all `src/esp32p4.c`, trace-free, Arduino-gated each step).
+     Fixes: (1) MD5Init slot `0x4FC005EC` mark-only + handler with
+     caller gate — MPY (ra outside `0x4ffa0000..0x4ffc0000`) gets IV +
+     zero bitcount, Arduino ECO5 gets a real host crc32_le (a `~0` stub
+     broke OTA slot selection: both app slots invalid magic). (2) BASE
+     SHA moved from a single global session to per-ctx state
+     (tot_len/state/buffer/buf_len in the caller's ets_sha ctx, offsets
+     verified from the MPY bootloader disassembly) — the partition-table
+     and image hashes use separate ctx buffers and the global session
+     double-counted. (3) SHAGUARD narrowed to the exact Arduino digest
+     addr `0x4ffbcc24` (the 64 B-overlap range test swallowed MPY's
+     digest `0x04fbcba0`, 32 B below its header, so every image hash
+     mismatched). Verified native: MPY `mpy_p4_nopsram.bin` passes
+     partition MD5 (`flash_parts` error gone) and reaches the factory
+     image-hash stage; Arduino `patched.bin` still HELLO+TICKs (100 s
+     window, zero errors). Verified WASM node (fresh `wasmc6_defconfig`
+     build, wasm 1305409 B): Arduino HELLO+TICKs (327 in 300 s, zero
+     errors); MPY reaches the same clock-init point as native. Next:
+     MPY factory image-hash compare + app boot → REPL.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,
