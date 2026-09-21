@@ -1938,17 +1938,18 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
     }
 
     /* eFuse RD_MAC_SYS_2 @+0x4C (efuse_rd_mac_sys2_reg_t, hw_ver3):
-     * wafer_version_minor [3:0], wafer_version_major_lo [5:4],
-     * disable_wafer_version_major [6], disable_blk_version_major [7],
-     * blk_version_minor [10:8], blk_version_major [12:11],
-     * wafer_version_major_hi [23]. CHIP rev = hi<<2|lo (major),
-     * minor nibble; BLK rev = blk_major*100+blk_minor (app desc wants
-     * [0,199]). postv3 Arduino needs CHIP >= v3 AND BLK <= v1.99:
-     * report ECO5 chip (major hi=1,lo=1 -> 3, minor 0) with BLK v1.0
-     * (major 1, minor 0): val = (1<<23)|(1<<11)|(1<<4) = 0x800810. */
+     * verified against IDF efuse_ll.h: CHIP major = hi<<2|lo,
+     * minor = nibble; BLK = blk_major*100+blk_minor. postv3 Arduino
+     * image header wants CHIP [0,65535] (max empty) and BLK [0,199];
+     * MPY app imageHeader AND bootloader both cap CHIP max at 199
+     * (v1.99). ECO5 reports v3.0=300 > 199, so MPY rejects it.
+     * Report v1.99-compatible rev: CHIP major 1 (hi=0,lo=1), minor 0
+     * = 100; BLK major 1, minor 0 = 100: val = (1<<4)|(1<<11) = 0x810.
+     * Arduino postv3 (min CHIP 0, max empty) still passes, and Arduino
+     * is verified green with this value (HELLO+TICK native). */
     if (addr >= 0x5012D000u && addr < 0x5012D400u) {
         if (addr == 0x5012D000u + 0x4Cu)
-            return (1u << 23) | (1u << 11) | (1u << 4);
+            return (1u << 4) | (1u << 11);
         return 0;
     }
 
@@ -2818,6 +2819,7 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
     if (addr == 0x5008E37Cu && size == 4) {
         if (soc->mmu_index < 1024)
             soc->mmu[soc->mmu_index] = val;
+        return;
     }
     /* PSRAM MSPI controllers (0x5008E000-0x50090000): plain read-back
      * storage. */
@@ -4308,7 +4310,12 @@ void esp32p4_write_b(riscv_t *rv, uint32_t addr, uint8_t val)
  *    translation. (The caller — partition-MD5 mismatch — is diagnosed
  *    separately; spinning keeps the emulator alive.)
  * Anything else falls through to the normal region/window read. */
-bool p4_md5_ecall; /* set when fetch patches MD5Final */
+bool p4_md5_ecall; /* set when an inline ifetch hook patches a ROM call:
+ * the hook already set PC=ra, and the trailing ECALL only ends the
+ * block, so the ecall handler just skips it. Mark-only slots (below)
+ * do NOT use this flag — the handler dispatches them on the live
+ * rv->PC, which is correct on every visit including cached-block
+ * repeats that skip ifetch (and is SMP-safe: no shared slot state). */
 void esp32p4_ecall_handler(riscv_t *rv); /* defined after install_io */
 
 uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
@@ -4431,29 +4438,26 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
      * SET in the cache-control read path) so they terminate. */
     /* MD5Update bodies (BASE 0x4fc06ec4 via slot 5F0; ECO5 0x4fc06ec4 via
      * slot 5E4 — SAME body: the tables alias here, both JAL to 0x4fc06ec4;
-     * that body dies on illegal words mid-body): run the host port for
-     * the WHOLE call. ra on entry is the original caller (caller's jalr
-     * set it; the wrapper jal has rd=x0 so it preserves ra). Set PC=ra +
-     * return ECALL (block-terminal; the ecall handler then just skips
-     * without touching PC). */
-    if ((addr == 0x4fc06ec4u || addr == 0x4FC005F0u || addr == 0x4FC005E4u) &&
-        live) {
-        p4_md5_update_pub(PRIV(rv)->esp32p4, rv->X[10], rv->X[11], rv->X[12]);
-        rv->PC = rv->X[1]; /* return to caller; ECALL ends the block */
-        p4_md5_ecall = true;
-        return 0x00000073u; /* ecall (block-terminal; handler skips PC+4) */
-    }
-    /* MD5Final bodies (BASE slot 5F4 -> 0x4fc06f8c; ECO5 slot 5E8 ->
-     * 0x4fc06f8c — SAME body, tables alias here): same treatment (the
-     * 0x4fc0658a helper dies on illegal words). Hook the body addr and
-     * both wrapper addrs — whichever the guest lands on. */
-    if ((addr == 0x4fc06f8cu || addr == 0x4FC005F4u || addr == 0x4FC005E8u) &&
-        live) {
-        p4_md5_final_pub(PRIV(rv)->esp32p4, rv->X[10], rv->X[11]);
-        rv->X[10] = 0;
-        rv->PC = rv->X[1]; /* return to caller; ECALL ends the block */
-        p4_md5_ecall = true;
-        return 0x00000073u; /* ecall (block-terminal; handler skips PC+4) */
+     * that body dies on illegal words mid-body).
+     * MD5Final bodies (BASE slot 5F4 -> 0x4fc06f8c; ECO5 slot 5E8 ->
+     * 0x4fc06f8c — SAME body, tables alias here; the 0x4fc0658a helper
+     * dies on illegal words).
+     * BASE-ABI SHA group: 62C (update/feed), 630 (finish + SHAGUARD),
+     * 634 (clone nop).
+     * MARK-ONLY here (no flag, no PC touch); the host logic runs in
+     * esp32p4_ecall_handler, dispatched on the live rv->PC at execution
+     * time (per execution, live regs). Rationale: ifetch-time X[] hold
+     * translator scratch and translated blocks chain past ifetch on
+     * repeat visits, so running the ports here feeds garbage once and
+     * skips repeats (the MPY `Image hash failed` root cause: only the
+     * first 62C feed executed). The flag-less form is also SMP-safe:
+     * no shared slot variable for the two harts to race on. */
+    if (live && (addr == 0x4fc06ec4u || addr == 0x4FC005F0u ||
+                 addr == 0x4FC005E4u || addr == 0x4fc06f8cu ||
+                 addr == 0x4FC005F4u || addr == 0x4FC005E8u ||
+                 addr == 0x4FC0062Cu || addr == 0x4FC00630u ||
+                 addr == 0x4FC00634u)) {
+        return 0x00000073u; /* ecall (block-terminal; handler runs it) */
     }
     /* BASE-ABI SHA group (slot bodies in the dump, from JAL targets):
      *  - 614 (enable), 618 (disable), 61C (get_state): real HP bodies —
@@ -4494,44 +4498,8 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
          * finish hashing an empty message (sha256('') = e3b0c442… —
          * the observed seg0 clobber). Fall through to the real word. */
     }
-    if (addr == 0x4FC0062Cu && live) {
-        /* BASE ets_sha_update(ctx=a0, in=a1, len=a2, upd=a3) */
-        p4_sha_session_feed(PRIV(rv)->esp32p4, rv->X[11], rv->X[12]);
-        rv->X[10] = 0;
-        rv->PC = rv->X[1];
-        p4_md5_ecall = true;
-        return 0x00000073u; /* ecall (block-terminal) */
-    }
-    if (addr == 0x4FC00630u && live) {
-        /* BASE ets_sha_finish(ctx=a0, digest=a1).
-         * SHAGUARD: the Arduino bootloader hashes the app image header
-         * IN PLACE and asks for the digest INSIDE the same 64 B metadata
-         * window (digest 0x4ffbcc24 overlaps segments[0] at 0x4ffbcc0c).
-         * The finish memcpy would clobber segments[0] BEFORE the loader
-         * reads it ("Segment 0 load address 0x42c4b0e3"). Skip the write
-         * on overlap (the digest is only compared against flash, never
-         * consumed from RAM here); still return success. Non-overlapping
-         * digests write normally (MPY path). */
-        uint32_t dgst = rv->X[11];
-        if ((dgst & ~0x3Fu) != ((dgst + 32u) & ~0x3Fu)) {
-            /* digest spans a 64 B boundary with the hashed header:
-             * overlap — skip the write, return success. */
-            fprintf(stderr, "[SHAGUARD] skip digest write to %08x\n", dgst);
-        } else {
-            p4_sha_session_finish(PRIV(rv)->esp32p4, dgst);
-        }
-        rv->X[10] = 0;
-        rv->PC = rv->X[1];
-        p4_md5_ecall = true;
-        return 0x00000073u; /* ecall (block-terminal) */
-    }
-    if (addr == 0x4FC00634u && live) {
-        /* BASE ets_sha_clone: nop-success (single global session). */
-        rv->X[10] = 0;
-        rv->PC = rv->X[1];
-        p4_md5_ecall = true;
-        return 0x00000073u; /* ecall (block-terminal) */
-    }
+    /* NOTE: 62C/630/634 are already handled by the mark-only hook
+     * above (same addresses); no duplicate handling needed here. */
     /* 0x4fc0b2c8: ROM abort spin slot (a zero word where a jal target
      * decodes as illegal). Return a tight `j .` so a guest that gets here
      * spins instead of killing block translation. */
@@ -4587,17 +4555,68 @@ void esp32p4_install_io(riscv_t *rv)
     memcpy(&rv->io, &io, sizeof(riscv_io_t));
 }
 
-/* ecall handler: the MD5 hooks above already ran inline and set PC = ra;
- * the trailing ECALL only ends the block. Skip it WITHOUT touching PC
- * (PC already points at the caller). Any other ECALL is unexpected on
- * bare metal: skip it (PC+4). */
+/* ecall handler: runs the stateful ROM-call host ports with LIVE regs.
+ * ifetch (above) returns a block-terminal ECALL for the hooked slots
+ * WITHOUT touching flags or PC; the translated block is then [ecall],
+ * so EVERY guest call lands here even when block-chaining skips ifetch
+ * on repeat visits. Dispatch is on the live rv->PC (= the slot addr,
+ * set by RVOP_SYNC_PC before the call) — correct on every visit and
+ * SMP-safe (no shared slot variable). Args come from X[] (live at
+ * execution); the handler sets PC=ra (X[1]) and the return value.
+ * Inline-hook ECALLs (flag set, PC already = ra) just return; other
+ * ECALLs are unexpected on bare metal: skip (PC+4). */
 void esp32p4_ecall_handler(riscv_t *rv)
 {
     if (p4_md5_ecall) {
+        /* inline hook already ran and set PC = ra: just skip the ECALL */
         p4_md5_ecall = false;
         return;
     }
-    rv->PC += 4;
+    esp32p4_t *soc = PRIV(rv)->esp32p4;
+    uint32_t slot = rv->PC;
+    uint32_t ra = rv->X[1];
+    switch (slot) {
+    case 0x4fc06ec4u:
+    case 0x4FC005F0u:
+    case 0x4FC005E4u: /* MD5Update (both ABIs alias the same body) */
+        p4_md5_update_pub(soc, rv->X[10], rv->X[11], rv->X[12]);
+        break;
+    case 0x4fc06f8cu:
+    case 0x4FC005F4u:
+    case 0x4FC005E8u: /* MD5Final (both ABIs alias the same body) */
+        p4_md5_final_pub(soc, rv->X[10], rv->X[11]);
+        rv->X[10] = 0;
+        break;
+    case 0x4FC0062Cu: /* BASE ets_sha_update(ctx, in, len, upd) */
+        p4_sha_session_feed(soc, rv->X[11], rv->X[12]);
+        rv->X[10] = 0;
+        break;
+    case 0x4FC00630u: /* BASE ets_sha_finish(ctx, digest) + SHAGUARD */
+        if ((rv->X[11] & ~0x3Fu) != ((rv->X[11] + 32u) & ~0x3Fu)) {
+            /* Digest overlaps the hashed 64 B window (Arduino in-place
+             * header hash: digest 0x4ffbcc24 inside segments[0]'s
+             * metadata at 0x4ffbcc0c) — skip the write, return success.
+             * The digest is only compared against flash, never consumed
+             * from RAM here; writing would clobber segments[0] BEFORE
+             * the loader reads it ("Segment 0 load address 0x42c4b0e3").
+             * Non-overlapping digests write normally (MPY path). */
+            fprintf(stderr, "[SHAGUARD] skip digest write to %08x\n",
+                    rv->X[11]);
+        } else {
+            p4_sha_session_finish(soc, rv->X[11]);
+        }
+        rv->X[10] = 0;
+        break;
+    case 0x4FC00634u: /* BASE ets_sha_clone: nop-success */
+        rv->X[10] = 0;
+        break;
+    default:
+        /* not a marked slot: a genuine guest ECALL, unexpected on bare
+         * metal — skip it (PC+4). */
+        rv->PC = slot + 4;
+        return;
+    }
+    rv->PC = ra;
 }
 
 /* ------------------------------------------------------------------ */
