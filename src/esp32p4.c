@@ -4569,7 +4569,7 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
      * 0x4fc06f8c — SAME body, tables alias here; the 0x4fc0658a helper
      * dies on illegal words).
      * BASE-ABI SHA group: 62C (update/feed), 630 (finish + SHAGUARD),
-     * 634 (clone nop).
+     * 634 (clone = ctx copy).
      * MARK-ONLY here (no flag, no PC touch); the host logic runs in
      * esp32p4_ecall_handler, dispatched on the live rv->PC at execution
      * time (per execution, live regs). Rationale: ifetch-time X[] hold
@@ -4591,7 +4591,8 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
      *  - 620 (init), 624 (process), 628 (starts), 62C (update): LP stubs
      *    (@0x4fb0xxxx, unmapped) — must hook.
      *  - 630 (finish), 634 (clone): hook too (finish writes the digest;
-     *    clone is a nop-success on the single global session).
+     *    clone copies the caller's ctx so a later finish does not
+     *    disturb the running session).
      * COLLISION with the ECO5 slots Arduino uses (608/60C/610/614/618/
      * 61C/620/624/628): 620 is ECO5 update vs BASE init, and 614 is ECO5
      * init vs BASE enable. 614 stays native (MPY's enable then runs the
@@ -4771,7 +4772,20 @@ void esp32p4_ecall_handler(riscv_t *rv)
         }
         rv->X[10] = 0;
         break;
-    case 0x4FC00634u: /* BASE ets_sha_clone: nop-success */
+    case 0x4FC00634u: /* BASE ets_sha_clone(dst, src): copy ctx state */
+        /* ets_sha_clone(dst=a0, src=a1): the bootloader clones the
+         * running hash ctx before finishing one copy (image-verify
+         * finishes a clone so the session survives for later segments).
+         * Copy the full per-ctx state (tot_len/state/buffer/buf_len =
+         * 104 bytes). A nop-success here leaves dst zeroed, so the
+         * clone's finish hashes the empty string and the compare
+         * fails ("Image hash failed"). */
+        {
+            uint8_t *s = esp32p4_guest_to_host(soc, rv->X[11]);
+            uint8_t *d = esp32p4_guest_to_host(soc, rv->X[10]);
+            if (s && d)
+                memcpy(d, s, 104);
+        }
         rv->X[10] = 0;
         break;
     default:

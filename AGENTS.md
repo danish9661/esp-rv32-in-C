@@ -683,6 +683,16 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      build, wasm 1305409 B): Arduino HELLO+TICKs (327 in 300 s, zero
      errors); MPY reaches the same clock-init point as native. Next:
      MPY factory image-hash compare + app boot → REPL.
+   - IN PROGRESS 2026-09-21: MPY factory image-hash compare.
+     FEEDTRACE (temp, since removed) showed the MPY bootloader feeding
+     one ctx `0x4ff33bec` cleanly (tot/blen/state monotonic, +0x400
+     window stride) — the earlier `tot dip` was a stale-binary artifact.
+     Root fix this round: `ets_sha_clone` (`0x4FC00634`) was a
+     nop-success; it is a real ctx copy (dst=a0, src=a1, 104 B), else
+     the clone's finish hashes empty and the compare fails. Verified
+     native: Arduino `patched.bin` still HELLO+TICKs (100 s window, 184
+     TICKs, zero errors) on the trace-free binary. Next: long MPY run
+     to the image-hash verdict, then app boot → REPL.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,
