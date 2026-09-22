@@ -881,7 +881,13 @@ esp32p4_t *esp32p4_new(void)
     assert(soc->rom);
     assert(esp32p4_rom_bin_len <= P4_ROM_SIZE);
     memcpy(soc->rom, esp32p4_rom_bin, esp32p4_rom_bin_len);
-    /* ROM slots stay as dumped (dual-ABI note above): no rewrite. */
+    /* ROM slots stay as dumped (dual-ABI note above): no rewrite.
+     * (An earlier draft patched LP-stub slot words to ECALL in the
+     * rom copy; REVERTED: the aliased ROM region is RAM-typed, so a
+     * guest memset over the slot range can restore the JAL and the
+     * two views diverge. Live-gated ifetch hooks + the PC-dispatched
+     * ecall handler below cover these slots on every execution
+     * instead.) */
 
     /* The 128KB mask ROM is linked at 0x4FC00000 (all ROM API symbols and
      * position-dependent startup code use that view; the HP core resets
@@ -1962,6 +1968,16 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
      * (nonzero = jump). Power-on default 0 = hart1 spins in ROM. */
     if (addr == 0x50110164u)
         return soc->appcpu_boot_addr;
+
+    /* LP_SYS store regs (0x50110000, incl. RTC_XTAL_FREQ_REG =
+     * LP_STORE4 @+0x3C): the bootloader stores the detected XTAL MHz
+     * (40) as two u16 copies; clk_tree_ll checks both copies match and
+     * nonzero, else warns `invalid RTC_XTAL_FREQ_REG value, assume
+     * 40MHz`. Plain storage reads back 0 (fresh calloc), so report the
+     * programmed value: 40 MHz in both halves (0x00280028). Without it
+     * the MPY app stalls later in clock bringup. */
+    if (addr == 0x50110000u + 0x3Cu)
+        return 0x00280028u;
 
     /* LP_CLKRST (0x50111000, 4KB): RC32K/RTC clock control + reset cause.
      * RESET_CAUSE @+0x10: HPCORE0 cause bits[12:7] (6'h1 = POR) + LPCORE
@@ -4439,11 +4455,29 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
      * real JAL word (harmless: the JAL lands back here at execution and
      * the hook fires then, terminating the block with RET). */
     bool live = (rv->PC == addr);
-    /* ROM ets_delay_us (0x4fc012f8: MCYCLE spin `mul a0,us,factor;
-     * csrr a4,mcycle; csrr a5,mcycle; sub; bltu loop`): the emulator's
-     * MCYCLE advances ~3/step, so a 9000us delay needs ~10M steps (~1hr
-     * wall). Skip it: set PC = ra (a0 arg ignored; delay is a nop). */
-    if (addr == 0x4fc012f8u && live) {
+    /* ROM ets_delay_us SLOT (0x4fc0003c, per esp32p4.rom.ld) and BODY
+     * (0x4fc012f8: MCYCLE spin `mul a0,us,factor; csrr a4,mcycle; csrr
+     * a5,mcycle; sub; bltu loop`): the emulator's MCYCLE advances
+     * ~3/step, so a 9000us delay needs ~10M steps (~1hr wall). Skip it:
+     * set PC = ra (a0 arg ignored; delay is a nop). BOTH addrs must
+     * hook: the slot JALs to an LP stub (unmapped 0x4fb0xxxx) so the
+     * body addr is only reached by callers using the body addr
+     * directly; missing the slot wedges MPY app boot in a delay loop
+     * (observed: app poll loop at 0x4000752e calling the slot with
+     * a0=100, native LP fetch spinning forever at 0x4fc01312). */
+    if ((addr == 0x4fc0003cu || addr == 0x4fc012f8u) && live) {
+        rv->PC = rv->X[1];
+        p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
+        return 0x00000073u; /* ecall (block-terminal) */
+    }
+    /* ROM ets_get_cpu_frequency SLOT (0x4fc00040, per esp32p4.rom.ld):
+     * JALs to an LP stub (unmapped 0x4fb0xxxx); returns the CPU clock in
+     * Hz (uint32_t, no args). Model: 360 MHz (matches the forced
+     * 0x4ffbff90 delay factor and the actual HP-core rate). Without it
+     * the MPY app wedges in a poll loop calling the slot with a0=100
+     * (observed pc=0x4fc00400 native spin). */
+    if (addr == 0x4fc00040u && live) {
+        rv->X[10] = 360000000u;
         rv->PC = rv->X[1];
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
@@ -4706,6 +4740,11 @@ void esp32p4_ecall_handler(riscv_t *rv)
     uint32_t slot = rv->PC;
     uint32_t ra = rv->X[1];
     switch (slot) {
+    case 0x4fc0003cu: /* ets_delay_us(us): nop (skip MCYCLE spin) */
+        break;
+    case 0x4fc00040u: /* ets_get_cpu_frequency(): 360 MHz */
+        rv->X[10] = 360000000u;
+        break;
     case 0x4FC005ECu: /* BASE MD5Init(ctx) / ECO5 crc32_le: gate by caller */
         if (ra >= 0x4ffa0000u && ra < 0x4ffc0000u) {
             /* Arduino ECO5 bootloader (crc32_le): compute the real CRC

@@ -683,16 +683,33 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      build, wasm 1305409 B): Arduino HELLO+TICKs (327 in 300 s, zero
      errors); MPY reaches the same clock-init point as native. Next:
      MPY factory image-hash compare + app boot → REPL.
-   - IN PROGRESS 2026-09-21: MPY factory image-hash compare.
+   - IN PROGRESS 2026-09-21/22: MPY factory image-hash compare → app boot.
      FEEDTRACE (temp, since removed) showed the MPY bootloader feeding
      one ctx `0x4ff33bec` cleanly (tot/blen/state monotonic, +0x400
      window stride) — the earlier `tot dip` was a stale-binary artifact.
-     Root fix this round: `ets_sha_clone` (`0x4FC00634`) was a
-     nop-success; it is a real ctx copy (dst=a0, src=a1, 104 B), else
-     the clone's finish hashes empty and the compare fails. Verified
-     native: Arduino `patched.bin` still HELLO+TICKs (100 s window, 184
-     TICKs, zero errors) on the trace-free binary. Next: long MPY run
-     to the image-hash verdict, then app boot → REPL.
+     `ets_sha_clone` (`0x4FC00634`) fixed as a real ctx copy (dst=a0,
+     src=a1, 104 B), not nop-success. HASHCMP (temp, since removed)
+     then PROVED the image hash live: computed `32cf9a57…` == python
+     model == stored hash (tot=1625008; the earlier `162508` reading
+     was the `(.)\1` dedup collapsing `1625008` in the analysis script,
+     not an emulator bug). Post-verify the MPY app wedged in a poll
+     loop at `0x4000752e` calling ROM slot `0x4FC0003C` with a0=100 and
+     spinning natively at `0x4fc01312` — root cause: `0x4FC0003C` is
+     `ets_delay_us` (per `esp32p4.rom.ld`), whose slot JALs to an LP
+     stub (unmapped `0x4fb0xxxx`); only the body addr `0x4fc012f8` was
+     hooked. Fixes (all `src/esp32p4.c`, trace-free): hook the delay
+     SLOT too; hook `ets_get_cpu_frequency` slot `0x4fc00040` (also an
+     LP stub; returns 360 MHz — the MPY app then polled it with a0=100
+     at `pc=0x4fc00040`); report `RTC_XTAL_FREQ_REG` (`LP_STORE4`
+     @`0x5011003C`) as `0x00280028` (40 MHz both halves) so the 5×
+     `invalid RTC_XTAL_FREQ_REG` warnings are gone. Slot coverage is
+     doubled: live-gated ifetch hook AND a `PC`-dispatched case in
+     `esp32p4_ecall_handler` (a first-visit slot block can translate +
+     chain before the ifetch hook ever fires live). Verified native:
+     Arduino `patched.bin` HELLO+TICKs (100 s, 169 TICKs, zero errors);
+     MPY reaches app code past clock-init (no warnings, new poll-loop
+     site under diagnosis). Next: MPY app boot → REPL prompt →
+     `print(6*7)` → protocol matrix.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
     interactive (`print(6*7)` → `42`). Peripheral proof via REPL,
