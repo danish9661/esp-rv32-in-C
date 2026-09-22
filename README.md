@@ -69,6 +69,14 @@ you can try it without building locally:
 The landing page links to both modes, and each mode page has a navigation
 button that switches directly to the other.
 
+## ESP32 support (this fork)
+
+This tree extends rv32emu with WebAssembly SoC models for **ESP32-C3, ESP32-C6,
+ESP32-H2, ESP32-P4** (single combined binary, runtime chip selection).
+See [docs/esp32-p4.md](docs/esp32-p4.md) for the P4 bring-up status, ROM-slot
+hook model, and verified firmware images; `AGENTS.md` holds the full project
+spec and progress log.
+
 ## Documentation
 
 | Topic | Document |

@@ -960,6 +960,9 @@ riscv_t *esp32p4_smp_target(riscv_t *rv)
     if (!soc->hart[1]) {
         vm_attr_t *attr = PRIV(rv);
         memory_t *mem0 = attr->mem;
+        /* rv->data is the shared vm_attr_t pointer (riscv_user_t is
+         * void*): hart1 shares the struct, so one SoC view serves both
+         * harts. */
         riscv_t *h1 = rv_create(rv->data);
         /* rv_create installed a fresh riscv mem; P4 memory lives in the
          * SoC regions, so drop it and keep sharing hart0's. */
@@ -968,6 +971,21 @@ riscv_t *esp32p4_smp_target(riscv_t *rv)
         if (!h1)
             return rv;
         h1->hart_id = 1;
+        /* hart1 boots the ROM reset vector like real HW (its own park
+         * loop polls the APP-CPU mailbox until IDF releases it). Two
+         * pieces of per-hart state must be initialized (rv_create only
+         * sets up hart0's context):
+         *  - PC/SP: rv_create zeroed X[] (its SP setup is skipped for
+         *    ESP32 targets), so point at ROM reset + top of HP SRAM.
+         *    Without this hart1 executes with sp=0 and its ROM park
+         *    loop faults/spins at a bogus low address.
+         *  - IO dispatch: rv_create installed the DEFAULT io table on
+         *    hart1 (flat-memory ifetch, no SoC hooks); without the P4
+         *    table hart1 fetches zeros/illegals outside the SoC regions
+         *    and never reaches the ROM park loop. */
+        h1->PC = P4_ROM_LINK;
+        h1->X[2] = P4_SRAM_BASE + P4_SRAM_SIZE;
+        esp32p4_install_io(h1);
         soc->hart[0] = rv;
         soc->hart[1] = h1;
         return rv;
@@ -4482,6 +4500,40 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
     }
+    /* ROM early-boot slots that JAL to LP stubs (unmapped 0x4fb0xxxx)
+     * and must return immediately (model: instant/nop/constant).
+     * Covered on BOTH paths: live-gated ifetch hook here AND a
+     * PC-dispatched case in esp32p4_ecall_handler (a first-visit slot
+     * block can translate + chain before the hook fires live).
+     *  - 0x4fc00078 uart_tx_wait_idle: TX FIFO drains instantly.
+     *  - 0x4fc00018 rtc_get_reset_reason: POR (1); the bootloader
+     *    branches on a0==12 later, POR keeps the normal boot path.
+     *  - 0x4fc000a8 ets_set_appcpu_boot_addr(addr): record the APP-CPU
+     *    boot address (unicore: just return; counts as a trace point
+     *    that app early init ran). */
+    if (live &&
+        (addr == 0x4fc00078u || addr == 0x4fc00018u ||
+         addr == 0x4fc000a8u)) {
+        if (addr == 0x4fc00078u) {
+            rv->PC = rv->X[1];
+            p4_md5_ecall = true;
+            return 0x00000073u; /* ecall (block-terminal) */
+        }
+        if (addr == 0x4fc00018u) {
+            rv->X[10] = 1u;
+            rv->PC = rv->X[1];
+            p4_md5_ecall = true;
+            return 0x00000073u; /* ecall (block-terminal) */
+        }
+        /* 0x4fc000a8 */
+        {
+            esp32p4_t *soc = PRIV(rv)->esp32p4;
+            soc->appcpu_boot_addr = rv->X[10];
+            rv->PC = rv->X[1];
+            p4_md5_ecall = true;
+            return 0x00000073u; /* ecall (block-terminal) */
+        }
+    }
     /* BASE MD5Init slot (0x4FC005EC: JAL to the 0x4FC070F0 body, whose
      * dump decodes to F-extension/illegal words — same failure mode as
      * the Update/Final bodies). The guest MD5Context layout
@@ -4744,6 +4796,14 @@ void esp32p4_ecall_handler(riscv_t *rv)
         break;
     case 0x4fc00040u: /* ets_get_cpu_frequency(): 360 MHz */
         rv->X[10] = 360000000u;
+        break;
+    case 0x4fc00078u: /* uart_tx_wait_idle(): TX drains instantly */
+        break;
+    case 0x4fc00018u: /* rtc_get_reset_reason(): POR (1) */
+        rv->X[10] = 1u;
+        break;
+    case 0x4fc000a8u: /* ets_set_appcpu_boot_addr(addr): record it */
+        soc->appcpu_boot_addr = rv->X[10];
         break;
     case 0x4FC005ECu: /* BASE MD5Init(ctx) / ECO5 crc32_le: gate by caller */
         if (ra >= 0x4ffa0000u && ra < 0x4ffc0000u) {

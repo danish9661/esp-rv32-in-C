@@ -708,7 +708,39 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
      chain before the ifetch hook ever fires live). Verified native:
      Arduino `patched.bin` HELLO+TICKs (100 s, 169 TICKs, zero errors);
      MPY reaches app code past clock-init (no warnings, new poll-loop
-     site under diagnosis). Next: MPY app boot → REPL prompt →
+     site under diagnosis).
+   - IN PROGRESS 2026-09-22: MPY early-boot ROM slots + SMP hart1 bringup.
+     Hooked (all `src/esp32p4.c`, trace-free, dual-covered ifetch +
+     `PC`-dispatched handler): `uart_tx_wait_idle` `0x4fc00078`
+     (instant-idle; MPY bootloader wedged on its LP stub),
+     `rtc_get_reset_reason` `0x4fc00018` (POR=1; bootloader branches on
+     a0==12), `ets_set_appcpu_boot_addr` `0x4fc000a8` (record mailbox
+     `0x50110164`). hart1 init fixed: `rv_create` leaves hart1 with the
+     DEFAULT io table (flat-memory ifetch, no SoC hooks) + zeroed X[]
+     — hart1 now gets `esp32p4_install_io(h1)` + `PC=P4_ROM_LINK` +
+     `SP=top of HP SRAM` so it runs the ROM park loop instead of
+     faulting at sp=0. Slot-scan tracing (temp UARTTRACE/SMPTRACE,
+     removed) mapped the MPY boot: 19 slot calls through partition-MD5
+     + image-SHA + `uart_tx_flush` to app `ets_set_appcpu_boot_addr`
+     from `0x40007514`. Verified native: Arduino still HELLO+TICKs
+     (100 s, 177 TICKs, zero errors). SMP (`-C esp32p4smp`) now loads
+     MPY segments on BOTH harts, prints the crash-dump header +
+     `ELF file SHA256: 086cb2bbd` + `Rebooting...` (i.e. the app ABORTS
+     at `0x4000d273` on core 0 — a MPY panic path, not a boot stall),
+     but then wedges post-Rebooting with both harts parked (hart0 at
+     app `0x4ff0d30c`, hart1 at app ram-startup `0x4ff003e8` polling BSS
+     `0x4ff1d885`, mailbox never set). Unicore MPY still spins at the
+     app poll loop `0x4000752e` (s0==0 yet no exit — beqz-taken edge
+     under diagnosis).
+   - DONE 2026-09-23: MPY early-boot slots + hart1 bringup (uncommitted
+     tree on top of `b5c2efc`, all `src/esp32p4.c`, trace-free; gate and
+     commit PENDING — this entry tracks the working tree, not a commit).
+     hart1 `PC/SP/IO` init
+     (`P4_ROM_LINK` + SRAM top + `esp32p4_install_io`); early-boot
+     slot hooks `0x4fc00078/18/a8` on both ifetch + handler paths.
+     Verified native Arduino `patched.bin` HELLO+TICKs (100 s window,
+     177 TICKs, zero errors) on a fresh `CC=gcc` rebuild. Next: SMP
+     post-Rebooting wedge + unicore `0x4000752e` spin → REPL prompt →
      `print(6*7)` → protocol matrix.
   - DONE 2026-09-12: MicroPython v1.29.0 boots on C3 and C6
     (prebuilt ESP32_GENERIC_C3/C6 factory images). REPL is fully
