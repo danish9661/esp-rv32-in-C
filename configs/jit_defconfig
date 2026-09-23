@@ -1,3 +1,0 @@
-# JIT compilation with tiered optimization
-CONFIG_JIT=y
-CONFIG_T2C=y

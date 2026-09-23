@@ -10,32 +10,17 @@ deps_emcc :=
 ASSETS := assets/wasm
 WEB_HTML_RESOURCES := $(ASSETS)/html
 WEB_JS_RESOURCES := $(ASSETS)/js
-# Base exported functions (always available)
-EXPORTED_FUNCS := _main,_indirect_rv_halt,_indirect_rv_alive,_indirect_rv_cleanup
-# System mode adds UART input buffer functions
-ifeq ($(CONFIG_SYSTEM),y)
-EXPORTED_FUNCS := $(EXPORTED_FUNCS),_get_input_buf,_get_input_buf_cap,_set_input_buf_size,_get_input_buf_size,_u8250_put_rx_char
-endif
+# Base exported functions (ESP UART input buffer functions included;
+# the ESP32-only tree always builds CONFIG_SYSTEM=y).
+EXPORTED_FUNCS := _main,_indirect_rv_halt,_indirect_rv_alive,_indirect_rv_cleanup,_get_input_buf,_get_input_buf_cap,_set_input_buf_size,_get_input_buf_size,_u8250_put_rx_char
 DEMO_DIR_BASE := demo
-ifeq ($(CONFIG_SYSTEM),y)
+# ESP32-only tree: always the system/ESP demo dir (user mode removed).
 DEMO_DIR := $(DEMO_DIR_BASE)/system
-else
-DEMO_DIR := $(DEMO_DIR_BASE)/user
-endif
 
-# Base web files. User mode also ships the bulky game-data assets that were
-# moved out of --embed-file so the WASM binary stays small. They are fetched
-# at runtime by user.html and written into MEMFS at the paths the binaries
-# expect (/DOOM1.WAD, /id1/pak0.pak, /etc/timidity/*).
+# Base web files: the WASM bundle only (ESP firmware is fetched at runtime
+# by system.html and written into MEMFS).
 WEB_FILES := $(BIN).js \
              $(BIN).wasm
-ifneq ($(CONFIG_SYSTEM),y)
-WEB_FILES += $(OUT)/elf_list.js \
-             $(OUT)/DOOM1.WAD \
-             $(OUT)/pak0.pak \
-             $(OUT)/timidity.tar \
-             $(OUT)/timidity.tar.gz
-endif
 
 # Only configure Emscripten settings when using emcc
 ifeq ("$(CC_IS_EMCC)", "1")
@@ -69,35 +54,12 @@ CFLAGS_emcc += -sALLOW_MEMORY_GROWTH \
                -O3 \
                -w
 
-# System mode: kernel + rootfs fetched on demand, DTB embedded (1.5 KB).
-# User mode: small ELFs + game binaries embedded (~4 MiB); large game data
-# (DOOM1.WAD, Quake pak0.pak, timidity instrument set) is fetched on demand
-# from the same origin and written to MEMFS at the paths the binaries expect.
-ifeq ($(CONFIG_SYSTEM),y)
+# ESP boot path: fixed system/ELF-loader flags (firmware boots from the
+# flash image via -C <chip> -F; no DTB, no embedded ELFs, no game data).
 CFLAGS_emcc += -sINITIAL_MEMORY=768MB \
                -DMEM_SIZE=0x20000000 \
                -sEXPORTED_RUNTIME_METHODS='["callMain","FS"]' \
                --pre-js $(WEB_JS_RESOURCES)/system-pre.js
-# Linux kernel boot mode (no ELF loader) needs the compiled-in DTB. The
-# ELF-loader system mode (e.g. the ESP32-C3 machine) never touches it.
-ifneq ($(CONFIG_ELF_LOADER),y)
-CFLAGS_emcc += --embed-file build/minimal.dtb@/minimal.dtb
-endif
-else
-CFLAGS_emcc += -sINITIAL_MEMORY=320MB \
-               -DMEM_SIZE=0x10000000 \
-               -sEXPORTED_RUNTIME_METHODS='["callMain","FS"]' \
-               --embed-file build/jit-bf.elf@/jit-bf.elf \
-               --embed-file build/coro.elf@/coro.elf \
-               --embed-file build/fibonacci.elf@/fibonacci.elf \
-               --embed-file build/hello.elf@/hello.elf \
-               --embed-file build/ieee754.elf@/ieee754.elf \
-               --embed-file build/perfcount.elf@/perfcount.elf \
-               --embed-file build/readelf.elf@/readelf.elf \
-               --embed-file build/smolnes.elf@/smolnes.elf \
-               --embed-file build/riscv32@/riscv32 \
-               --pre-js $(WEB_JS_RESOURCES)/user-pre.js
-endif
 
 # mimalloc support detection
 MIMALLOC_SUPPORT_SINCE_MAJOR := 3
@@ -108,50 +70,6 @@ ifeq ($(call version_gte,$(EMCC_MAJOR),$(EMCC_MINOR),$(EMCC_PATCH),$(MIMALLOC_SU
 else
     $(warning mimalloc requires Emscripten $(MIMALLOC_SUPPORT_SINCE_MAJOR).$(MIMALLOC_SUPPORT_SINCE_MINOR).$(MIMALLOC_SUPPORT_SINCE_PATCH)+)
 endif
-
-# ELF list generator
-$(OUT)/elf_list.js: artifact tools/gen-elf-list-js.py
-	$(Q)tools/gen-elf-list-js.py > $@
-
-# Stage Quake's pak0.pak (lives under $(OUT)/id1/) to a flat name next to the
-# WASM bundle so the dev server and deploy treat it like any other WEB_FILE.
-# user.html fetches it and writes it back to /id1/pak0.pak in MEMFS.
-$(OUT)/pak0.pak: $(QUAKE_DATA)
-	$(Q)cp $(OUT)/id1/pak0.pak $@
-
-# Build the web-deployed rootfs by splicing /etc/init.d/S99automount into the
-# upstream rootfs.cpio. Splicing preserves character device nodes (/dev/console
-# etc.) which a non-root extract+repack would silently drop, leaving the guest
-# init without a stdio console. See tools/cpio-inject.py for the format.
-$(OUT)/linux-image/rootfs.web.cpio: $(OUT)/linux-image/rootfs.cpio \
-                                    tools/rootfs-automount.sh \
-                                    tools/cpio-inject.py
-	$(VECHO) "  CPIO\t$@\n"
-	$(Q)python3 tools/cpio-inject.py \
-	    $(OUT)/linux-image/rootfs.cpio \
-	    $@ \
-	    etc/init.d/S99automount \
-	    tools/rootfs-automount.sh
-	$(Q)cpio -t < $@ 2>/dev/null | grep -q '^etc/init.d/S99automount$$' || \
-	    { echo "ERROR: S99automount missing from $@"; exit 1; }
-	$(Q)cpio -t < $@ 2>/dev/null | grep -q '^dev/console$$' || \
-	    { echo "ERROR: dev/console missing from $@ (device nodes dropped)"; exit 1; }
-	$(VECHO) "  OK\trootfs.web.cpio: S99automount injected, /dev preserved\n"
-
-# Bundle the timidity instrument set as tar plus tar.gz so browsers with
-# DecompressionStream get the smaller download while older Safari/Firefox can
-# still fetch a plain tar and use the same JS untar path.
-# COPYFILE_DISABLE keeps macOS BSD tar from emitting AppleDouble (._*) files;
-# --no-xattrs (where supported) drops any extended attributes the JS untar
-# would otherwise have to filter out. Both are silently ignored on Linux.
-$(OUT)/timidity.tar: $(TIMIDITY_DATA)
-	$(VECHO) "  TAR\t$@\n"
-	$(Q)COPYFILE_DISABLE=1 tar --no-xattrs -cf $@ -C $(OUT)/timidity . 2>/dev/null || \
-	    COPYFILE_DISABLE=1 tar -cf $@ -C $(OUT)/timidity .
-
-$(OUT)/timidity.tar.gz: $(OUT)/timidity.tar
-	$(VECHO) "  TARGZ\t$@\n"
-	$(Q)gzip -9 -c $< > $@
 
 # xterm.js terminal library for web UI.
 # Fetched at build time from jsdelivr (primary) with unpkg as a backup. Both
@@ -193,14 +111,9 @@ $(XTERM_CSS): | $(XTERM_VENDOR)
 
 XTERM_DATA := $(XTERM_JS) $(XTERM_CSS)
 
-# Dependencies for WASM build
-# System mode: kernel image only (no audio/games)
-# User mode: ELFs, games, and timidity for MIDI audio
-ifeq ($(CONFIG_SYSTEM),y)
+# Dependencies for the ESP WASM build: prebuilt ELF fixtures only
+# (no game data, no timidity, no kernel image).
 deps_emcc += artifact
-else
-deps_emcc += artifact $(OUT)/elf_list.js $(DOOM_DATA) $(QUAKE_DATA) $(TIMIDITY_DATA)
-endif
 
 # Browser TCO Support Detection
 
@@ -258,52 +171,23 @@ define cp-web-worker
 endef
 
 STATIC_WEB_FILES := $(WEB_JS_RESOURCES)/coi-serviceworker.min.js \
-                    $(XTERM_JS) $(XTERM_CSS)
-ifeq ($(CONFIG_SYSTEM),y)
-STATIC_WEB_FILES += $(WEB_HTML_RESOURCES)/system.html
-else
-STATIC_WEB_FILES += $(WEB_HTML_RESOURCES)/user.html
-endif
+                    $(XTERM_JS) $(XTERM_CSS) \
+                    $(WEB_HTML_RESOURCES)/system.html
 
-# Landing page is installed once at the unified demo root so the
-# "User Mode" / "System Mode" cards resolve to ./user/ and ./system/.
-LANDING_PAGE := $(WEB_HTML_RESOURCES)/demo-index.html
+# ESP32-only tree: single demo root (demo/system); no user-mode page,
+# no landing page (upstream demo-index.html removed).
 
 start_web_deps := check-demo-dir-exist $(BIN) $(XTERM_DATA)
-ifeq ($(CONFIG_SYSTEM),y)
-# rootfs.web.cpio is the upstream rootfs.cpio with an /etc/init.d/S99automount
-# overlay so the guest auto-mounts /dev/vda at /mnt during boot.
-start_web_deps += $(OUT)/linux-image/Image \
-                  $(OUT)/linux-image/rootfs.web.cpio
-ifneq ($(CONFIG_ELF_LOADER),y)
-start_web_deps += $(BUILD_DTB) $(BUILD_DTB2C)
-endif
-else
-# User mode also stages large game data alongside the WASM bundle so the
-# WEB_FILES copy step succeeds. These targets pull from DOOM_DATA/QUAKE_DATA
-# /TIMIDITY_DATA which deps_emcc already triggers; the rules above just
-# re-stage them under flat names suitable for the dev server.
-start_web_deps += $(OUT)/DOOM1.WAD $(OUT)/pak0.pak \
-                  $(OUT)/timidity.tar $(OUT)/timidity.tar.gz
-endif
 
-# Populate the demo tree for the configured mode without starting a server.
-# Useful for building both modes (run twice with/without ENABLE_SYSTEM=1) and
-# then serving them together via `make serve-web`.
+# Populate the ESP demo tree (demo/system) without starting a server.
 prepare-web: $(start_web_deps)
 	$(Q)rm -f $(DEMO_DIR)/*.html
 	$(foreach T, $(WEB_FILES), $(call cp-web-file, $(T)))
 	$(foreach T, $(STATIC_WEB_FILES), $(call cp-web-file, $(T)))
 	$(call cp-web-worker)
-ifeq ($(CONFIG_SYSTEM),y)
-	$(Q)cp build/linux-image/Image $(DEMO_DIR)/
-	$(Q)cp $(OUT)/linux-image/rootfs.web.cpio $(DEMO_DIR)/rootfs.cpio
-endif
 	$(Q)mv $(DEMO_DIR)/*.html $(DEMO_DIR)/index.html
-	$(Q)cp $(LANDING_PAGE) $(DEMO_DIR_BASE)/index.html
 
-# Serve whatever is currently under $(DEMO_DIR_BASE). Run `prepare-web` first
-# for one or both modes.
+# Serve whatever is currently under $(DEMO_DIR_BASE). Run `prepare-web` first.
 serve-web:
 	$(Q)python3 tools/dev-server.py --bind $(DEMO_IP) --port $(DEMO_PORT) --directory $(DEMO_DIR_BASE)
 
@@ -316,12 +200,7 @@ compress-web: $(start_web_deps)
 	$(foreach T, $(WEB_FILES), $(call cp-web-file, $(T)))
 	$(foreach T, $(STATIC_WEB_FILES), $(call cp-web-file, $(T)))
 	$(call cp-web-worker)
-ifeq ($(CONFIG_SYSTEM),y)
-	$(Q)cp build/linux-image/Image $(DEMO_DIR)/
-	$(Q)cp $(OUT)/linux-image/rootfs.web.cpio $(DEMO_DIR)/rootfs.cpio
-endif
 	$(Q)mv $(DEMO_DIR)/*.html $(DEMO_DIR)/index.html
-	$(Q)cp $(LANDING_PAGE) $(DEMO_DIR_BASE)/index.html
 	@$(call notice, Compressing web assets...)
 	$(Q)gzip -9 -k $(DEMO_DIR)/rv32emu.wasm 2>/dev/null || true
 	$(Q)gzip -9 -k $(DEMO_DIR)/rv32emu.js 2>/dev/null || true

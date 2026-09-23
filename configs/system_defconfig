@@ -1,3 +1,0 @@
-# System emulation for Linux kernel
-CONFIG_SYSTEM=y
-CONFIG_GOLDFISH_RTC=y

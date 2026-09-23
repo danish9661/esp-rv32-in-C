@@ -65,7 +65,7 @@ error_msg = $(PRINTF) "$(RED)$(strip $1)$(NC)\n"
 # Note: 'artifact' is included because it only downloads prebuilt binaries
 # and determines what to download from ENABLE_* flags (via compat.mk)
 CONFIG_TARGETS := config menuconfig defconfig oldconfig savedefconfig \
-                  clean distclean env-check artifact fetch-checksum build-linux-image
+                  clean distclean env-check artifact fetch-checksum
 
 # Targets where we can skip expensive dependency detection (pkg-config, llvm-config, etc.)
 # This speeds up 'make clean', etc. significantly

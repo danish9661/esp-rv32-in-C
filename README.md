@@ -1,130 +1,96 @@
-# RISC-V RV32I[MAFC] emulator
-![GitHub Actions](https://github.com/sysprog21/rv32emu/actions/workflows/main.yml/badge.svg)
+# ESP32 RISC-V emulator (C3 / C6 / H2 / P4, WebAssembly)
+
+A WebAssembly emulator for **ESP32-C3, ESP32-C6, ESP32-H2, ESP32-P4**,
+built by extending [sysprog21/rv32emu](https://github.com/sysprog21/rv32emu)
+with ESP32 SoC models (memory maps, ROM hooks, peripherals, interrupt
+controllers). One combined binary serves all four chips with runtime chip
+selection. This fork is ESP-only: upstream user-mode games, SDL, JIT, GDB
+stub, arch-test, and Linux-image tooling are not part of this tree
+(see [docs/esp32-p4.md](docs/esp32-p4.md) for scope notes).
+
 ```
-                       /--===============------\
-      ______     __    | |⎺⎺⎺⎺⎺⎺⎺⎺⎺⎺⎺⎺⎺⎺⎺|     |
-     |  _ \ \   / /    | |               |     |
-     | |_) \ \ / /     | |   Emulator!   |     |
-     |  _ < \ V /      | |               |     |
-     |_| \_\ \_/       | |_______________|     |
-      _________        |                   ::::|
-     |___ /___ \       '======================='
-       |_ \ __) |      //-'-'-'-'-'-'-'-'-'-'-\\
-      ___) / __/      //_'_'_'_'_'_'_'_'_'_'_'_\\
-     |____/_____|     [-------------------------]
+rv32emu core (interpreter, ELF loader)   [upstream, kept]
+        │
+        └── ESP32 SoC layer (new, C, per-chip table-driven)
+              ├── memory map / register banks per chip
+              ├── SYSTIMER, UART (console), GPIO, SPI0 flash cache
+              ├── interrupt controllers (PLIC/INTC/CLIC per chip)
+              └── chip select at runtime (`-C esp32c3|c6|h2|p4|p4smp`)
 ```
 
-`rv32emu` is an emulator for the 32 bit [RISC-V processor model](https://riscv.org/technical/specifications/) (RV32),
-faithfully implementing the RISC-V instruction set architecture (ISA).
-It serves as an exercise in modeling a modern RISC-based processor, demonstrating
-the device's operations without the complexities of a hardware implementation.
-The code is designed to be accessible and expandable, making it an ideal educational
-tool and starting point for customization. It is primarily written in C99, utilizing
-C11 atomics for memory management, with a focus on efficiency and readability.
-
-Features:
-* Fast interpreter that faithfully executes the complete RV32 instruction set
-* Full coverage of RV32I / RV32E plus the M (integer multiply–divide), A (atomics), F (single-precision floating-point), C (compressed), and Zba/Zbb/Zbc/Zbs bit-manipulation extensions
-* Partial support for the V (vector) extension — decode plus partial execution at `VLEN=128`; opt-in via `make config` (select "V — Vector Extension")
-* Built-in ELF loader for user-mode emulation
-* Newlib-compatible system-call layer for standalone programs
-* Minimal system emulation capable of booting an RV32 Linux kernel and running user-space binaries
-* SDL-based display/event/audio system calls for running video games
-* WebAssembly build for user-mode and system emulation with SDL graphics and audio in modern browsers
-* Remote debugging through the GDB Remote Serial Protocol
-* Tiered JIT compilation for performance boost while maintaining a small footprint
+| Chip | Core | Notes |
+|---|---|---|
+| ESP32-C3 | RV32IMC, 1 core | WiFi+BLE |
+| ESP32-C6 | RV32IMC, 1 core | WiFi6+BLE+802.15.4 |
+| ESP32-H2 | RV32IMC, 1 core | BLE+802.15.4 |
+| ESP32-P4 | RV32IMAFC, 2 HP cores + LP | No wireless; SMP via `-C esp32p4smp` |
 
 ## Quick start
 
-`rv32emu` relies on the [SDL2 library](https://www.libsdl.org/) and
-[SDL2_Mixer library](https://wiki.libsdl.org/SDL2_mixer) for full
-functionality:
-* macOS: `brew install sdl2 sdl2_mixer`
-* Ubuntu Linux / Debian: `sudo apt install libsdl2-dev libsdl2-mixer-dev`
+Prerequisites: `gcc`, `arduino-cli` (esp32 core 3.3.10), node; for WASM:
+Emscripten SDK (`source ~/emsdk/emsdk_env.sh`, emcc 6.0.6).
 
-Build and verify:
 ```shell
-$ make defconfig      # Apply default configuration
-$ make                # Build rv32emu
-$ make check          # Run tests
+# Native build (fast iteration only):
+make -j$(nproc)                              # -> build/rv32emu
+
+# WASM build (the real target):
+source ~/emsdk/emsdk_env.sh
+rm -rf build/softfloat build/devices         # when switching toolchains
+make CC=emcc wasmc6_defconfig
+make CC=emcc -j$(nproc)                      # -> build/rv32emu.js + .wasm
 ```
 
-Run the included demos:
+Switching between native and WASM toolchains requires
+`rm -rf build/softfloat build/devices` (objects are toolchain-specific;
+make does not detect the switch).
+
+## Running firmware
+
+Build firmware with `arduino-cli`, flash it as a `merged.bin` image:
+
 ```shell
-$ make doom           # Doom (1993)
-$ make quake          # Quake (requires RV32F, on by default)
+# P4 hello (ChipVariant=postv3), then unicore-patch + run:
+arduino-cli compile --fqbn esp32:esp32:esp32p4:ChipVariant=postv3 <sketchdir> --output-dir <out>
+python3 tools/p4_mkunicore.py <out>/<name>.ino.elf <out>/<name>.ino.merged.bin <out>/patched.bin
+timeout 100 ./build/rv32emu -C esp32p4 -F <out>/patched.bin   # expect HELLO_UART_OK + TICKs
+timeout 300 node run_p4.js <out>/patched.bin                 # WASM headless (run_c3/c6/h2.js likewise)
 ```
 
-For interactive build configuration, use `make config`. For predefined
-configurations, Kconfig options, and tiered JIT compilation setup
-(LLVM toolchain), see [docs/build.md](docs/build.md).
+The WASM bundle sets `Module["noInitialRun"]=true`, so bare
+`node build/rv32emu.js -C ...` does NOT run `main()` — use the
+`run_*.js` harnesses (MEMFS image + `run_system`, `document` stub).
+Browser demo: serve `demo/` (`python3 tools/dev-server.py --directory demo`)
+and open the system page; firmware + runner glue live under
+`demo/system/esp32*/` and `assets/wasm/js/system-pre.js`.
+UART RX injection: `-U <file>` native, `P4_RX_FILE`/`H2_RX_FILE` env on node.
 
-## Online demo
+## Verified status
 
-A hosted WebAssembly build of `rv32emu` runs entirely in the browser, so
-you can try it without building locally:
-* [User-mode emulation demo page](https://sysprog21.github.io/rv32emu-demo/user/)
-* [System emulation demo page](https://sysprog21.github.io/rv32emu-demo/system/)
+- Arduino hello on all four chips boots to `setup()`/`loop()` with UART
+  output (`HELLO_UART_OK` + `TICK`s), native and WASM-node.
+- C6 full peripheral report (`demotest` → `DEMO_DONE`); H2 11-test matrix;
+  P4 18-test peripheral matrix incl. dual-core SMP (`IPC_DONE`, GPIO).
+- MicroPython v1.29.0 REPL on C3/C6/H2 (interactive `print(6*7)` → `42`
+  plus peripheral matrix); P4 MicroPython boots through partition-MD5 and
+  factory image-hash verify (`32cf9a57…` match), app bring-up in progress.
+- WiFi/BT are stubs (out of scope for a faithful model).
 
-The landing page links to both modes, and each mode page has a navigation
-button that switches directly to the other.
-
-## ESP32 support (this fork)
-
-This tree extends rv32emu with WebAssembly SoC models for **ESP32-C3, ESP32-C6,
-ESP32-H2, ESP32-P4** (single combined binary, runtime chip selection).
-See [docs/esp32-p4.md](docs/esp32-p4.md) for the P4 bring-up status, ROM-slot
-hook model, and verified firmware images; `AGENTS.md` holds the full project
-spec and progress log.
+Details: [docs/esp32-p4.md](docs/esp32-p4.md); full project spec and
+progress log: `AGENTS.md`.
 
 ## Documentation
 
 | Topic | Document |
 | ----- | -------- |
-| Build options, Kconfig, and tiered JIT setup | [docs/build.md](docs/build.md) |
-| System emulation: boot Linux, virtio block devices, bootargs | [docs/system.md](docs/system.md) |
-| WebAssembly build for the browser | [docs/wasm.md](docs/wasm.md) |
-| GDB remote debugging and register JSON dump | [docs/gdbstub.md](docs/gdbstub.md) |
-| RISCOF / RISC-V architecture tests | [docs/riscof.md](docs/riscof.md) |
-| Benchmarks and continuous benchmarking | [docs/benchmark.md](docs/benchmark.md) |
-| Static analysis tools (rv_histogram, rv_profiler) | [docs/tools.md](docs/tools.md) |
-| Docker image | [docs/docker.md](docs/docker.md) |
-| Demo applications (Doom, Quake) | [docs/demo.md](docs/demo.md) |
-| Code generation and JIT internals | [docs/codegen.md](docs/codegen.md) |
+| ESP32-P4 bring-up status, hook model, images | [docs/esp32-p4.md](docs/esp32-p4.md) |
+| ESP build configs and options | [docs/build.md](docs/build.md) |
+| ESP WebAssembly build + node/browser runs | [docs/wasm.md](docs/wasm.md) |
 | RISC-V instruction reference | [docs/instruction.md](docs/instruction.md) |
-| Newlib system calls | [docs/syscall.md](docs/syscall.md) |
-| Prebuilt binaries | [docs/prebuilt.md](docs/prebuilt.md) |
-| Base image preparation | [docs/base-image.md](docs/base-image.md) |
 
-## Contributing
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
+## Upstream credit
 
-## Citation
-Please see our [VMIL'24](https://2024.splashcon.org/home/vmil-2024) paper, available in the [ACM digital library](https://dl.acm.org/doi/10.1145/3689490.3690399).
-```
-@inproceedings{ncku2024accelerate,
-  title={Accelerate {RISC-V} Instruction Set Simulation by Tiered {JIT} Compilation},
-  author={Chen, Yen-Fu and Chen, Meng-Hung and Huang, Ching-Chun and Tu, Chia-Heng},
-  booktitle={Proceedings of the 16th ACM SIGPLAN International Workshop on Virtual Machines and Intermediate Languages},
-  pages={12--22},
-  year={2024}
-}
-```
-
-## License
-`rv32emu` is available under a permissive MIT-style license.
-Use of this source code is governed by a MIT license that can be found in the [LICENSE](LICENSE) file.
-
-## External sources
-See [docs/prebuilt.md](docs/prebuilt.md).
-
-## Reference
-* [Writing a simple RISC-V emulator in plain C](https://fmash16.github.io/content/posts/riscv-emulator-in-c.html)
-* [Writing a RISC-V Emulator in Rust](https://book.rvemu.app/)
-* [Bare metal C on my RISC-V toy CPU](https://florian.noeding.com/posts/risc-v-toy-cpu/cpu-from-scratch/)
-* [Juraj's RISC-V note](https://jborza.com/tags/riscv/)
-* [GUI-VP: RISC-V based Virtual Prototype (VP) for graphical application development](https://github.com/ics-jku/GUI-VP)
-* [LupV: an education-friendly RISC-V based system emulator](https://gitlab.com/luplab/lupv)
-* [mini-rv32ima](https://github.com/cnlohr/mini-rv32ima) / [video: Writing a Really Tiny RISC-V Emulator](https://youtu.be/YT5vB3UqU_E)
-* [RVVM](https://github.com/LekKit/RVVM)
-* [RISCVBox](https://github.com/bane9/RISCVBox)
+Core interpreter, ELF loader, and build system by the
+[rv32emu project](https://github.com/sysprog21/rv32emu) (MIT license,
+see [LICENSE](LICENSE)). VMIL'24 paper:
+[Accelerate RISC-V Instruction Set Simulation by Tiered JIT Compilation](https://dl.acm.org/doi/10.1145/3689490.3690399).

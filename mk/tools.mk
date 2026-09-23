@@ -39,12 +39,6 @@ $(HIST_BIN): $(HIST_OBJS)
 
 TOOLS_BIN += $(HIST_BIN)
 
-# Build Linux image
-LINUX_IMAGE_SRC = $(BUILDROOT_DATA) $(LINUX_DATA) $(SIMPLEFS_DATA)
-build-linux-image: $(LINUX_IMAGE_SRC)
-	$(Q)./tools/build-linux-image.sh
-	$(Q)$(PRINTF) "Build done.\n"
-
 # Code Formatting (tool detection deferred to recipe)
 # Uses find -print0 | xargs -0 for safe handling of paths with special characters
 format:
@@ -66,6 +60,6 @@ format:
 	find . \( $$PRUNE_ARGS \) -prune -o \( -name '*.py' -o -name '*.pyi' \) -print0 | xargs -0 $$BLACK --quiet
 	$(Q)$(call notice, All files formatted.)
 
-.PHONY: build-linux-image format
+.PHONY: format
 
 endif # _MK_TOOLS_INCLUDED
