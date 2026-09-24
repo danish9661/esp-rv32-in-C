@@ -1,0 +1,106 @@
+# ESP32 demo web UI (GitHub Pages)
+
+name: esp32-demo
+
+# yamllint disable-line rule:truthy -- `on:` must stay quoted: unquoted it
+# parses as boolean True and GitHub ignores the trigger block.
+"on":
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'assets/wasm/**'
+      - 'demo/system/**'
+      - 'configs/wasmc6_defconfig'
+      - 'configs/Kconfig'
+      - 'mk/**'
+      - 'Makefile'
+      - 'run_*.js'
+      - 'tools/cdp_boot_test.py'
+      - 'tools/dev-server.py'
+      - '.github/workflows/esp32-demo.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: esp32-demo-${{ github.ref }}
+  cancel-in-progress: false  # don't cancel deploys; partial Pages publishes are worse
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v6
+        with:
+          submodules: 'true'
+      - name: Install emsdk
+        run: |
+          git clone https://github.com/emscripten-core/emsdk
+          cd emsdk
+          ./emsdk install 6.0.6
+          ./emsdk activate 6.0.6
+          source ./emsdk_env.sh
+          # Propagate emsdk env to subsequent steps (each `run:` is a fresh
+          # shell). PATH alone is not enough: emcc needs EMSDK/EM_CONFIG to
+          # find its .emscripten config and EMSDK_NODE for its bundled node
+          # without relying on relative-path auto-discovery.
+          # Only propagate values that are set and non-empty: writing them
+          # empty to $GITHUB_ENV would override emcc's $HOME/.emscripten
+          # fallback with "".
+          for var in EMSDK EM_CONFIG EMSDK_NODE EMSDK_PYTHON; do
+            val="${!var}"
+            [ -n "$val" ] && printf '%s=%s\n' "$var" "$val" >> "$GITHUB_ENV"
+          done
+          {
+            echo "$PWD"
+            echo "$PWD/upstream/emscripten"
+          } >> $GITHUB_PATH
+        shell: bash
+      - name: Build ESP32 WASM bundle
+        # GH_TOKEN authenticates the parse-time fetch-releases-tag call in
+        # mk/artifact.mk so the GitHub API request escapes the 60 req/hr
+        # anonymous (IP-shared) limit.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf build/softfloat build/devices  # objects are toolchain-specific
+          make CC=emcc wasmc6_defconfig
+          make CC=emcc -j$(nproc)
+          ls -la build/rv32emu.js build/rv32emu.wasm
+      - name: Gate headless (node, P4 SMP hello)
+        # The guest idles after boot, so `timeout` exits 124 by design;
+        # the gate is the grepped log, not the exit code.
+        # run_p4.js defaults to unicore `-C esp32p4`; the SMP image needs
+        # the explicit `-C esp32p4smp` third arg (unicore stalls at entry).
+        run: |
+          timeout 300 node run_p4.js demo/system/esp32p4smp/p4hellov3.ino.merged.bin "-C esp32p4smp -F /merged.bin" > /tmp/esp_gate.log 2>&1 || true
+          grep -a "HELLO_UART_OK" /tmp/esp_gate.log
+      - name: Gate headless (node, C6 demotest)
+        run: |
+          timeout 300 node run_c6.js demo/system/esp32c6/demotest.ino.merged.bin > /tmp/esp_gate_c6.log 2>&1 || true
+          grep -a "DEMO_DONE" /tmp/esp_gate_c6.log
+      - name: Stage demo/system web UI
+        run: |
+          make CC=emcc prepare-web
+          ls -la demo/system
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: demo/system
+
+  deploy:
+    needs: build-and-gate
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
