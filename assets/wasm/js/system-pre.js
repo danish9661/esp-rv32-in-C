@@ -1,5 +1,10 @@
 Module["noInitialRun"] = true;
 
+// Generic entry used by the node headless runners (run_*.js) and CI gates.
+Module["run_system"] = function (cli_param) {
+  callMain(cli_param.split(" "));
+};
+
 // ESP32 flash-only boot: each chip boots its merged flash image through
 // the ROM reset vector (no ELF arg needed; the SoC ignores the positional
 // ELF when -F is given, so all six entries take just the flash MEMFS path).
