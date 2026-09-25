@@ -4503,25 +4503,46 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
     }
+    /* ROM UART slots (per esp32p4.rom.ld — slot JALs verified against
+     * the real 128 KB dump: tx_one_char 0x54 -> 0x4fc0a77c, flush 0x74
+     * -> 0x4fc0a838, wait_idle 0x78 -> 0x4fc0a880, write_char 0x80 ->
+     * 0x4fc02f02; all bodies decode clean RV32+C). The char-out ABI is
+     * one byte in a0, return void: forward a0[7:0] to the UART0
+     * console and return to ra. uart_tx_one_char2/3 share the same ABI.
+     * ets_write_char_uart(c) likewise. uart_tx_flush (0x4fc00074) and
+     * uart_tx_wait_idle (0x4fc00078) drain instantly (void return).
+     * uartAttach (0x70), uart_tx_switch (0x84), uart_buff_switch (0x88)
+     * are mode switches the model treats as nop.
+     * Covered on BOTH paths: live-gated ifetch hook here AND a
+     * PC-dispatched case in esp32p4_ecall_handler. */
+    if (live &&
+        (addr == 0x4fc00054u || addr == 0x4fc00058u ||
+         addr == 0x4fc0005cu || addr == 0x4fc00070u ||
+         addr == 0x4fc00074u || addr == 0x4fc00078u ||
+         addr == 0x4fc00080u || addr == 0x4fc00084u ||
+         addr == 0x4fc00088u)) {
+        if (addr == 0x4fc00054u || addr == 0x4fc00058u ||
+            addr == 0x4fc0005cu || addr == 0x4fc00080u) {
+            esp32p4_t *soc = PRIV(rv)->esp32p4;
+            esp32_uart_putc(soc, (char) (rv->X[10] & 0xFFu));
+        }
+        rv->PC = rv->X[1];
+        p4_md5_ecall = true;
+        return 0x00000073u; /* ecall (block-terminal) */
+    }
     /* ROM early-boot slots that JAL to LP stubs (unmapped 0x4fb0xxxx)
      * and must return immediately (model: instant/nop/constant).
      * Covered on BOTH paths: live-gated ifetch hook here AND a
      * PC-dispatched case in esp32p4_ecall_handler (a first-visit slot
      * block can translate + chain before the hook fires live).
-     *  - 0x4fc00078 uart_tx_wait_idle: TX FIFO drains instantly.
      *  - 0x4fc00018 rtc_get_reset_reason: POR (1); the bootloader
      *    branches on a0==12 later, POR keeps the normal boot path.
      *  - 0x4fc000a8 ets_set_appcpu_boot_addr(addr): record the APP-CPU
      *    boot address (unicore: just return; counts as a trace point
      *    that app early init ran). */
     if (live &&
-        (addr == 0x4fc00078u || addr == 0x4fc00018u ||
+        (addr == 0x4fc00018u ||
          addr == 0x4fc000a8u)) {
-        if (addr == 0x4fc00078u) {
-            rv->PC = rv->X[1];
-            p4_md5_ecall = true;
-            return 0x00000073u; /* ecall (block-terminal) */
-        }
         if (addr == 0x4fc00018u) {
             rv->X[10] = 1u;
             rv->PC = rv->X[1];
@@ -4801,6 +4822,18 @@ void esp32p4_ecall_handler(riscv_t *rv)
         rv->X[10] = 360000000u;
         break;
     case 0x4fc00078u: /* uart_tx_wait_idle(): TX drains instantly */
+        break;
+    case 0x4fc00074u: /* uart_tx_flush(): TX drains instantly */
+        break;
+    case 0x4fc00070u: /* uartAttach(rxbuf): nop */
+    case 0x4fc00084u: /* uart_tx_switch(uart_no): nop */
+    case 0x4fc00088u: /* uart_buff_switch: nop */
+        break;
+    case 0x4fc00054u: /* uart_tx_one_char(c): console putc(a0) */
+    case 0x4fc00058u: /* uart_tx_one_char2(c): same ABI */
+    case 0x4fc0005cu: /* uart_tx_one_char3(c): same ABI */
+    case 0x4fc00080u: /* ets_write_char_uart(c): same ABI */
+        esp32_uart_putc(soc, (char) (rv->X[10] & 0xFFu));
         break;
     case 0x4fc00018u: /* rtc_get_reset_reason(): POR (1) */
         rv->X[10] = 1u;

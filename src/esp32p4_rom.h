@@ -1,5 +1,5 @@
-/* Automatically generated from esp32p4-rom.bin (wokwi/esp32-roms dump, 0x20000 bytes).
- * Do not edit. */
+/* Automatically generated from esp32p4-rom.bin (wokwi/esp32-roms dump,
+ * 131072 bytes). Do not edit. */
 #ifndef ESP32P4_ROM_H
 #define ESP32P4_ROM_H
 
