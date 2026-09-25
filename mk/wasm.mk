@@ -111,9 +111,11 @@ $(XTERM_CSS): | $(XTERM_VENDOR)
 
 XTERM_DATA := $(XTERM_JS) $(XTERM_CSS)
 
-# Dependencies for the ESP WASM build: prebuilt ELF fixtures only
-# (no game data, no timidity, no kernel image).
-deps_emcc += artifact
+# ESP-only WASM build: no prebuilt downloads. The ESP machines boot
+# committed flash images (demo/system/*/[*.merged.bin]); nothing in the
+# link needs `artifact` (ELF fixtures / Linux image for the old demos).
+# xterm.js is vendored for committed builds, fetched for fresh CI clones.
+deps_emcc += $(XTERM_DATA)
 
 # Browser TCO Support Detection
 

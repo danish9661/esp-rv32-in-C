@@ -47,17 +47,6 @@ jobs:
         with:
           path: emsdk
           key: emsdk-6.0.6
-      - name: Cache prebuilt Linux image
-        # The WASM build's `artifact` dep downloads this (~34 MB) from
-        # GitHub releases when the sentinels are missing. Restoring it
-        # skips the download; a stale cache self-heals via SHA verify.
-        uses: actions/cache@v4
-        with:
-          path: |
-            build/linux-image
-            build/sha1sum-linux-image
-            build/.stamp-linux-image
-          key: rv32emu-linux-image-v1
       - name: Install emsdk
         run: |
           if [ ! -d emsdk ]; then git clone --depth 1 https://github.com/emscripten-core/emsdk; fi
@@ -82,11 +71,9 @@ jobs:
           } >> $GITHUB_PATH
         shell: bash
       - name: Build ESP32 WASM bundle
-        # GH_TOKEN authenticates the parse-time fetch-releases-tag call in
-        # mk/artifact.mk so the GitHub API request escapes the 60 req/hr
-        # anonymous (IP-shared) limit.
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # No network beyond emsdk/xterm CDN: the ESP build no longer
+        # depends on the `artifact` target (committed flash images boot
+        # directly; old Linux/ELF payloads are gone from the page).
         run: |
           rm -rf build/softfloat build/devices  # objects are toolchain-specific
           make CC=emcc wasmc6_defconfig
