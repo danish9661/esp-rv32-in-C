@@ -39,8 +39,9 @@ other).
 
 ## Notable model values
 
-- eFuse `RD_MAC_SYS_2 @+0x4C` = `0x810` (CHIP/BLK v1.0; ECO5 v3.0 trips
-  MPY rev checks, postv3 Arduino passes either).
+- eFuse `RD_MAC_SYS_2 @+0x4C` = `0x30` (CHIP v3.0 = real ECO5 silicon,
+  BLK v0; inside MPY BL+APP [300..399] and Arduino postv3 [0..empty]).
+  (Was `0x810`/v1.0 — predates MPY's min-v3.0 headers.)
 - `RTC_XTAL_FREQ_REG` (`LP_STORE4 @0x5011003C`) = `0x00280028` (40 MHz).
 - `SHAGUARD`: digest `0x4ffbcc24` (Arduino in-place header hash) skips
   the write; all other digests write normally.

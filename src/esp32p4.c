@@ -2082,18 +2082,21 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
     }
 
     /* eFuse RD_MAC_SYS_2 @+0x4C (efuse_rd_mac_sys2_reg_t, hw_ver3):
-     * verified against IDF efuse_ll.h: CHIP major = hi<<2|lo,
-     * minor = nibble; BLK = blk_major*100+blk_minor. postv3 Arduino
-     * image header wants CHIP [0,65535] (max empty) and BLK [0,199];
-     * MPY app imageHeader AND bootloader both cap CHIP max at 199
-     * (v1.99). ECO5 reports v3.0=300 > 199, so MPY rejects it.
-     * Report v1.99-compatible rev: CHIP major 1 (hi=0,lo=1), minor 0
-     * = 100; BLK major 1, minor 0 = 100: val = (1<<4)|(1<<11) = 0x810.
-     * Arduino postv3 (min CHIP 0, max empty) still passes, and Arduino
-     * is verified green with this value (HELLO+TICK native). */
+     * verified against IDF efuse_ll.h + efuse_struct.h: CHIP major =
+     * hi<<2|lo (hi=bit23, lo=bits[5:4]), minor = bits[3:0];
+     * BLK = blk_major*100+blk_minor. postv3 Arduino image headers want
+     * CHIP [0,empty] (passes anything); current MPY BL+APP want CHIP
+     * min v3.0 (300) max v3.99 (399) (earlier pre-rev3 MPY builds
+     * wanted [0..199]; the tree no longer targets those).
+     * val: CHIP major 3 needs hi=0 + lo=3 -> bits[5:4]=0b11:
+     * (1<<4)|(1<<5) = 0x30. minor 0, BLK ver 0 (inside MPY's BLK
+     * [min..3.99]). CHIP rev = 300, inside MPY BL/APP [300..399] and
+     * inside Arduino postv3 [0..empty-max]. Real ECO5 silicon is v3.0;
+     * the old v1.x report predates MPY's min-v3.0 headers.
+     * Arduino postv3 (min CHIP 0, max empty) still passes. */
     if (addr >= 0x5012D000u && addr < 0x5012D400u) {
         if (addr == 0x5012D000u + 0x4Cu)
-            return (1u << 4) | (1u << 11);
+            return (1u << 4) | (1u << 5);
         return 0;
     }
 
