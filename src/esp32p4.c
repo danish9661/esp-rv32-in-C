@@ -4507,6 +4507,12 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
     }
+    /* ROM SPI-flash helpers (0x4fc00118 wait_idle, 0x4fc00168
+     * config_param): run NATIVELY. An earlier draft nop-hooked them,
+     * but the native bodies perform status side effects later code
+     * polls — suppressing them wedges the bootloader before
+     * console_init. The bodies are valid HP code that terminates
+     * against the instant-flash model. */
     /* ROM UART slots (per esp32p4.rom.ld — slot JALs verified against
      * the real 128 KB dump: install_printf 0x30 -> 0x4fc03374,
      * tx_one_char 0x54 -> 0x4fc0a77c, flush 0x74 -> 0x4fc0a838,
