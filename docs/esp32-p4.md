@@ -65,30 +65,15 @@ effects). The slots are NEVER rewritten.
 
 ## MicroPython P4EMU build (reproducible)
 
-Upstream MicroPython v1.29.0, no tree changes needed except two new
-files (kept outside this repo for now):
-
-- `ports/esp32/boards/ESP32_GENERIC_P4/mpconfigvariant_P4EMU.cmake`:
-  `SDKCONFIG_DEFAULTS = boards/sdkconfig.p4 + ~/mpywork/sdkconfig.p4emu`,
-  board name `Generic ESP32P4 (rv32emu, ECO5, no PSRAM)`.
-- `~/mpywork/sdkconfig.p4emu`: ECO5 v3.0 headers (base `sdkconfig.p4`
-  already sets `REV_MIN_300`; this file keeps it and unsets PSRAM /
-  hosted / wifi-remote — the slave-target Kconfig only resolves in a
-  shell with `ESP_IDF_VERSION=5.5` exported, otherwise
-  `esp_hosted` fails with `Unknown Slave Target`).
-
-Build with the mp-y IDF env (`IDF_PATH`, `IDF_VERSION=5.5`,
-`IDF_PYTHON_ENV_PATH`, `IDF_TOOLS_PATH`, riscv toolchain on `PATH`):
+Upstream MicroPython v1.29.0, no tree changes needed except the
+`P4EMU` board variant: `ports/esp32/boards/ESP32_GENERIC_P4/
+mpconfigvariant_P4EMU.cmake` (in the micropython tree) plus
+`~/mpywork/sdkconfig.p4emu` (ECO5 v3.0 headers, no PSRAM / hosted /
+wifi-remote; the slave-target Kconfig only resolves with
+`ESP_IDF_VERSION=5.5` exported). One-command rebuild + merge:
 
 ```sh
-make -C ~/micropython/ports/esp32 BOARD=ESP32_GENERIC_P4 BOARD_VARIANT=P4EMU -j$(nproc)
-# merge + pad to 16 MB:
-esptool.py --chip esp32p4 merge_bin -o /tmp/mpy_p4emu_16.bin \
-  --flash_mode dio --flash_size 16MB \
-  0x2000 build-.../bootloader/bootloader.bin \
-  0x8000 build-.../partition_table/partition-table.bin \
-  0x10000 build-.../micropython.bin
-python3 -c "img=bytearray(b'\xff'*16777216);raw=open('/tmp/mpy_p4emu_16.bin','rb').read();img[:len(raw)]=raw;open('/tmp/mpy_p4emu_16.bin','r+b').write(img)"
+tools/build-mpy-p4emu.sh   # -> /tmp/mpy_p4emu_16.bin (16 MB, 0xFF-padded)
 node run_p4.js /tmp/mpy_p4emu_16.bin "-C esp32p4smp -F /merged.bin"
 ```
 
