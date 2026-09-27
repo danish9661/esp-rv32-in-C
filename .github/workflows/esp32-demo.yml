@@ -93,6 +93,24 @@ jobs:
         run: |
           timeout 120 node run_c6.js demo/system/esp32c6/demotest.ino.merged.bin > /tmp/esp_gate_c6.log 2>&1 || true
           grep -a "DEMO_DONE" /tmp/esp_gate_c6.log
+      - name: Gate headless (node, H2 hello)
+        run: |
+          timeout 120 node run_h2.js demo/system/esp32h2/h2hello.ino.merged.bin > /tmp/esp_gate_h2.log 2>&1 || true
+          grep -a "HELLO_UART_OK" /tmp/esp_gate_h2.log
+      - name: Gate headless (node, P4 unicore hello)
+        run: |
+          timeout 150 node run_p4.js demo/system/esp32p4/p4hello.ino.patched.bin > /tmp/esp_gate_p4.log 2>&1 || true
+          grep -a "HELLO_UART_OK" /tmp/esp_gate_p4.log
+      - name: Gate headless (node, C6 I2S/GDMA)
+        run: |
+          timeout 120 node run_c6.js demo/system/i2sgdma/i2sgdma.ino.merged.bin > /tmp/esp_gate_i2s.log 2>&1 || true
+          grep -a "TX_EOF=1" /tmp/esp_gate_i2s.log
+      - name: Gate headless (node, C3 blink boots to entry)
+        # Silent blink by design (no UART marker); gate on the entry
+        # line. DBG flood is compiled out, so the log stays small.
+        run: |
+          timeout 100 node run_c3.js demo/system/esp32c3/esp32test.ino.merged.bin > /tmp/esp_gate_c3.log 2>&1 || true
+          grep -a "entry 0x403cbf10" /tmp/esp_gate_c3.log
       - name: Stage ESP web UI
         # prepare-web copies the bundle + HTML + xterm, but also the stale
         # Linux payload (Image/rootfs.cpio, 34 MB) and every committed

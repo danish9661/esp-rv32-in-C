@@ -180,31 +180,29 @@ static void esp32_sha_feed_block_be(const uint32_t *le_words, int first)
     esp32_sha_compress(be, sha_h);
 }
 
-/* ECO5-ABI SHA session (slots 608/614/620/624/628, all valid HP bodies
- * called through the bootloader's jr-t1 table — the slot hooks route
- * them here per execution): emulates the documented ROM behavior
- * host-side against the CALLER's ctx buffer. The TRUE ECO5 layout is
- * rom/sha.h SHA_CTX (corrected 2026-09-26; the old tot@+0/state@+4/
- * buf@+36/blen@+100 map was the BASE-ABI guess and hashed garbage):
- * start bool @+0, in_hardware bool @+1, type enum @+4, state[16] u32
- * @+8, buffer[128] u8 @+72, total_bits[4] u32 @+200. The disassembly
- * PROVES it: update loads tot@+200 and buf-off@+204, derives the
- * buffer pointer as ctx+72 (addi x24,x8,72) and the block engine as
- * the SHA peripheral; for SHA2-256 only state[0..8] + buffer[0..64]
- * matter (total_bits[0] @+200 counts BYTES: +3/add pattern per call
- * with blen chaining, finish pads from tot*8).
+/* Per-ctx SHA session for the hooked slots 608/614/620/624/628 (the
+ * bootloader calls them through a function-pointer table landing on
+ * the SLOT addrs, so the valid HP bodies never execute under the
+ * emulator): emulates the documented ROM behavior host-side against
+ * the CALLER's ctx buffer. Layout is rom/sha.h SHA_CTX: start bool
+ * @+0, in_hardware bool @+1, type enum @+4, state[16] u32 @+8,
+ * buffer[128] u8 @+72, total_bits[4] u32 @+200 (verified against the
+ * disassembly: update loads tot@+200 and buf-off@+204, derives the
+ * buffer pointer as ctx+72; for SHA2-256 only state[0..8] +
+ * buffer[0..64] matter, total_bits[0] @+200 counts BYTES, finish pads
+ * from tot*8).
  *  - enable/init(ctx): reset tot/state/buf state.
  *  - update(ctx, data, len): append bytes; full 64 B blocks compress
- *    immediately through the SHA block model (START first, CONTINUE
- *    chained); partial tail stays in ctx->buffer.
+ *    immediately (START first, CONTINUE chained); partial tail stays
+ *    in ctx->buffer.
  *  - finish(ctx, digest): FIPS-180 pad of tot into fresh block(s),
  *    compress, write 32 digest bytes big-endian; then reset tot so
  *    a repeated finish does not double-count (ROM finish is repeatable).
- * NOTE (corrected 2026-09-26): the old comment claimed ECO5 bodies run
- * natively via MMIO — they do NOT under the emulator: the slot hooks
- * fire first (rv->PC == slot on entry) and return ECALL before the JAL
- * body ever executes. So update/finish MUST be served here, or the
- * ctx stays empty and every image hash mismatches. */
+ * NOTE: the slot bodies are valid HP code, but they never execute
+ * here — the live-gated ifetch hook fires first (rv->PC == slot on
+ * entry) and returns ECALL before the slot JAL runs. So update/finish
+ * MUST be served by this session, or the ctx stays empty and every
+ * image hash mismatches. */
 static void p4_sha_ctx_init(esp32p4_t *soc, uint32_t ctx)
 {
     uint8_t *p = esp32p4_guest_to_host(soc, ctx);
@@ -273,12 +271,6 @@ static void p4_sha_ctx_finish(esp32p4_t *soc, uint32_t ctx, uint32_t digest)
     memcpy(&blen, p + 204, 4);
     if (blen > 64)
         blen = tot % 64;
-    /* tot counts the header word + segment data already fed; the SHAGUARD
-     * digest address sits INSIDE the hashed region for Arduino (digest
-     * 0x4ffbcc24 within segments[0] metadata), so digest bytes written
-     * by an earlier finish would corrupt a later hash. The ROM avoids
-     * this by hashing the header BEFORE any digest exists... except the
-     * SHAGUARD skip already handles Arduino. */
     uint64_t bitlen = (uint64_t) tot * 8u;
     uint32_t tail_len = blen;
     uint32_t tot_pad = tail_len + 1u + 8u;
@@ -315,68 +307,11 @@ static void p4_sha_ctx_finish(esp32p4_t *soc, uint32_t ctx, uint32_t digest)
     }
 }
 
-static void p4_sha_session_reset(void) __attribute__((unused));
-static void p4_sha_session_reset(void)
-{
-    esp32_sha_reset();
-}
-
-static void p4_sha_session_feed(esp32p4_t *soc, uint32_t addr, uint32_t len)
-    __attribute__((unused));
-static void p4_sha_session_feed(esp32p4_t *soc, uint32_t addr, uint32_t len)
-{
-    for (uint32_t i = 0; i < len; i++) {
-        uint8_t *b = esp32p4_guest_to_host(soc, addr + i);
-        if (!b)
-            continue;
-        if (sha_len + 1 <= sizeof(sha_msg))
-            sha_msg[sha_len++] = *b;
-        sha_msg_len++;
-    }
-}
-
-static void p4_sha_session_finish(esp32p4_t *soc, uint32_t digest)
-    __attribute__((unused));
-static void p4_sha_session_finish(esp32p4_t *soc, uint32_t digest)
-{
-    /* FIPS-180 padding over a COPY of the running state (session length
-     * = sha_msg_len; fed full blocks already compressed into sha_h). */
-    uint32_t full = (sha_msg_len / 64u) * 64u;
-    uint32_t tail_len = sha_msg_len - full;
-    uint64_t bitlen = (uint64_t) sha_msg_len * 8u;
-    uint32_t tot = tail_len + 1u + 8u;
-    uint32_t nblocks = (tot + 63u) / 64u;
-    uint8_t tail[128];
-    for (uint32_t i = 0; i < tail_len; i++)
-        tail[i] = sha_msg[full + i];
-    tail[tail_len] = 0x80u;
-    for (uint32_t i = tail_len + 1; i < nblocks * 64u - 8u; i++)
-        tail[i] = 0x00u;
-    for (int i = 7; i >= 0; i--)
-        tail[nblocks * 64u - 8u + (7 - i)] = (bitlen >> (8 * i)) & 0xFFu;
-    uint32_t h[8];
-    for (int i = 0; i < 8; i++)
-        h[i] = sha_h[i];
-    for (uint32_t o = 0; o < nblocks * 64u; o += 64) {
-        uint32_t be[16];
-        for (int i = 0; i < 16; i++)
-            be[i] = ((uint32_t) tail[o + 4 * i] << 24) |
-                    ((uint32_t) tail[o + 4 * i + 1] << 16) |
-                    ((uint32_t) tail[o + 4 * i + 2] << 8) |
-                    tail[o + 4 * i + 3];
-        esp32_sha_compress(be, h);
-    }
-
-    for (int i = 0; i < 8; i++) {
-        uint8_t *dp = esp32p4_guest_to_host(soc, digest + i * 4u);
-        if (dp) {
-            dp[0] = (h[i] >> 24) & 0xFFu;
-            dp[1] = (h[i] >> 16) & 0xFFu;
-            dp[2] = (h[i] >> 8) & 0xFFu;
-            dp[3] = h[i] & 0xFFu;
-        }
-    }
-}
+/* MMIO SHA-block path (see the +0x89000 handler below): the ROM bodies
+ * that run NATIVELY (cache/MMU helpers, plus any swallowed slot call)
+ * drive START/CONTINUE compression through esp32_sha_feed_block_be and
+ * read the digest via esp32_sha_digest_word. The per-ctx session above
+ * is the path the hooked slots (608/614/620/624/628) use. */
 
 static uint32_t esp32_sha_digest_word(unsigned idx)
 {
@@ -897,13 +832,12 @@ esp32p4_t *esp32p4_new(void)
     assert(soc->rom);
     assert(esp32p4_rom_bin_len <= P4_ROM_SIZE);
     memcpy(soc->rom, esp32p4_rom_bin, esp32p4_rom_bin_len);
-    /* ROM slots stay as dumped (dual-ABI note above): no rewrite.
-     * (An earlier draft patched LP-stub slot words to ECALL in the
-     * rom copy; REVERTED: the aliased ROM region is RAM-typed, so a
-     * guest memset over the slot range can restore the JAL and the
-     * two views diverge. Live-gated ifetch hooks + the PC-dispatched
-     * ecall handler below cover these slots on every execution
-     * instead.) */
+    /* ROM slots stay as dumped: no rewrite. (An earlier draft patched
+     * slot words to ECALL in the rom copy; REVERTED: the aliased ROM
+     * region is RAM-typed, so a guest memset over the slot range can
+     * restore the JAL and the two views diverge. Live-gated ifetch
+     * hooks + the PC-dispatched ecall handler below cover these slots
+     * on every execution instead.) */
 
     /* The 128KB mask ROM is linked at 0x4FC00000 (all ROM API symbols and
      * position-dependent startup code use that view; the HP core resets
@@ -1067,22 +1001,19 @@ void esp32p4_smp_poll(riscv_t *rv)
 }
 
 /* ------------------------------------------------------------------ */
-/* ROM ABI note: TWO firmware ABIs share the 0x4fc005e0..0x4fc00634 slot
- * range (verified from the linked ELF symtabs + the real 128 KB dump):
- *  - ECO5 table (Arduino prebuilt libs AND current IDF v5.5.4 builds):
- *    MD5Init 5E0 / MD5Update 5E4 / MD5Final 5E8, crc32_le 5EC, sha
- *    enable 608 / init 614 / update 620 / finish 624 / clone 628.
- *    All these slot JALs land in valid in-dump HP bodies.
- *  - The pre-ECO5 BASE table (old comment, kept for history) had MD5
- *    at 5EC/5F0/5F4 and SHA at 614..634; nothing in the tree targets
- *    it anymore.
+/* ROM ABI note: the ECO5 table (Arduino prebuilt libs AND current IDF
+ * v5.5.4 builds) lives at slots 0x4fc005e0..0x4fc00628 (verified from
+ * the linked ELF symtabs + the real 128 KB dump):
+ * MD5Init 5E0 / MD5Update 5E4 / MD5Final 5E8, crc32_le 5EC, sha
+ * enable 608 / init 614 / update 620 / finish 624 / clone 628.
+ * All these slot JALs land in valid in-dump HP bodies.
  * The slots are NEVER rewritten (a remap was tried and reverted).
- * MD5Update/Final bodies + the LP-stub SHA group trap in ifetch and
- * run the host ports below (execution-gated: rv->PC check is
- * load-bearing, translate-time fetches carry garbage regs). Host SHA
- * session helpers (p4_sha_session_*) serve the SHA group; the MMIO
- * SHA block model (START/CONTINUE compression) serves bodies that run
- * natively. */
+ * The SHA bodies would run natively through the MMIO SHA block below
+ * (START/CONTINUE compression), but the slot hooks fire first so the
+ * session above serves them instead; the MD5 bodies use F-extension
+ * load/store encodings rv32emu rejects, so MD5Update/Final trap in
+ * ifetch (live rv->PC gate — load-bearing, translate-time fetches
+ * carry garbage regs) and run the host ports below. */
 /* One MD5 64-byte block transform (RFC 1321). Input bytes load
  * little-endian (the ROM's byteReverse(in,16) is a no-op on LE hosts:
  * it writes back the LE word that was already there). */
@@ -1158,10 +1089,11 @@ static uint32_t p4_crc32_le(uint32_t crc, const uint8_t *buf, uint32_t len)
 }
 
 /* Host MD5 (esp_rom_md5 port, linux/esp_rom_md5.c): used for MD5Update +
- * MD5Final, whose in-dump bodies die on illegal words mid-body. MD5Init
- * runs natively (prologue-only: writes IV constants, returns). Guest
- * MD5Context layout (rom/md5_hash.h): buf[4] @+0, bits[2] @+16, in[64]
- * @+24. ifetch routes body entry PCs here and returns RET. */
+ * MD5Final, whose in-dump bodies call into shared ROM helpers the
+ * emulator cannot run to completion. MD5Init runs natively
+ * (prologue-only: writes IV constants, returns). Guest MD5Context
+ * layout (rom/md5_hash.h): buf[4] @+0, bits[2] @+16, in[64] @+24.
+ * ifetch routes body entry PCs here and returns RET. */
 void p4_md5_update_pub(esp32p4_t *soc, uint32_t ctx, uint32_t buf,
                         uint32_t len)
 {
@@ -1312,12 +1244,9 @@ void p4_md5_final_pub(esp32p4_t *soc, uint32_t digest, uint32_t ctx)
     memcpy(dp, p, 16);
 }
 
-/* ROM ABI note (corrected 2026-09-26): the CURRENT rom.ld/ELF symtab
- * puts BOTH ABIs on the ECO5 table (MD5Init 5E0 / Update 5E4 / Final
- * 5E8, crc32_le 5EC, sha enable 608 / init 614 / update 620 / finish
- * 624 / clone 628; slot JALs verified in the real 128 KB dump). The
- * old "BASE 5EC = MD5Init" comment described a pre-ECO5 table nothing
- * targets anymore. The slots are NEVER rewritten (tried, reverted).
+/* Slot map: ECO5 table (MD5Init 5E0 / Update 5E4 / Final 5E8,
+ * crc32_le 5EC, sha 608/614/620/624/628; verified in the 128 KB dump).
+ * MD5Init runs natively (prologue-only: writes IV constants, returns).
  */
 #define UART_FIFO_REG 0x00u
 #define UART_INT_RAW_REG 0x04u
@@ -1381,7 +1310,9 @@ static void esp32p4_spi2_complete(riscv_t *rv, esp32p4_t *soc)
 {
     (void) rv;
     /* SPI2 transfer completion: cmd.usr was set. The virtual device
-     * (a 16-byte SRAM, JEDEC ID 0xEF4015, echo fallback) decodes the TX
+     * (a 16-byte SRAM, JEDEC ID EF 40 15, echo fallback — this is the
+     * GPSPI peripheral model, deliberately different from the flash
+     * RDID EF 40 18: different bus, different chip) decodes the TX
      * bytes and shifts its response back. TX source: DMA OUT descriptor
      * chain when dma_tx_ena (bit 28 of DMA_CONF 0x30), else the CPU data
      * buffer at 0x98. RX always lands in the CPU data buffer and is
@@ -4486,12 +4417,9 @@ void esp32p4_write_b(riscv_t *rv, uint32_t addr, uint8_t val)
 
 /* Route a guest PC to its backing bytes for instruction fetch.
  * Hooks (execution-gated by rv->PC == addr, see below) run host ports of
- * ROM calls whose in-dump bodies die on illegal words or chase LP stubs:
- * ets_delay_us skip, esp_rom_spiflash_read, cache-control nops,
- * MD5Update/Final, and the BASE-ABI SHA group. ECO5-ABI callers (Arduino)
- * hit the same slot addresses for MD5; MD5 bodies alias so one hook set
- * serves both. SHA collides (620/624/628 differ per ABI) — see the hook
- * comment for the split.
+ * ROM calls the guest cannot execute itself: ets_delay_us skip,
+ * esp_rom_spiflash_read, cache-control nops, MD5Update/Final (whose
+ * bodies use F-extension encodings rv32emu rejects).
  *  - 0x4fc0b2c8 (ROM abort spin: zeros where a jal target decodes as
  *    illegal) and 0x4ffc0000 (the "invalid header" recovery landing pad):
  *    return a tight `j .` (0xa001) so the guest spins instead of killing
@@ -4518,26 +4446,24 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
      * the hook fires then, terminating the block with RET). */
     bool live = (rv->PC == addr);
     /* ROM ets_delay_us SLOT (0x4fc0003c, per esp32p4.rom.ld) and BODY
-     * (0x4fc012f8: MCYCLE spin `mul a0,us,factor; csrr a4,mcycle; csrr
-     * a5,mcycle; sub; bltu loop`): the emulator's MCYCLE advances
-     * ~3/step, so a 9000us delay needs ~10M steps (~1hr wall). Skip it:
-     * set PC = ra (a0 arg ignored; delay is a nop). BOTH addrs must
-     * hook: the slot JALs to an LP stub (unmapped 0x4fb0xxxx) so the
-     * body addr is only reached by callers using the body addr
+     * (0x4fc012f8). The body is a long MCYCLE spin (`mul a0,us,factor;
+     * csrr a4,mcycle; csrr a5,mcycle; sub; bltu loop`): the emulator's
+     * MCYCLE advances ~3/step, so a 9000us delay needs ~10M steps
+     * (~1hr wall). Skip it: set PC = ra (a0 arg ignored; delay is a
+     * nop). Hook BOTH addrs: callers use the slot and the body addr
      * directly; missing the slot wedges MPY app boot in a delay loop
      * (observed: app poll loop at 0x4000752e calling the slot with
-     * a0=100, native LP fetch spinning forever at 0x4fc01312). */
+     * a0=100). */
     if ((addr == 0x4fc0003cu || addr == 0x4fc012f8u) && live) {
         rv->PC = rv->X[1];
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
     }
     /* ROM ets_get_cpu_frequency SLOT (0x4fc00040, per esp32p4.rom.ld):
-     * JALs to an LP stub (unmapped 0x4fb0xxxx); returns the CPU clock in
-     * Hz (uint32_t, no args). Model: 360 MHz (matches the forced
-     * 0x4ffbff90 delay factor and the actual HP-core rate). Without it
-     * the MPY app wedges in a poll loop calling the slot with a0=100
-     * (observed pc=0x4fc00400 native spin). */
+     * returns the CPU clock in Hz (uint32_t, no args). Model: 360 MHz
+     * (matches the forced 0x4ffbff90 delay factor and the actual HP-core
+     * rate). Without it the MPY app wedges in a poll loop calling the
+     * slot with a0=100. */
     if (addr == 0x4fc00040u && live) {
         rv->X[10] = 360000000u;
         rv->PC = rv->X[1];
@@ -4581,8 +4507,8 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         p4_md5_ecall = true;
         return 0x00000073u; /* ecall (block-terminal) */
     }
-    /* ROM early-boot slots that JAL to LP stubs (unmapped 0x4fb0xxxx)
-     * and must return immediately (model: instant/nop/constant).
+    /* ROM early-boot slots that must return immediately
+     * (model: instant/nop/constant).
      * Covered on BOTH paths: live-gated ifetch hook here AND a
      * PC-dispatched case in esp32p4_ecall_handler (a first-visit slot
      * block can translate + chain before the hook fires live).
@@ -4609,38 +4535,29 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
             return 0x00000073u; /* ecall (block-terminal) */
         }
     }
-    /* BASE MD5Init slot (0x4FC005E0 in the CURRENT rom.ld/ELF symtab;
-     * JALs to the 0x4fc06e92 body). The guest MD5Context layout
+    /* MD5Init slot (0x4FC005E0; JALs to the 0x4fc06e92 body, which just
+     * writes the IV constants). The guest MD5Context layout
      * (rom/md5_hash.h): buf[4] @+0, bits[2] @+16, in[64] @+24.
      * MARK-ONLY (no flag, no PC touch); esp32p4_ecall_handler writes
      * the IV + zero bitcount with live regs and returns (PC=ra).
-     * ABI COLLISION (stale note corrected 2026-09-26): the CURRENT
-     * symtab puts BOTH ABIs' MD5Init at 5E0 and crc32_le at 5EC —
-     * the old "BASE 5EC = MD5Init" comment described a pre-ECO5 table.
-     * So: 5EC is crc32_le for MPY too, and the handler computes the
-     * real CRC host-side unconditionally (a stub breaks OTA slot
-     * selection: both app slots report invalid magic). */
+     * crc32_le (0x4FC005EC) is a separate slot: MARK-ONLY; the
+     * handler computes the real CRC host-side unconditionally (a stub
+     * breaks OTA slot selection: both app slots report invalid
+     * magic). */
     if (addr == 0x4FC005E0u && live) {
         return 0x00000073u; /* ecall (block-terminal; handler runs it) */
     }
     /* crc32_le slot (0x4FC005EC in the CURRENT symtab, both ABIs):
      * MARK-ONLY; the handler computes the real CRC host-side. */
-    /* ROM libgcc bit-scan slots (ECO5 + BASE ABIs share these addrs —
-     * PROVEN 2026-09-19 from both ELF symtabs + .ld files: BASE puts
-     * __clzsi2/__ffssi2 at 0x4fc00770/0x4fc007a0, ECO5 puts __ctzsi2/
-     * __fixsfdi at the SAME addrs). The ROM bodies die natively: the
-     * dump decodes to F-extension words (fmv.w.x/flt.s/fneg.s lead at
-     * both 0x4fc14030 and 0x4fc14fb0) which rv32emu rejects as illegal,
-     * so the guest traps instead of computing. Every tlsf_create/add/
-     * malloc maps sizes through these slots — dead slots = all pools
-     * report empty = malloc returns 0 (the esp_libc_init abort, then
-     * the VFS-nullfs 0x101 abort). Host ports (libgcc ABI):
-     * __clzsi2 = clz(v), 32 if v == 0; __ffssi2 = ctz(v)+1 (1-based,
-     * same as POSIX ffs; tlsf_ffs does __builtin_ffs(w)-1 for 0-based).
-     * NOTE on the shared slot: clz and ctz differ in general, but the
-     * ECO5 ABI only calls 0x4fc00770 as ctz in float-convert paths the
-     * guests never execute (Arduino boots green with the clz port);
-     * the slot's live callers (tlsf in both ABIs) need clz here. */
+    /* ROM libgcc bit-scan slots (both firmware ABIs call 0x4fc00770 as
+     * __clzsi2 and 0x4fc007a0 as __ffssi2, per the ELF symtabs + .ld
+     * files). Skip model-side decoding claims: serve them as host ports
+     * (libgcc ABI): __clzsi2 = clz(v), 32 if v == 0; __ffssi2 =
+     * ctz(v)+1 (1-based, same as POSIX ffs; tlsf_ffs does
+     * __builtin_ffs(w)-1 for 0-based). Every tlsf_create/add/malloc
+     * maps sizes through these slots — dead slots mean all pools
+     * report empty and malloc returns 0 (the esp_libc_init abort, then
+     * the VFS-nullfs 0x101 abort). */
     if ((addr == 0x4fc00770u || addr == 0x4fc007a0u) && live) {
         uint32_t v = rv->X[10];
         if (addr == 0x4fc00770u)
@@ -4698,7 +4615,8 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
     /* ROM cache/MMU control (used by the bootloader around MMU remap
      * and by esp_flash paths): the model is write-through with no caches
      * and programs the MMU table directly, so all of these are nops — but
-     * they must RETURN (bodies chase LP stubs/illegals in the dump).
+     * they must RETURN (else the guest falls into ROM padding/illegal
+     * words and faults).
      * Covers Disable/Enable for CORE0/CORE1 ICache, DCache, L2, plus
      * Invalidate_Addr/WriteBack_All bodies, the L2 suspend/enable pair
      * and Cache_FLASH_MMU_Set_Secure (the MMU entries are already in
@@ -4725,15 +4643,21 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
      * SET in the cache-control read path) so they terminate. */
     /* MD5 bodies (slot JALs verified in the real dump): Update body
      * 0x4fc06ec4 (via slot 5E4), Final body 0x4fc06f8c (via slot 5E8).
-     * Slots 5F0/5F4 are crc16_le/crc8_le (NOT MD5 — the old comment
-     * misread the symtab); hooking them as MD5 would corrupt CRC calls,
-     * so only the true MD5 slots + bodies mark here.
-     * ECO5 SHA group: enable 608 / init 614 / update 620 / finish 624
-     * / clone 628 — all valid HP bodies (verified JAL targets above),
-     * EXCEPT the bootloader calls them through a function-pointer
-     * table (jr t1: `jr -1716(t1) # 4fc00620`), which the slot hooks
-     * below already cover on every execution. The per-ctx SHA session
-     * (init/feed/finish/clone) serves them.
+     * Slots 5F0/5F4 are crc16_le/crc8_le (NOT MD5); hooking them as
+     * MD5 would corrupt CRC calls, so only the true MD5 slots +
+     * bodies mark here. The bodies call into shared ROM helpers
+     * (jal x5 to the 0x4fc19xxx range) that the emulator cannot run
+     * to completion, so the MARK-ONLY hook routes them to the host
+     * ports instead.
+     * ECO5 SHA group (slot JALs verified in the real dump: enable
+     * 608 -> 0x4fc04576, init 614 -> 0x4fc04640, update 620 ->
+     * 0x4fc0484a, finish 624 -> 0x4fc04940, clone 628 -> 0x4fc04760).
+     * The bootloader calls them through a function-pointer table
+     * (jr t1), landing on the SLOT addrs, which this hook routes to
+     * the handler per execution: init resets the caller ctx, update
+     * feeds (ctx, data, len), finish writes the digest to the caller
+     * buffer (+ SHAGUARD below), clone copies the 216 B ctx. enable
+     * is a HW-clock nop (its body touches only clock regs).
      * MARK-ONLY here (no flag, no PC touch); the host logic runs in
      * esp32p4_ecall_handler, dispatched on the live rv->PC at execution
      * time (per execution, live regs). Rationale: ifetch-time X[] hold
@@ -4747,16 +4671,7 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
                  addr == 0x4FC00624u || addr == 0x4FC00628u)) {
         return 0x00000073u; /* ecall (block-terminal; handler runs it) */
     }
-    /* ECO5 SHA group (slot JALs verified in the real dump: enable 608
-     * -> 0x4fc04576, init 614 -> 0x4fc04640, update 620 -> 0x4fc0484a,
-     * finish 624 -> 0x4fc04940, clone 628 -> 0x4fc04760; all valid HP
-     * bodies). The bootloader calls them through a function-pointer
-     * table (jr t1), landing on the SLOT addrs, which the mark-only
-     * hook above already routes to the handler per execution. The
-     * handler (below) feeds/finishes the per-ctx host SHA session.
-     * update = feed(ctx, data, len); finish = digest to caller buffer
-     * (+ SHAGUARD for the Arduino in-place header hash); clone = 216 B
-     * ctx copy. enable is a HW-clock nop; init resets the caller ctx. */
+    /* (SHA slot map: see the MARK-ONLY hook above.) */
     /* 0x4fc0b2c8: ROM abort spin slot (a zero word where a jal target
      * decodes as illegal). Return a tight `j .` so a guest that gets here
      * spins instead of killing block translation. */
@@ -4936,16 +4851,16 @@ void esp32p4_ecall_handler(riscv_t *rv)
         rv->X[10] = 0;
         break;
     case 0x4FC00624u: /* ets_sha_finish(ctx, digest) + SHAGUARD */
-        /* SHAGUARD (Arduino ONLY): the Arduino bootloader hashes the app
-         * image header IN PLACE with digest 0x4ffbcc24 inside
-         * segments[0]'s metadata at 0x4ffbcc0c — writing would clobber
-         * segments[0] BEFORE the loader reads it ("Segment 0 load
-         * address 0x42c4b0e3"). The digest is only compared against
-         * flash, never consumed from RAM here, so skip the write and
-         * return success. Gate on the exact Arduino address (NOT a
-         * 64 B-overlap range test: MPY's digest 0x04fbcba0 is 32 B
-         * below its hashed header and MUST be written, or every image
-         * hash mismatches). */
+        /* SHAGUARD: one legacy Arduino bootloader hashed the app image
+         * header IN PLACE with the digest buffer (0x4ffbcc24) inside
+         * segments[0]'s own metadata (0x4ffbcc0c) — writing the digest
+         * clobbered segments[0] BEFORE the loader read it ("Segment 0
+         * load address 0x42c4b0e3"). The digest is only compared
+         * against flash, never consumed from RAM here, so skip the
+         * write for that exact address and return success. Both
+         * current images digest elsewhere (Arduino + MPY use
+         * 0x4ffbcba0, 32 B below the hashed header) and take the
+         * normal write path — the gate is a no-op for them. */
         if (rv->X[11] == 0x4ffbcc24u) {
             fprintf(stderr, "[SHAGUARD] skip digest write to %08x\n",
                     rv->X[11]);

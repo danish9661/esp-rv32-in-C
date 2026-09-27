@@ -987,3 +987,36 @@ rv32emu's interpreter with full ISA + softfloat is ~5 MB code.
 - rv32emu wasm docs: docs/wasm.md (in repo)
 - Espressif QEMU fork (alternative for real firmware): https://github.com/espressif/qemu
 - ESP32-P4 datasheet (RV32IMAFC, Zc, XespV): documentation.espressif.com
+
+## 2026-09-27 session (P4EMU → SMP runs; docs + comment audit)
+
+- P4EMU MPY variant: `ESP32_GENERIC_P4` + `P4EMU` variant files live
+  OUTSIDE this repo (`~/micropython/.../mpconfigvariant_P4EMU.cmake`,
+  `~/mpywork/sdkconfig.p4emu`); build needs `ESP_IDF_VERSION=5.5` in
+  the environment or `esp_hosted` dies with `Unknown Slave Target`.
+  Merge + pad recipe in `docs/esp32-p4.md`. 16 MB image NOT committed
+  (ephemeral `/tmp/mpy_p4emu_16.bin`); current P4EMU headers are
+  [300..399], matching eFuse report `0x30` (CHIP v3.0).
+- Emulator fixes (all WASM-verified, node): SMP 256-block quantum +
+  lr_valid hart pin (bound 512) — fixes `esp_cpu_compare_and_set`
+  livelock; CLIC word-write W1C for IP-clear — fixes id-21 storm from
+  SDK RMW config; flash RDID `EF 40 18` (16 MB) — fixes SMP
+  size-vs-header probe fail. Arduino P4 + P4-SMP HELLO, C6 DEMO_DONE,
+  H2 HELLO green after each change.
+- Slot-map truth (real 128 KB dump, single ECO5 table): MD5Init 5E0,
+  crc32 5EC, SHA 608/614/620/624/628; 5F0/5F4 are crc16/8 (never MD5).
+  Init slot 614 was missing from the mark list (handler case existed
+  but unreachable) — every digest hashed from zeroed state until fixed.
+- Stale-theory sweep: removed all BASE-table / LP-stub / illegal-word
+  comments from `src/esp32p4.c`; rewrote `docs/esp32-p4.md` (status
+  2026-09-27, P4EMU recipe, ECO5-only hooks, open work = MPY→REPL).
+  SHAGUARD comment reworded (gate is legacy-only; current digests at
+  `0x4ffbcba0` take the write path). Deleted dead
+  `p4_sha_session_*` (global-MMIO session superseded by per-ctx
+  session + native MMIO block path).
+- `HANDOVER_P4_SEG0_2026-09-15.md` is SUPERSEDED (segment-mismatch era;
+  current images boot). `AGENT.md` remains the live handover; this
+  `AGENTS.md` entry is the commit record.
+- MPY SMP status: both harts reach app code (no cas-stuck), 280 s runs
+  end silent after `entry 0x4ffac2c0`. Next: `s_cpu_up` handoff →
+  clock init → REPL → `print(6*7)` → protocol matrix.
