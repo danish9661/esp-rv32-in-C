@@ -653,6 +653,7 @@ struct esp32p4_soc {
     uint32_t appcpu_boot_addr;
     uint8_t smp_enabled;
     unsigned long smp_toggle;
+    unsigned smp_lr_pin; /* bound on lr_valid hart-pinning (above) */
     /* LP_PERI (LPPERI, 0x50120000): clk_en @+0x0 (ck_en_lp_i2cmst=27,
      * reset default 1), reset_en @+0x4. Plain read-back storage with
      * reset defaults so clock-gate polls see enabled bits. */
@@ -1027,7 +1028,26 @@ riscv_t *esp32p4_smp_target(riscv_t *rv)
      * Sync h1 forward whenever it lags (never backward). */
     if (h1->csr_cycle < h0->csr_cycle)
         h1->csr_cycle = h0->csr_cycle;
-    return (soc->smp_toggle++ & 1) ? h1 : h0;
+    /* Quantum, not per-block alternation: each hart runs 256 blocks
+     * before switching. Per-block alternation deterministically
+     * livelocks LR/SC spinlocks when both harts contend (each breaks
+     * the other's reservation every block; real HW resolves by timing
+     * jitter). A quantum lets lock holders finish critical sections.
+     * 256 blocks is short enough that tick/IPI latency stays sane.
+     * LR/SC atomicity: a hart with a live reservation (lr_valid) is
+     * NEVER preempted — the paired sc must execute before any other
+     * hart (or handler) can store to the guarded word. Without this,
+     * the switch between the lr-block and the sc-block lets the other
+     * hart store first, failing every sc (observed: hart0 stuck in
+     * esp_cpu_compare_and_set with cur=0 vs lrval for 12B cycles).
+     * Bound it (512 switches) so a hart spinning INSIDE lr..sc with
+     * interrupts disabled can't starve the other hart forever. */
+    if (rv->lr_valid && soc->smp_lr_pin < 512) {
+        soc->smp_lr_pin++;
+        return rv;
+    }
+    soc->smp_lr_pin = 0;
+    return ((soc->smp_toggle++ >> 8) & 1) ? h1 : h0;
 }
 
 /* Advance shared peripherals once, then deliver pending interrupts to
@@ -2074,6 +2094,12 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
                 hw_ip = !!(soc->clint_mtimcmp[h] &&
                            soc->clint_mtime >= soc->clint_mtimcmp[h]);
             }
+            /* HW pending (level source via INTMTX, or CLINT) always
+             * reads live: the SW ip bit is ORed in, but a set HW line
+             * reads 1 even if SW was cleared (and vice versa). This
+             * matters for RMW config (esprv_int_set_vectored): the
+             * read must reflect the HW line, not a stale SW latch,
+             * or the write-back re-pends a dead interrupt forever. */
             if (hw_ip || soc->clic_ip_sw[h][id])
                 v |= 1u;
             if (soc->clic_ie[h][id])
@@ -2991,8 +3017,16 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             unsigned id = (addr - 0x20801000u) >> 2;
             unsigned sub = (addr - 0x20801000u) & 3u;
             if (size == 4 && sub == 0) {
-                /* word write updates all four byte-fields at once */
-                soc->clic_ip_sw[h][id] = (val & 0x1u) ? 1u : 0u;
+                /* word write updates all four byte-fields at once.
+                 * CLIC IP is W1C for the clear direction: a 0 bit
+                 * clears a SW-latched pending (the SDK's RMW config
+                 * writes back whatever it read; without W1C a stale
+                 * latched 1 re-pends forever). A 1 bit does NOT
+                 * force-pend here (SW trigger goes through the
+                 * byte-write path / HW lines); it leaves SW clear.
+                 * HW lines still pend via intc_status regardless. */
+                if (!(val & 0x1u))
+                    soc->clic_ip_sw[h][id] = 0;
                 soc->clic_ie[h][id] = (val & (1u << 8)) ? 1u : 0u;
                 soc->clic_attr[h][id] = (uint8_t) ((val >> 16) & 0x7u);
                 soc->clic_ctl[h][id] = (uint8_t) (val >> 24);
@@ -4003,8 +4037,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
              * commands (WRSR/WRSR2/page-program) W holds the transmit
              * data. Receive branches clear it before filling. */
             if (cmd == 0x9Fu) {
-                /* RDID: JEDEC ID (Winbond W25Q32: 0xEF 0x40 0x16) */
-                w[0] = 0x1640EFu;
+                /* RDID: JEDEC ID. Report a 16 MB part (W25Q128-class:
+                 * EF 40 18) to match P4_FLASH_SIZE and the image
+                 * headers; a smaller ID fails the bootloader's
+                 * size-vs-header probe (esp_flash_spi_init). */
+                w[0] = 0x1840EFu;
             } else if (cmd == 0x5Au) {
                 /* SFDP: 1st 16 bytes = "SFDP" + version + table ptr */
                 static const uint8_t sfdp[16] = {
