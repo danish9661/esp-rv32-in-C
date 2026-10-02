@@ -876,9 +876,15 @@ RVOP(lrw, {
     uint32_t v = MEM_READ_W(rv, addr);
     if (ir->rd)
         rv->X[ir->rd] = v;
-    /* record reservation (value-based; see struct comment) */
+    /* record reservation (address-tagged; see struct comment) */
+    rv->lr_addr = addr;
     rv->lr_value = v;
     rv->lr_valid = true;
+    /* TEMP-MPYDIAG lr census (REMOVE with the scw census). */
+    if (addr == 0x4ff3de80u) {
+        extern void p4_lrnote(riscv_t *, uint32_t, uint32_t);
+        p4_lrnote(rv, addr, v);
+    }
 })
 
 /* SC.W: Store Conditional */
@@ -886,8 +892,17 @@ RVOP(scw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, STORE, false, 1);
     const uint32_t value = rv->X[ir->rs2];
-    uint32_t cur = MEM_READ_W(rv, addr);
-    if (rv->lr_valid && cur == rv->lr_value) {
+    /* sc succeeds iff this hart holds a live reservation for this
+     * word (address match only — a peer hart's same-value store is
+     * benign). The overlapping-peer-store invalidation in
+     * esp32p4_write_w clears the flag on a real conflicting store.
+     * TEMP-MPYDIAG sc-fail census (REMOVE): classifies every failed
+     * sc by cause — dead (flag already clear) vs waddr (live flag
+     * for a different word) — and logs the first 8 failures. */
+    if (rv->lr_valid && (rv->lr_addr & ~3u) == (addr & ~3u)) {
+        /* Own sc store also clears the PEER's reservation on the
+         * same word (it observed a changed value): route through
+         * MEM_WRITE_W so the SoC cross-hart invalidation fires. */
         MEM_WRITE_W(rv, addr, value);
         if (ir->rd)
             rv->X[ir->rd] = 0;
@@ -896,6 +911,14 @@ RVOP(scw, {
 #endif
     } else if (ir->rd) {
         rv->X[ir->rd] = 1; /* reservation lost: fail, caller retries */
+        /* TEMP-MPYDIAG sc-fail census (REMOVE with this arm): dead =
+         * flag already clear at sc entry vs waddr = live flag for a
+         * different word. */
+        {
+            extern void p4_scfail_note(riscv_t *, uint32_t, uint32_t, uint32_t);
+            p4_scfail_note(rv, addr, ir->rs2,
+                           rv->lr_valid ? 1u : 0u);
+        }
     }
     rv->lr_valid = false;
 })

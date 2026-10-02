@@ -507,9 +507,11 @@ esp32h2_t *esp32h2_new(void)
     soc->spi2_reg[0x3Cu >> 2] = H2_SPI2_TRANS_DONE_MASK;
     soc->gpio_in_prev = 0;
 
-    /* flash backing shared by the i/d-cache window */
-    uint8_t *flash = calloc(1, C6_FLASH_SIZE);
+    /* flash backing shared by the i/d-cache window. Erased flash
+     * reads 0xFF (real HW); empty checks and littlefs rely on it. */
+    uint8_t *flash = malloc(C6_FLASH_SIZE);
     assert(flash);
+    memset(flash, 0xFF, C6_FLASH_SIZE);
 
     esp32_add_region(soc, C6_SRAM_BASE, H2_SRAM_SIZE, ESP32_REG_RAM);
     esp32_add_region(soc, C6_LP_SRAM_BASE, C6_LP_SRAM_SIZE, ESP32_REG_RAM);

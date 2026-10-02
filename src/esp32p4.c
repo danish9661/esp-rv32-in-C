@@ -211,7 +211,6 @@ static void p4_sha_ctx_init(esp32p4_t *soc, uint32_t ctx)
     static const uint32_t iv[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
                                    0xa54ff53au, 0x510e527fu, 0x9b05688cu,
                                    0x1f83d9abu, 0x5be0cd19u};
-    uint32_t zero = 0;
     /* tot = 0 (total_bits[0..1] @+200, rest @+204..211 already zero
      * from init; keep the full 16 B clear), state = IV, buffer zero. */
     memset(p + 200, 0, 16);
@@ -377,6 +376,11 @@ struct esp32p4_soc {
     /* PMU_INT_RAW (0x600B015C): SOC_WAKEUP_INT_RAW (bit 31) is set when the
      * sleep timer fires so pmu_sleep_start's wakeup-wait loop exits. */
     uint32_t pmu_int_raw;
+    /* LP_TRNG read nonce: mixed into the TRNG word so consecutive reads
+     * always differ (real HW returns fresh entropy per read; the old
+     * SYSTIMER-only seed repeated for ~5 reads, zeroing the bootloader's
+     * ram_obfs_value and retrying fill_random forever). */
+    uint32_t trng_nonce;
 
     /* CLINT (0x20001800): free-running MTIME (shared) + per-hart
      * MSIP/MTIMECMP (hart1 has its own timer/IPI view for SMP). */
@@ -418,14 +422,20 @@ struct esp32p4_soc {
     /* I2C_EXT (0x60004000): register bank + SCL_RST_SLV_EN auto-clear */
     uint32_t i2c_reg[128]; /* 0x200 bytes, mirrors i2c_dev_t */
     int i2c_scl_rst_cnt;   /* reads left with SCL_RST_SLV_EN asserted */
-    int i2c_transfer_pending; /* a trans_start was written */
-    uint8_t i2c_tx_fifo[32];  /* bytes pushed to I2C_DATA before trans_start */
+    uint8_t i2c_tx_fifo[32]; /* bytes pushed to I2C_DATA (TX phase) */
     int i2c_tx_len;
-    uint8_t i2c_rx_fifo[32];  /* bytes the virtual device sent on a read */
+    uint8_t i2c_rx_fifo[32]; /* bytes the virtual device sent on a read */
     int i2c_rx_len;
     int i2c_rx_pos;
-    int i2c_slave_active;     /* transfer targets the virtual device */
-    int i2c_slave_rw;         /* 1 = read from the device, 0 = write */
+    /* Command-list executor state (the IDF i2c drivers program
+     * command[0..7] @0x58..0x74 + TX bytes to DATA @0x1C, then queue a
+     * START via CTR @0x04): byte pointer into i2c_tx_fifo, active
+     * slave phase, and a mask of command regs programmed since the
+     * last START. */
+    int i2c_exec_pending;  /* a latched command list awaits execution */
+    int i2c_cmd_ptr;       /* next TX byte consumed by a WRITE cmd */
+    int i2c_slave_active;  /* current transfer targets virtual dev 0x50 */
+    int i2c_slave_rw;      /* 1 = read phase, 0 = write phase */
     uint8_t i2c_dev_mem[16];  /* virtual EEPROM contents (address 0x50) */
     int i2c_dev_ptr;          /* current register/memory address pointer */
 
@@ -667,6 +677,21 @@ static inline int p4_intc_test(const esp32p4_t *soc, unsigned s)
     return (int) ((soc->intc_status_hi >> (s - 64u)) & 1u);
 }
 
+/* TEMP-MPYDIAG (2026-10-01): WEDGE sampler for the prvIsYieldRequiredSMP
+ * stall + XWR crosscore trace. REMOVE ALL before commit (production WASM
+ * must be trace-free). */
+static unsigned long p4_wedge_n = 0;
+static unsigned long p4_xwr_n = 0;
+static uint32_t p4_wedge_rd32(esp32p4_t *soc, uint32_t addr);
+static uint32_t p4_wedge_rd32(esp32p4_t *soc, uint32_t addr)
+{
+    uint8_t *h = esp32p4_guest_to_host(soc, addr);
+    uint32_t v = 0;
+    if (h)
+        memcpy(&v, h, 4);
+    return v;
+}
+
 static esp32_region_t *esp32_find_region(esp32p4_t *soc, uint32_t addr)
 {
     for (int i = 0; i < soc->nregions; i++) {
@@ -791,11 +816,10 @@ esp32p4_t *esp32p4_new(void)
      * bit 31 (ck_en_lp_core = 0); reset_en all deasserted. */
     soc->lpperi_reg[0] = 0x7FFFFFFFu;
 
-    /* flash backing shared by the i/d-cache window */
-    uint8_t *flash = calloc(1, P4_FLASH_SIZE);
+    /* flash backing shared by the i/d-cache window. Erased flash
+     * reads 0xFF (real HW); empty checks and littlefs rely on it. */
+    uint8_t *flash = malloc(P4_FLASH_SIZE);
     assert(flash);
-    /* Erased flash reads 0xFF (real HW); bootloader/app empty checks
-     * and NVS rely on it. (calloc gives 0x00; C3/C6/H2 memset to 0xFF.) */
     memset(flash, 0xFF, P4_FLASH_SIZE);
 
     esp32_add_region(soc, P4_TCM_BASE, P4_TCM_SIZE, ESP32_REG_RAM);
@@ -896,6 +920,64 @@ void esp32p4_set_smp(struct esp32p4_soc *soc, int on)
         soc->smp_enabled = on ? 1u : 0u;
 }
 
+/* TEMP-MPYDIAG sc-fail census (REMOVE with the scw census in
+ * rv32_template.c). Must sit after p4_hart/p4_wedge_rd32 defs. */
+void p4_scfail_note(riscv_t *rv, uint32_t addr, uint32_t rs2, uint32_t was_valid)
+{
+    static unsigned long n = 0;
+    if (rv) {
+        esp32p4_t *soc = PRIV(rv)->esp32p4;
+        riscv_t *other = NULL;
+        if (soc && soc->hart[0] && soc->hart[1])
+            other = (rv == soc->hart[0]) ? soc->hart[1] : soc->hart[0];
+        /* Log the first 8 failures AND any failure after 2B cycles
+         * (the stall is steady-state: proves whether sc keeps failing
+         * late, not just during bringup). */
+        uint32_t cyc = (uint32_t) rv->csr_cycle;
+        if (n < 8 || (cyc > 2000000000u && n < 16))
+            fprintf(stderr,
+                    "[SCFAIL] n=%lu hart=%d pc=%08x addr=%08x val=%08x "
+                    "was_valid=%u lr_addr=%08x mem=%08x oth_pc=%08x oth_lr=%u "
+                    "mstatus=%08x mint=%08x mie=%08x cyc=%u\n",
+                    n, p4_hart(rv), rv->PC, addr, rv->X[rs2], was_valid,
+                    rv->lr_addr,
+                    p4_wedge_rd32(soc, addr & ~3u),
+                    other ? other->PC : 0,
+                    other ? (unsigned) other->lr_valid : 9u,
+                    rv->csr_mstatus, rv->csr_mintthresh, rv->csr_mie, cyc);
+    }
+    n++;
+}
+/* TEMP-MPYDIAG lr census (REMOVE with the scw census). */
+void p4_lrnote(riscv_t *rv, uint32_t addr, uint32_t v)
+{
+    static unsigned long n = 0;
+    if (rv) {
+        uint32_t cyc = (uint32_t) rv->csr_cycle;
+        if (n < 8 || (cyc > 2000000000u && n < 16))
+            fprintf(stderr, "[LR] n=%lu hart=%d pc=%08x addr=%08x val=%08x cyc=%u\n",
+                    n, p4_hart(rv), rv->PC, addr, v, cyc);
+    }
+    n++;
+}
+/* TEMP-MPYDIAG: trap-delivery census (REMOVE). Counts traps per
+ * hart per CLIC id bucket (no per-event log): proves WHICH line
+ * hammers hart0 late (id histogram) vs hart1. */
+static unsigned long p4_trap_n0 = 0, p4_trap_n1 = 0;
+static unsigned long p4_trap_id0[64], p4_trap_id1[64];
+void p4_trapnote(riscv_t *rv, uint32_t id)
+{
+    if (!rv || id >= 64)
+        return;
+    if (p4_hart(rv) == 0) {
+        p4_trap_n0++;
+        p4_trap_id0[id]++;
+    } else {
+        p4_trap_n1++;
+        p4_trap_id1[id]++;
+    }
+}
+
 /* Pick the hart to execute the current block iteration. The APP hart is
  * created on the first call and boots the ROM reset vector like real HW
  * (both cores run ROM; hart1 parks in its poll loop until IDF releases
@@ -969,13 +1051,16 @@ riscv_t *esp32p4_smp_target(riscv_t *rv)
      * jitter). A quantum lets lock holders finish critical sections.
      * 256 blocks is short enough that tick/IPI latency stays sane.
      * LR/SC atomicity: a hart with a live reservation (lr_valid) is
-     * NEVER preempted — the paired sc must execute before any other
-     * hart (or handler) can store to the guarded word. Without this,
-     * the switch between the lr-block and the sc-block lets the other
-     * hart store first, failing every sc (observed: hart0 stuck in
-     * esp_cpu_compare_and_set with cur=0 vs lrval for 12B cycles).
-     * Bound it (512 switches) so a hart spinning INSIDE lr..sc with
-     * interrupts disabled can't starve the other hart forever. */
+     * NEVER preempted by the QUANTUM switch — the paired sc must
+     * execute before any other hart can store to the guarded word.
+     * Without this, the switch between the lr-block and the sc-block
+     * lets the other hart store first, failing every sc. Unlike the
+     * peer-store invalidation (which only fires on an OVERLAPPING
+     * store to the reserved word), this pin cannot cause a permanent
+     * sc failure: sc always runs on the same hart right after its lr
+     * within the pinned window. Bound it (512 switches) so a hart
+     * spinning INSIDE lr..sc with interrupts disabled can't starve
+     * the other hart forever. */
     if (rv->lr_valid && soc->smp_lr_pin < 512) {
         soc->smp_lr_pin++;
         return rv;
@@ -991,6 +1076,275 @@ riscv_t *esp32p4_smp_target(riscv_t *rv)
 void esp32p4_smp_poll(riscv_t *rv)
 {
     esp32p4_t *soc = PRIV(rv)->esp32p4;
+    /* TEMP-MPYDIAG: scheduler-state trace (REMOVE with SCHED trace).
+     * Logs scheduler-progress PCs + xPortSwitchFlag/scheduler state +
+     * hart CSR gate state (mstatus/mintthresh/mie/mtvt): proves whether
+     * hart0 ever leaves vPortYield poll (4ff2e5d6) and what gates
+     * delivery. Cap 128. */
+    if (rv->PC == 0x4ff2e598u || rv->PC == 0x4ff2e5d6u ||
+        rv->PC == 0x4ff2e5e6u || rv->PC == 0x4ff2e6aau ||
+        rv->PC == 0x4ff2e6b2u || rv->PC == 0x4ff2e6d4u ||
+        rv->PC == 0x4ff26752u || rv->PC == 0x4ff266d8u) {
+        static unsigned long p4_yield_n = 0;
+        if (p4_yield_n < 32) {
+            esp32p4_t *ysoc = PRIV(rv)->esp32p4;
+            fprintf(stderr, "[YIELD] hart=%d pc=%08x ra=%08x "
+                    "sw0=%08x sw1=%08x from0=%u from1=%u mstatus=%08x "
+                    "mint=%08x mie=%08x mtvt=%08x\n",
+                    p4_hart(rv), rv->PC, rv->X[1],
+                    p4_wedge_rd32(ysoc, 0x4ff3db30u),
+                    p4_wedge_rd32(ysoc, 0x4ff3db34u),
+                    p4_intc_test(ysoc, 79u),
+                    p4_intc_test(ysoc, 80u),
+                    rv->csr_mstatus, rv->csr_mintthresh, rv->csr_mie,
+                    rv->csr_mtvt);
+        }
+        p4_yield_n++;
+    }
+    if (rv->PC == 0x4ff2ea80u || rv->PC == 0x4000a0c0u ||
+        (rv->PC >= 0x4fc00230u && rv->PC <= 0x4fc00260u) ||
+        rv->PC == 0x4ff2ebe0u || rv->PC == 0x4fc005bcu ||
+        rv->PC == 0x4ff2e696u || rv->PC == 0x4ff2e698u ||
+        rv->PC == 0x4ff2e6a2u || rv->PC == 0x4ff2e6a6u ||
+        rv->PC == 0x4ff2e598u) {
+        static unsigned long p4_sys_n = 0;
+        if (p4_sys_n < 48)
+            fprintf(stderr, "[VSYS] hart=%d pc=%08x ra=%08x a0=%08x a1=%08x a2=%08x\n",
+                    p4_hart(rv), rv->PC, rv->X[1], rv->X[10], rv->X[11], rv->X[12]);
+        p4_sys_n++;
+    }
+    if (((rv->PC >= 0x4ff30c5au && rv->PC < 0x4ff30d40u) ||
+         (rv->PC >= 0x4ff2e622u && rv->PC < 0x4ff2e720u)) ||
+        (rv->PC >= 0x4ff2e996u && rv->PC < 0x4ff2ea60u) ||
+        (rv->PC >= 0x4ff2ea56u && rv->PC < 0x4ff2ebf0u) ||
+        (rv->PC >= 0x4ff30b3eu && rv->PC < 0x4ff30c5au) ||
+        (rv->PC >= 0x400449f8u && rv->PC < 0x40044a60u) ||
+        (rv->PC >= 0x4011d576u && rv->PC < 0x4011d652u) ||
+        (rv->PC >= 0x4ff2e598u && rv->PC < 0x4ff2e5e0u)) {
+        static unsigned long p4_sched_n = 0;
+        if (p4_sched_n < 128) {
+            fprintf(stderr, "[SCHED] hart=%d pc=%08x ra=%08x "
+                    "xsched=%08x pxrun0=%08x pxrun1=%08x "
+                    "susp0=%08x susp1=%08x ntask=%08x\n",
+                    p4_hart(rv), rv->PC, rv->X[1],
+                    p4_wedge_rd32(soc, 0x4ff3dafcu),
+                    p4_wedge_rd32(soc, 0x4ff3db50u),
+                    p4_wedge_rd32(soc, 0x4ff3db54u),
+                    p4_wedge_rd32(soc, 0x4ff3dad4u),
+                    p4_wedge_rd32(soc, 0x4ff3dad8u),
+                    p4_wedge_rd32(soc, 0x4ff3db08u));
+        }
+        p4_sched_n++;
+    }
+    /* TEMP-MPYDIAG sampler: 1 hit per 64K polls. REMOVE with p4_wedge_n.
+     * List_t = 20 B: uxNum[0:4] pxIndex[4:8] xListEnd{item[8:12]
+     * next[12:16] prev[16:20]} — END-marker MiniListItem layout
+     * (xItemValue, pxNext, pxPrevious = 12 B). ListItem = 20 B:
+     * xItemValue[0:4] pxNext[4:8] pxPrevious[8:12] pvOwner[12:16]
+     * pxContainer[16:20]. pxIndex points AT the next item (not past
+     * it): owner = pxIndex+12. TCB: pxTopOfStack[0:4]
+     * xStateListItem[4:24] xEventListItem[24:44] uxPriority[44:48]
+     * pxStack[48:52] pcTaskName[52:68]. */
+    if (soc->hart[1] && ((++p4_wedge_n & 0xFFFFu) == 0)) {
+        /* TEMP-MPYDIAG trap-rate line (REMOVE with p4_trapnote):
+         * one line per 64K polls with cumulative per-hart trap
+         * counts + live PCs + nonzero id-bucket histogram. */
+        extern unsigned long p4_trap_n0, p4_trap_n1;
+        extern unsigned long p4_trap_id0[64], p4_trap_id1[64];
+        {
+            char hid0[640], hid1[640];
+            hid0[0] = 0;
+            hid1[0] = 0;
+            int p0 = 0, p1 = 0;
+            for (int i = 0; i < 64 && p0 < 630; i++)
+                if (p4_trap_id0[i])
+                    p0 += snprintf(hid0 + p0, sizeof(hid0) - p0,
+                                   "%u:%lu ", i, p4_trap_id0[i]);
+            for (int i = 0; i < 64 && p1 < 630; i++)
+                if (p4_trap_id1[i])
+                    p1 += snprintf(hid1 + p1, sizeof(hid1) - p1,
+                                   "%u:%lu ", i, p4_trap_id1[i]);
+            fprintf(stderr, "[TRAPRATE] polls=%lu n0=%lu n1=%lu "
+                    "h0pc=%08x h1pc=%08x mstatus0=%08x ids0=[%s] ids1=[%s]\n",
+                    p4_wedge_n, p4_trap_n0, p4_trap_n1,
+                    soc->hart[0]->PC, soc->hart[1]->PC,
+                    soc->hart[0]->csr_mstatus, hid0, hid1);
+        }
+        riscv_t *h0 = soc->hart[0], *h1 = soc->hart[1];
+        uint32_t tcb0 = p4_wedge_rd32(soc, 0x4ff3db18u);
+        uint32_t tcb1 = p4_wedge_rd32(soc, 0x4ff3db1cu);
+        char n0[17], n1[17];
+        uint32_t p0 = 99, p1 = 99, c0 = 99, c1 = 99;
+        uint8_t *h;
+        h = esp32p4_guest_to_host(soc, tcb0 + 52u);
+        if (h) { memcpy(n0, h, 16); n0[16] = 0; } else n0[0] = 0;
+        h = esp32p4_guest_to_host(soc, tcb1 + 52u);
+        if (h) { memcpy(n1, h, 16); n1[16] = 0; } else n1[0] = 0;
+        p0 = p4_wedge_rd32(soc, tcb0 + 44u);
+        p1 = p4_wedge_rd32(soc, tcb1 + 44u);
+        c0 = p4_wedge_rd32(soc, tcb0 + 68u);
+        c1 = p4_wedge_rd32(soc, tcb1 + 68u);
+        int m79_0 = soc->intc_intmap[0][79] == 0xFFFFFFFFu ? -1 : (int) soc->intc_intmap[0][79];
+        int m80_1 = soc->intc_intmap[1][80] == 0xFFFFFFFFu ? -1 : (int) soc->intc_intmap[1][80];
+        unsigned id79_0 = (m79_0 >= 0 && m79_0 < 32) ? 16u + (unsigned) m79_0 : 99u;
+        unsigned id80_1 = (m80_1 >= 0 && m80_1 < 32) ? 16u + (unsigned) m80_1 : 99u;
+        int hw79 = (id79_0 < 64u) ? (p4_intc_test(soc, 79u) || soc->clic_ip_sw[0][id79_0]) : -1;
+        int hw80 = (id80_1 < 64u) ? (p4_intc_test(soc, 80u) || soc->clic_ip_sw[1][id80_1]) : -1;
+        /* Ready-list heads: FreeRTOS List_t[25] (configMAX_PRIORITIES),
+         * each 20 B: uxNum[0:4] pxIndex[4:8] xListEnd{item[8:12]
+         * next[12:16] prev[16:20]} (MINI_LIST_ITEM=1, 12 B end
+         * marker). ListItem = 20 B: val[0:4] next[4:8] prev[8:12]
+         * owner[12:16] container[16:20]. pxIndex points AT the next
+         * item: owner = pxIndex+12. Dump owner+name+count for
+         * prio 0/1/24. */
+        uint32_t rlbase = 0x4ff394a8u;
+        uint8_t *rlh = esp32p4_guest_to_host(soc, rlbase);
+        uint32_t rlx0 = 0, rlx1 = 0, rlx24 = 0, rlc0 = 0, rlc1 = 0, rlc24 = 0;
+        uint32_t rlp0 = 99, rlp1 = 99, rlp24 = 99;
+        char rln0[17], rln1[17], rln24[17];
+        rln0[0] = rln1[0] = rln24[0] = 0;
+        if (rlh) {
+            /* List_t layout: uxNumberOfItems[0:4], pxIndex[4:8],
+             * xListEnd{item[8:12], next[12:16], prev[16:20]} */
+            uint32_t px0, px1, px24, n0, n1, n24;
+            memcpy(&n0, rlh + 0 * 20, 4);
+            memcpy(&px0, rlh + 0 * 20 + 4, 4);
+            memcpy(&n1, rlh + 1 * 20, 4);
+            memcpy(&px1, rlh + 1 * 20 + 4, 4);
+            memcpy(&n24, rlh + 24 * 20, 4);
+            memcpy(&px24, rlh + 24 * 20 + 4, 4);
+            rlc0 = n0;
+            rlc1 = n1;
+            rlc24 = n24;
+            /* pxIndex points AT a ListItem_t; pvOwner is at +12.
+             * Owner 0 (NULL) means pxIndex still points at the
+             * in-list xListEnd sentinel (empty list): keep name
+             * empty, prio 99. */
+            uint8_t *o;
+            uint32_t ow0 = 0, ow1 = 0, ow24 = 0;
+            o = esp32p4_guest_to_host(soc, px0 + 12u);
+            if (o) memcpy(&ow0, o, 4);
+            o = esp32p4_guest_to_host(soc, px1 + 12u);
+            if (o) memcpy(&ow1, o, 4);
+            o = esp32p4_guest_to_host(soc, px24 + 12u);
+            if (o) memcpy(&ow24, o, 4);
+            rlx0 = ow0;
+            rlx1 = ow1;
+            rlx24 = ow24;
+            if (ow0) {
+                o = esp32p4_guest_to_host(soc, ow0 + 44u);
+                if (o) { uint32_t t; memcpy(&t, o, 4); rlp0 = t; }
+                o = esp32p4_guest_to_host(soc, ow0 + 52u);
+                if (o) { memcpy(rln0, o, 16); rln0[16] = 0; }
+            }
+            if (ow1) {
+                o = esp32p4_guest_to_host(soc, ow1 + 44u);
+                if (o) { uint32_t t; memcpy(&t, o, 4); rlp1 = t; }
+                o = esp32p4_guest_to_host(soc, ow1 + 52u);
+                if (o) { memcpy(rln1, o, 16); rln1[16] = 0; }
+            }
+            if (ow24) {
+                o = esp32p4_guest_to_host(soc, ow24 + 44u);
+                if (o) { uint32_t t; memcpy(&t, o, 4); rlp24 = t; }
+                o = esp32p4_guest_to_host(soc, ow24 + 52u);
+                if (o) { memcpy(rln24, o, 16); rln24[16] = 0; }
+            }
+        }
+        /* CAS-failure decode: hart0 spins in esp_cpu_compare_and_set
+         * (lr/sc retry) called from esp_ipc_call_nonblocking with
+         * a0=&s_no_block_func[cpu]. Dump a1 (compare), a2 (new func),
+         * live mem[a0], the [1]-side IPC words, and 6 stack words for
+         * the caller chain above the nonblocking call. */
+        uint32_t h0a0 = h0->X[10], h0a1 = h0->X[11], h0a2 = h0->X[12];
+        uint32_t mema0 = p4_wedge_rd32(soc, h0a0);
+        uint32_t nb1 = p4_wedge_rd32(soc, 0x4ff3de80u);
+        uint32_t rdyw = p4_wedge_rd32(soc, 0x4ff3de78u);
+        uint32_t arg1 = p4_wedge_rd32(soc, 0x4ff3de74u);
+        uint32_t f1 = p4_wedge_rd32(soc, 0x4ff3de98u);
+        uint32_t fa1 = p4_wedge_rd32(soc, 0x4ff3de90u);
+        uint32_t w1 = p4_wedge_rd32(soc, 0x4ff3de88u);
+        uint32_t sp0 = h0->X[2];
+        uint32_t sk0 = p4_wedge_rd32(soc, sp0);
+        uint32_t sk1 = p4_wedge_rd32(soc, sp0 + 4u);
+        uint32_t sk2 = p4_wedge_rd32(soc, sp0 + 8u);
+        uint32_t sk3 = p4_wedge_rd32(soc, sp0 + 12u);
+        uint32_t sk4 = p4_wedge_rd32(soc, sp0 + 16u);
+        uint32_t sk5 = p4_wedge_rd32(soc, sp0 + 20u);
+        fprintf(stderr,
+                "[WEDGE] h0:pc=%08x ra=%08x a0=%08x sp=%08x lr=%u/%08x "
+                "h1:pc=%08x ra=%08x a0=%08x sp=%08x lr=%u/%08x "
+                "cur=[%08x/%s/p%u/c%u %08x/%s/p%u/c%u] "
+                "ss=[%u %u] sw=[%u %u] "
+                "top=%u run=[%u %u %u] tick=%u "
+                "map79=[%d %d] map80=[%d %d] "
+                "d79=[hw%d ie%d at%u ct%02x shv%u] "
+                "d80=[hw%d ie%d at%u ct%02x shv%u] "
+                "pend79=%d pend80=%d "
+                "mstatus=[%08x %08x] mth=[%08x %08x] mie=[%08x %08x] "
+                "mtvt=[%08x %08x] st=[conf%08x ena%08x raw%08x] "
+                "ntask=%u s_cpu=%08x sod=%08x cyc=[%llu %llu] "
+                "ipc=[nb%08x nbr%u nbq%08x nbqr%u f%08x fa%08x w%u "
+                "h0=%08x h1=%08x m0=%08x m1=%08x a0=%08x a1=%08x] "
+                "flashop=[m%08x cs%08x cc%08x] "
+                "cas=[a1=%08x a2=%08x mem=%08x nb1=%08x rdy=%08x "
+                "arg1=%08x f1=%08x fa1=%08x w1=%08x] "
+                "stk=[%08x %08x %08x %08x %08x %08x] "
+                "rl=[%08x/%s/p%u#%u %08x/%s/p%u#%u %08x/%s/p%u#%u]\n",
+                h0->PC, h0->X[1], h0->X[10], h0->X[2],
+                (unsigned) h0->lr_valid, h0->lr_value,
+                h1->PC, h1->X[1], h1->X[10], h1->X[2],
+                (unsigned) h1->lr_valid, h1->lr_value,
+                tcb0, n0, p0, c0,
+                tcb1, n1, p1, c1,
+                p4_wedge_rd32(soc, 0x4ff3dad4u), p4_wedge_rd32(soc, 0x4ff3dad8u),
+                p4_wedge_rd32(soc, 0x4ff3db30u), p4_wedge_rd32(soc, 0x4ff3db34u),
+                p4_wedge_rd32(soc, 0x4ff3db00u),
+                p4_wedge_rd32(soc, 0x4ff3db50u), p4_wedge_rd32(soc, 0x4ff3dafcu),
+                p4_wedge_rd32(soc, 0x4ff3db10u),
+                p4_wedge_rd32(soc, 0x4ff3db04u),
+                m79_0, soc->intc_intmap[1][79] == 0xFFFFFFFFu ? -1 : (int) soc->intc_intmap[1][79],
+                soc->intc_intmap[0][80] == 0xFFFFFFFFu ? -1 : (int) soc->intc_intmap[0][80], m80_1,
+                hw79, (id79_0 < 64u) ? !!soc->clic_ie[0][id79_0] : -1,
+                (id79_0 < 64u) ? (soc->clic_attr[0][id79_0] & 0x7u) : 99u,
+                (id79_0 < 64u) ? soc->clic_ctl[0][id79_0] : 99u,
+                (id79_0 < 64u) ? !!(soc->clic_attr[0][id79_0] & 0x1u) : 99u,
+                hw80, (id80_1 < 64u) ? !!soc->clic_ie[1][id80_1] : -1,
+                (id80_1 < 64u) ? (soc->clic_attr[1][id80_1] & 0x7u) : 99u,
+                (id80_1 < 64u) ? soc->clic_ctl[1][id80_1] : 99u,
+                (id80_1 < 64u) ? !!(soc->clic_attr[1][id80_1] & 0x1u) : 99u,
+                p4_intc_test(soc, 79u), p4_intc_test(soc, 80u),
+                h0->csr_mstatus, h1->csr_mstatus,
+                h0->csr_mintthresh, h1->csr_mintthresh,
+                h0->csr_mie, h1->csr_mie,
+                h0->csr_mtvt, h1->csr_mtvt,
+                soc->systimer_conf, soc->systimer_int_ena, soc->systimer_int_raw,
+                p4_wedge_rd32(soc, 0x4ff3db08u),
+                p4_wedge_rd32(soc, 0x4ff3da0cu),
+                p4_wedge_rd32(soc, 0x4ff3dad0u),
+                (unsigned long long) h0->csr_cycle,
+                (unsigned long long) h1->csr_cycle,
+                p4_wedge_rd32(soc, 0x4ff3de7cu),
+                p4_wedge_rd32(soc, 0x4ff3de78u),
+                p4_wedge_rd32(soc, 0x4ff3de70u),
+                p4_wedge_rd32(soc, 0x4ff3de74u),
+                p4_wedge_rd32(soc, 0x4ff3de94u),
+                p4_wedge_rd32(soc, 0x4ff3de8cu),
+                p4_wedge_rd32(soc, 0x4ff3de84u),
+                p4_wedge_rd32(soc, 0x4ff3deacu),
+                p4_wedge_rd32(soc, 0x4ff3deb0u),
+                p4_wedge_rd32(soc, 0x4ff3dea4u),
+                p4_wedge_rd32(soc, 0x4ff3dea8u),
+                p4_wedge_rd32(soc, 0x4ff3de9cu),
+                p4_wedge_rd32(soc, 0x4ff3dea0u),
+                p4_wedge_rd32(soc, 0x4ff3de5cu),
+                p4_wedge_rd32(soc, 0x4ff3de5bu),
+                p4_wedge_rd32(soc, 0x4ff3de5au),
+                h0a1, h0a2, mema0, nb1, rdyw,
+                arg1, f1, fa1, w1,
+                sk0, sk1, sk2, sk3, sk4, sk5,
+                rlx0, rln0, rlp0, rlc0, rlx1, rln1, rlp1, rlc1, rlx24, rln24,
+                rlp24, rlc24);
+    }
     esp32p4_periodic(soc->hart[0] ? soc->hart[0] : rv);
     if (soc->hart[0])
         esp32p4_check_interrupt(soc->hart[0]);
@@ -1261,9 +1615,14 @@ void p4_md5_final_pub(esp32p4_t *soc, uint32_t digest, uint32_t ctx)
 #define UART_CLKDIV_CONF_REG 0x98u
 #define UART_RX_FIFO_SZ 128u
 
-/* Interrupt sources (soc/interrupts.h, counted from 0).
- * NOTE: these are translated P4 sources; the peripheral logic dispatches
- * on the translated C6-style offsets, only the source numbers differ. */
+/* Interrupt sources (soc/interrupts.h ETS_ enum, 0-based: count the
+ * enum entries. NOTE the alias: ETS_TEMPERATURE_SENSOR =
+ * ETS_LP_TSENS (no increment) and ETS_LP_UART = 16 (explicit, which
+ * re-syncs the count). Verified by manual count 2026-10-02 AND by
+ * guest behavior (guest routes src 53/55/79 = T0/T2/FROM_CPU_0):
+ * SPI2=25, UART0=31, UART1=32, TWAI0=40, RMT=43, I2C0=44, TG0_T0=46,
+ * TG1_T0=49, TG0_WDT=48, TG1_WDT=51, PCNT=111, PWM0=38, I2S0=27,
+ * GPIO0=74. */
 #define P4_UART0_INTR_SOURCE 31u
 #define P4_UART1_INTR_SOURCE 32u
 #define P4_TWAI0_INTR_SOURCE 40u
@@ -1288,7 +1647,7 @@ void p4_md5_final_pub(esp32p4_t *soc, uint32_t digest, uint32_t ctx)
 /* AXI_GDMA interrupt sources (interrupts.h enum) */
 #define P4_AXI_DMA_IN_CH0_INTR_SOURCE 62u
 #define P4_AXI_DMA_OUT_CH0_INTR_SOURCE 65u
-/* SPI2 interrupt source: ETS_SPI2_INTR_SOURCE (counted from the enum above) */
+/* SPI2 interrupt source: ETS_SPI2_INTR_SOURCE = 25 (enum count). */
 #define P4_SPI2_INTR_SOURCE 25u
 /* P4_SPI2_TRANS_DONE_MASK is defined above (used by esp32p4_new). */
 static void esp32p4_spi2_int_update(esp32p4_t *soc)
@@ -1431,7 +1790,7 @@ static void esp32p4_spi2_complete(riscv_t *rv, esp32p4_t *soc)
     }
 }
 
-/* SYSTIMER interrupt sources (interrupts.h enum) */
+/* SYSTIMER interrupt sources (interrupts.h enum: T0=53, T1=54, T2=55) */
 #define P4_SYSTIMER_T0_SOURCE 53u
 #define P4_SYSTIMER_T1_SOURCE 54u
 #define P4_SYSTIMER_T2_SOURCE 55u
@@ -1617,7 +1976,8 @@ static void esp32_uart_putc(esp32p4_t *soc, char c)
 #define SYSTIMER_INT_CLR 0x6Cu
 
 /* ESP32-P4 interrupt sources (soc/interrupts.h): 53 = SYSTIMER_TARGET0
- * (FreeRTOS tick), 55 = SYSTIMER_TARGET2 (esp_timer). */
+ * (FreeRTOS tick hart0), 54 = TARGET1 (tick hart1), 55 = TARGET2
+ * (esp_timer). */
 #define SYSTIMER_T0_SOURCE 53u
 #define SYSTIMER_T1_SOURCE 54u
 #define SYSTIMER_T2_SOURCE 55u
@@ -2147,12 +2507,27 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return v;
     }
 
-    /* LP_TRNG data (0x50126004): xorshift PRNG, seeded by SYSTIMER. */
+    /* LP_TRNG data (0x50126004): xorshift PRNG, seeded by SYSTIMER.
+     * Real HW: the RNG register returns a FRESH 32-bit random word on
+     * every read. The old model returned the same word for up to 5
+     * consecutive reads (systimer_counter advances 1 per 5 cycles, and
+     * the seed's low bits only changed when the counter moved), so any
+     * guest entropy loop that requires two consecutive reads to differ
+     * (bootloader_fill_random's rdcycle-gated TRNG re-sample at
+     * 0x4ffb01c4..0x4ffb01d8: TRNG read / rdcycle / TRNG read /
+     * rdcycle-delta < 1439 -> re-read) spins forever: the two reads
+     * match, the xor cancels to 0, and the delta test never passes.
+     * Mix a per-read nonce (advanced on every MMIO read dispatch) into
+     * the xorshift output so consecutive reads always differ, as on HW.
+     * (LP_TIMER BUF, 0x50112014/0x50112018, intentionally does NOT get
+     * this treatment: lp_timer_hal_get_cycle_count legitimately spins
+     * until the SLOW (150 kHz, /533) counter advances.) */
     if (addr == 0x50126004u) {
         uint32_t s = (uint32_t) soc->systimer_counter | 1u;
         s ^= s << 13;
         s ^= s >> 17;
         s ^= s << 5;
+        s += 0x9E3779B9u * (++soc->trng_nonce);
         return s;
     }
 
@@ -2422,16 +2797,36 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
         return soc->mcpwm_reg[o >> 2];
     }
 
-    /* I2C_EXT (0x60004000-0x60004200) */
+    /* I2C_EXT (0x60004000-0x60004200): mirrors i2c_dev_t. Both IDF
+     * drivers program command[0..7] @0x58..0x74 + TX bytes to DATA @0x1C
+     * (legacy Arduino via cmd_link, new MicroPython driver via ops),
+     * then queue a START through CTR @0x04 bit 5; one executor pass
+     * runs the round to completion: done bits set on executed command
+     * regs, RX bytes assembled into i2c_rx_fifo for the ISR's DATA
+     * reads. SR @0x08 bit 4 (bus_busy) reads 0: the executor runs
+     * synchronously in the periodic pass, so the bus is never busy
+     * when the guest can observe it (the NACK path spins on busy
+     * until it clears — a stuck-busy wedges every scan probe). */
     if (addr >= P4_PERIPH_BASE + 0x4000u &&
         addr < P4_PERIPH_BASE + 0x4200u) {
         uint32_t *r = soc->i2c_reg + ((addr - P4_PERIPH_BASE - 0x4000u) >> 2);
+        if (addr == P4_PERIPH_BASE + 0x4008u)
+            return soc->i2c_reg[0x08 >> 2] & ~(1u << 4); /* SR: idle */
         if (addr == P4_PERIPH_BASE + 0x4080u && soc->i2c_scl_rst_cnt > 0 &&
             --soc->i2c_scl_rst_cnt == 0)
             *r &= ~1u; /* SCL_RST_SLV_EN self-clears after the pulses */
         if (addr == P4_PERIPH_BASE + 0x402cu) {
+            /* INT_ST (masked status): raw & ena. The shared (intrstatus)
+             * ISR gate reads this reg and only runs the driver ISR when
+             * masked bits are set; without it every transaction wedges
+             * in the event-queue wait (scan hang / WR-4 timeout). */
             uint32_t v = soc->i2c_reg[0x20 >> 2] & soc->i2c_reg[0x28 >> 2];
             return v;
+        }
+        if (addr == P4_PERIPH_BASE + 0x4028u) {
+            /* INT_ENA reads back the programmed mask (generic store
+             * path handles writes). */
+            return soc->i2c_reg[0x28 >> 2];
         }
         if (addr == P4_PERIPH_BASE + 0x401cu) { /* data: RX fifo pop */
             if (soc->i2c_rx_pos < soc->i2c_rx_len) {
@@ -2457,9 +2852,16 @@ static uint32_t esp32_mmio_read(riscv_t *rv, esp32p4_t *soc, uint32_t addr)
                 }
                 return 0; /* empty FIFO reads as zero */
             case UART_STATUS_REG: {
-                /* RXFIFO_CNT [5:0]; TX side left at 0 (always room) */
-                return (soc->uart_rx_head[p] - soc->uart_rx_tail[p]) &
-                       (UART_RX_FIFO_SZ - 1u);
+                /* STATUS: rxfifo_cnt[7:0] + txfifo_cnt[23:16] (plus
+                 * fixed modem bits). The MPY REPL ISR sizes its drain
+                 * from rxfifo_cnt via uart_ll_get_rxfifo_len: report
+                 * the live injected-byte count (TX side always empty).
+                 * Fixed bits match reset defaults (ctsn/rxd/dtrn/rtsn/
+                 * txd = 1). */
+                return ((soc->uart_rx_head[p] - soc->uart_rx_tail[p]) &
+                        (UART_RX_FIFO_SZ - 1u)) |
+                       (1u << 14) | (1u << 15) | (1u << 29) | (1u << 30) |
+                       (1u << 31);
             }
             case UART_INT_ST_REG:
                 return mmio32[(base + UART_INT_RAW_REG - P4_PERIPH_BASE) >> 2] &
@@ -2947,22 +3349,36 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         if (addr >= 0x20801000u && addr < 0x20801000u + 64u * 4u) {
             unsigned id = (addr - 0x20801000u) >> 2;
             unsigned sub = (addr - 0x20801000u) & 3u;
+            /* TEMP-MPYDIAG: CLIC-config trace (REMOVE with MAPW trace).
+             * Logs CLIC IE/CTL/ATTR writes: proves whether the guest
+             * enables the tick/crosscore CLIC ids and at what level.
+             * No cap (guest writes ~100 total). */
+            {
+                fprintf(stderr, "[CLICW] hart=%d id=%u sub=%u val=%08x size=%u\n",
+                        h, id, sub, val, size);
+            }
             if (size == 4 && sub == 0) {
                 /* word write updates all four byte-fields at once.
-                 * CLIC IP is W1C for the clear direction: a 0 bit
-                 * clears a SW-latched pending (the SDK's RMW config
-                 * writes back whatever it read; without W1C a stale
-                 * latched 1 re-pends forever). A 1 bit does NOT
-                 * force-pend here (SW trigger goes through the
-                 * byte-write path / HW lines); it leaves SW clear.
-                 * HW lines still pend via intc_status regardless. */
-                if (!(val & 0x1u))
-                    soc->clic_ip_sw[h][id] = 0;
+                 * No separate IP latch is kept for the SW bit: like
+                 * HW, the read computes pending live (matrix level OR
+                 * the stored bit), so a plain full-word store is
+                 * faithful and RMW config can never stack a stale
+                 * pend. Byte layout within the word (matches the
+                 * byte-write path below: IP/IE/ATTR/CTL):
+                 * IP = bit 0, IE = bit 8 (CLIC_INT_IE_S; the SDK's
+                 * word writes carry IE byte = 0x01, e.g. 0x1f010000
+                 * and 0x20010001). ATTR = bits[18:16],
+                 * CTL = bits[31:24]. */
+                soc->clic_ip_sw[h][id] = val & 0x1u;
                 soc->clic_ie[h][id] = (val & (1u << 8)) ? 1u : 0u;
                 soc->clic_attr[h][id] = (uint8_t) ((val >> 16) & 0x7u);
                 soc->clic_ctl[h][id] = (uint8_t) (val >> 24);
             } else if (size == 1) {
-                /* byte write targets one field (IP/IE/ATTR/CTL) */
+                /* byte write targets one field (IP/IE/ATTR/CTL).
+                 * The ROM's esprv_intc_int_{enable,disable} use sb to
+                 * bit 1 of the IE byte (0x20801001+4*id): sb 1 sets IE,
+                 * sb 0 clears it. A plain byte store (not OR) matches
+                 * the ROM bodies, which sb a zeroed register to clear. */
                 uint8_t b = (uint8_t) val;
                 if (sub == 0)
                     soc->clic_ip_sw[h][id] = b & 0x1u;
@@ -2994,6 +3410,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
      * must see the pre-SMP fire-and-forget behavior (writes dropped,
      * reads 0) instead of hanging in the handshake poll. */
     if (addr == 0x500E5010u) {
+        /* TEMP-MPYDIAG: FROM_CPU_0 write trace (first 48). REMOVE. */
+        if (p4_xwr_n < 48)
+            fprintf(stderr, "[XWR] FROM_CPU_0 wr=%08x pc=%08x hart=%d\n",
+                    val, rv->PC, p4_hart(rv));
+        p4_xwr_n++;
         if (val & 1u)
             p4_intc_set(soc, P4_FROM_CPU_INTR_SOURCE);
         else
@@ -3001,6 +3422,11 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         return;
     }
     if (addr == 0x500E5014u) {
+        /* TEMP-MPYDIAG: FROM_CPU_1 write trace (first 96). REMOVE. */
+        if (p4_xwr_n < 96)
+            fprintf(stderr, "[XWR] FROM_CPU_1 wr=%08x pc=%08x hart=%d\n",
+                    val, rv->PC, p4_hart(rv));
+        p4_xwr_n++;
         if (val & 1u) {
             if (soc->hart[1])
                 p4_intc_set(soc, P4_FROM_CPU1_INTR_SOURCE);
@@ -3231,12 +3657,23 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
     }
 
 
-    /* I2C_EXT (0x60004000-0x60004200) */
+    /* I2C_EXT (0x60004000-0x60004200): mirrors i2c_dev_t. DATA @0x1C
+     * pushes TX bytes; command[0..7] @0x58..0x74 store verbatim (done
+     * bits managed by the executor); CTR @0x04 bit 5 (trans_start, WT)
+     * runs the programmed list once (see the CTR arm below);
+     * conf_upgate (bit 11, WT) is a date-register sync with no
+     * executor side effects. */
     if (addr >= P4_PERIPH_BASE + 0x4000u &&
         addr < P4_PERIPH_BASE + 0x4200u) {
         uint32_t *r = soc->i2c_reg + ((addr - P4_PERIPH_BASE - 0x4000u) >> 2);
         if (addr == P4_PERIPH_BASE + 0x4024u) { /* int_clr */
             soc->i2c_reg[0x20 >> 2] &= ~val; /* clear raw status bits */
+            /* int_clr also drops the INTC IRQ (below). It does NOT
+             * touch command done bits: the executor sets done as it
+             * walks, and the legacy driver's next round re-programs
+             * command regs verbatim — which would NOT clear a stale
+             * done bit. Instead the CTR arm latches a round on every
+             * fresh trans_start edge ... (see below). */
             p4_intc_clear(soc, P4_I2C_EXT0_INTR_SOURCE); /* drop the pending IRQ */
         } else if (addr == P4_PERIPH_BASE + 0x4018u) { /* fifo_conf */
             soc->i2c_reg[0x18 >> 2] = val;
@@ -3252,16 +3689,30 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             if (soc->i2c_tx_len < 32)
                 soc->i2c_tx_fifo[soc->i2c_tx_len++] = val & 0xFFu;
         } else if (addr == P4_PERIPH_BASE + 0x4004u) { /* ctr */
-            *r = val;
-            if (val & (1u << 5)) { /* trans_start (WT): transfer begins */
-                uint32_t addr_byte = soc->i2c_tx_len > 0 ?
-                                     soc->i2c_tx_fifo[0] : 0xFFu;
-                soc->i2c_transfer_pending = 1;
-                if ((addr_byte >> 1) == P4_I2C_DEV_ADDR) {
-                    soc->i2c_slave_active = 1;
-                    soc->i2c_slave_rw = addr_byte & 1u;
-                } else {
+            /* CTR holds two WT bits: trans_start (bit 5) runs the
+             * programmed list once; conf_upgate (bit 11) is a
+             * date-register sync with no executor side effects (it
+             * must NOT latch a round: the legacy driver writes
+             * update|start in one CTR store, and the upgate half
+             * would otherwise execute the list before the start half
+             * is even programmed). Store only the R/W bits; WT bits
+             * self-clear like HW. */
+            *r = val & ~((1u << 5) | (1u << 11));
+            /* trans_start queues one executor round, edge-triggered:
+             * the legacy driver writes update|start together per round,
+             * so each round carries a fresh 0->1 edge on bit 5 (the WT
+             * bit self-clears in *r, and the executor clears the CTR
+             * copy too). A START latches a round whenever the stored
+             * bit was 0; repeats without an intervening clear are
+             * ignored. */
+            if (val & (1u << 5)) {
+                if (!(*r & (1u << 5))) {
+                    soc->i2c_cmd_ptr = 0;
                     soc->i2c_slave_active = 0;
+                    soc->i2c_slave_rw = 0;
+                    soc->i2c_rx_len = 0;
+                    soc->i2c_rx_pos = 0;
+                    soc->i2c_exec_pending = 1;
                 }
             }
         } else {
@@ -3922,6 +4373,16 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                  * periodic TXFIFO_EMPTY logic raise the interrupt and lets the
                  * SDK's ISR see it and move bytes to the FIFO. */
                 mmio32[off >> 2] = val | UART_TXFIFO_EMPTY_BIT | 0x4000u;
+            } else if (o == UART_CONF0_REG) {
+                /* CONF0 bit 22 (rxfifo_rst): the REPL init resets the
+                 * RX FIFO before arming interrupts. Drain only the
+                 * CURRENT contents; bytes injected later still raise
+                 * their own arrival edge (see the periodic poll). */
+                if (val & (1u << 22)) {
+                    soc->uart_rx_head[p] = 0;
+                    soc->uart_rx_tail[p] = 0;
+                }
+                mmio32[off >> 2] = val;
             } else
                 mmio32[off >> 2] = val;
             return;
@@ -3950,9 +4411,98 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             }
         }
         mmio32[off >> 2] = val;
+        if (addr == P4_PERIPH_BASE + 0x2000u ||
+            addr == P4_PERIPH_BASE + 0x3000u) {
+            /* Dedicated-bit ops (HAL path, no USR): WREN/WRDI set/clear
+             * WEL; PP/SE/BE/CE program/erase; RDSR/RDID/READ return data.
+             * Without these every flash write fails verification with
+             * 0x105 (WEL never set). CMD bit map (P4 TRM SPI_MEM_CMD,
+             * same as C6): USR=18, CE=22, BE=23, SE=24, PP=25, WRSR=26,
+             * RDSR=27, RDID=28, WRDI=29, WREN=30, READ=31.
+             * P4 note: program length rides in ADDR high bits [31:24]
+             * (spimem_flash_ll.h: mspi_ddr = addr>>24, 0 = 256 B). */
+            uint32_t base = addr - P4_PERIPH_BASE;
+            uint32_t *w = mmio32 + ((base + SPI_DATA_BUF) >> 2);
+            uint32_t addrreg = mmio32[((base + SPI_ADDR_REG) >> 2)];
+            esp32_region_t *fi =
+                esp32_find_region(soc, P4_FLASH_I_BASE);
+            if (val & (1u << 30))
+                soc->flash_sr |= 0x02u; /* FLASH_WREN */
+            if (val & (1u << 29))
+                soc->flash_sr &= ~0x02u; /* FLASH_WRDI */
+            if (val & (1u << 22)) { /* FLASH_CE: chip erase */
+                memset(fi->data, 0xFF, P4_FLASH_SIZE);
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 23)) { /* FLASH_BE: block erase (64K) */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t bbase = faddr & ~65535u;
+                if (bbase < P4_FLASH_SIZE) {
+                    uint32_t len = P4_FLASH_SIZE - bbase;
+                    if (len > 65536u)
+                        len = 65536u;
+                    memset(fi->data + bbase, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 24)) { /* FLASH_SE: sector erase (4K) */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t sbase = faddr & ~4095u;
+                if (sbase < P4_FLASH_SIZE) {
+                    uint32_t len = P4_FLASH_SIZE - sbase;
+                    if (len > 4096u)
+                        len = 4096u;
+                    memset(fi->data + sbase, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 25)) { /* FLASH_PP: page program */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t plen = (addrreg >> 24) & 0xFFu;
+                if (plen == 0)
+                    plen = 256u;
+                if (plen > 64u)
+                    plen = 64u;
+                uint8_t *wb = (uint8_t *) w;
+                for (uint32_t i = 0; i < plen; i++)
+                    if (faddr + i < P4_FLASH_SIZE)
+                        fi->data[faddr + i] &= wb[i];
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 26)) { /* FLASH_WRSR */
+                soc->flash_sr = w[0] & 0xFFu;
+                soc->flash_sr2 = (w[0] >> 8) & 0xFFu;
+                soc->flash_sr &= ~0x02u;
+            }
+            if (val & (1u << 27)) /* FLASH_RDSR */
+                w[0] = soc->flash_sr;
+            if (val & (1u << 28)) /* FLASH_RDID */
+                w[0] = 0x1840EFu; /* EF 40 18: 16 MB part */
+            if (val & (1u << 31)) { /* FLASH_READ */
+                uint32_t faddr = addrreg & 0xFFFFFFu;
+                uint32_t miso =
+                    (mmio32[((base + SPI_MISO_DLEN) >> 2)] & 0x3FFu) + 1u;
+                uint32_t rn = (miso + 7u) / 8u;
+                if (rn > 64u)
+                    rn = 64u;
+                memset(w, 0, rn);
+                if (faddr < P4_FLASH_SIZE)
+                    memcpy(w, fi->data + faddr, rn);
+            }
+            if (val & ~(0x40000u | 0x20000u)) {
+                /* Dedicated bits serviced above: self-clear so
+                 * poll_cmd_done (which spins on cmd==0) exits. USR
+                 * path below clears CMD itself after servicing. */
+                if (!(val & 0x40000u))
+                    mmio32[off >> 2] = 0;
+            }
+        }
         if ((addr == P4_PERIPH_BASE + 0x2000u ||
              addr == P4_PERIPH_BASE + 0x3000u) && (val & SPI_CMD_USR_BIT)) {
-            /* SPI_USR command trigger: service the command into W0.. */
+            /* SPI_USR command trigger: service the command into W0..
+             * NOTE: on P4 the HAL flash path uses dedicated CMD bits
+             * (handled above), so this USR trigger only fires for the
+             * ROM/bootloader USR path and GDMA-less peripherals. */
             uint32_t base = addr - P4_PERIPH_BASE;
             uint32_t *w = mmio32 + ((base + SPI_DATA_BUF) >> 2);
             uint32_t cmd = mmio32[(base + 0x20u) >> 2] & 0xFFu; /* USER2 */
@@ -3962,6 +4512,17 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
             uint32_t nbytes = (miso + 7u) / 8u;
             if (nbytes > 64u)
                 nbytes = 64u;
+            /* SPI_MEM MOSI_DLEN is at base+0x24 (MISO at +0x28); capture
+             * the payload BEFORE W0 is cleared below (program data would
+             * otherwise be destroyed). */
+            uint32_t mosiw =
+                (mmio32[(base + 0x24u) >> 2] & 0xFFFFFFu) + 1u;
+            uint32_t wnw = (mosiw + 7u) / 8u;
+            if (wnw > 64u)
+                wnw = 64u;
+            uint8_t mosi_data[64];
+            memset(mosi_data, 0, sizeof(mosi_data));
+            memcpy(mosi_data, w, wnw);
             esp32_region_t *fi = esp32_find_region(soc, P4_FLASH_I_BASE);
             uint32_t faddr = mmio32[(base + SPI_ADDR_REG) >> 2];
             /* NOTE: no blanket memset of W0.. here: for MOSI write
@@ -4007,9 +4568,39 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
                 if (faddr < P4_FLASH_SIZE)
                     memcpy(w, fi->data + faddr, nbytes);
             } else if (user & 0x08000000u) {
-                /* USR_MOSI: write data from W0 */
-                if (faddr < P4_FLASH_SIZE)
-                    memcpy(fi->data + faddr, w, nbytes);
+                /* USR_MOSI: program data from the pre-captured MOSI
+                 * payload (flash can only clear bits: AND). */
+                for (uint32_t i = 0; i < wnw; i++)
+                    if (faddr + i < P4_FLASH_SIZE)
+                        fi->data[faddr + i] &= mosi_data[i];
+                soc->flash_sr &= ~0x02u; /* program clears WEL */
+            } else if (cmd == 0x02u || cmd == 0x32u) {
+                /* page program via raw opcode (ROM path): same AND. */
+                for (uint32_t i = 0; i < wnw; i++)
+                    if (faddr + i < P4_FLASH_SIZE)
+                        fi->data[faddr + i] &= mosi_data[i];
+                soc->flash_sr &= ~0x02u;
+            } else if (cmd == 0x20u || cmd == 0x52u || cmd == 0xD8u ||
+                       cmd == 0x60u || cmd == 0xC7u) {
+                /* erase to 0xFF: 4K sector / 32K / 64K block / chip
+                 * (ROM path; the HAL uses dedicated SE/BE/CE above). */
+                uint32_t len = P4_FLASH_SIZE, ebase = 0;
+                if (cmd == 0x20u) {
+                    len = 4096u;
+                    ebase = faddr & ~4095u;
+                } else if (cmd == 0x52u) {
+                    len = 32768u;
+                    ebase = faddr & ~32767u;
+                } else if (cmd == 0xD8u) {
+                    len = 65536u;
+                    ebase = faddr & ~65535u;
+                }
+                if (ebase < P4_FLASH_SIZE) {
+                    if (ebase + len > P4_FLASH_SIZE)
+                        len = P4_FLASH_SIZE - ebase;
+                    memset(fi->data + ebase, 0xFF, len);
+                }
+                soc->flash_sr &= ~0x02u; /* erase clears WEL */
             } else if (cmd == 0x03u || cmd == 0x0Bu || cmd == 0x3Bu ||
                        cmd == 0x6Bu || cmd == 0xEBu) {
                 /* flash read commands: copy from flash image */
@@ -4071,10 +4662,16 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
      * 4*source, up to 160 sources incl. PCNT at 111). HW format: 0 =
      * unmapped, otherwise (line + 16). (The ROM route API adds 0x10 to the
      * line before storing.) Store the true line; 0xFFFFFFFF = unmapped. */
+    /* TEMP-MPYDIAG MAP-write trace (REMOVE): logs every INTMTX MAP
+     * program with hart + source + line: proves whether the guest
+     * ever routes sources 54/55/56/80/81 to CPU lines. No cap (the
+     * guest only writes ~64 total). */
     if (addr >= P4_PERIPH_BASE + 0x10000u &&
         addr < P4_PERIPH_BASE + 0x10000u + 160 * 4u) {
         uint32_t s = (addr - P4_PERIPH_BASE - 0x10000u) >> 2;
         uint32_t v = val & 0x1Fu;
+        fprintf(stderr, "[MAPW] hart=0 src=%u line=%u%s\n",
+                s, v, (s >= 53 && s <= 55) || (s >= 79 && s <= 80) ? " <=TICK/XCPU" : "");
         soc->intc_intmap[0][s] = (v == 0u) ? 0xFFFFFFFFu : ((v - 16u) & 0x1Fu);
         /* SPI2 TRANS_DONE is level (active when idle): re-evaluate after
          * remap so the live level is not lost. */
@@ -4086,6 +4683,8 @@ static void esp32_mmio_write(riscv_t *rv, uint32_t addr, uint32_t val,
         addr < P4_PERIPH_BASE + 0x10800u + 160 * 4u) {
         uint32_t s = (addr - P4_PERIPH_BASE - 0x10800u) >> 2;
         uint32_t v = val & 0x1Fu;
+        fprintf(stderr, "[MAPW] hart=1 src=%u line=%u%s\n",
+                s, v, (s >= 53 && s <= 55) || (s >= 79 && s <= 80) ? " <=TICK/XCPU" : "");
         soc->intc_intmap[1][s] = (v == 0u) ? 0xFFFFFFFFu : ((v - 16u) & 0x1Fu);
         return;
     }
@@ -4376,6 +4975,37 @@ void esp32p4_write_w(riscv_t *rv, uint32_t addr, uint32_t val)
     if (r->base == P4_FLASH_I_BASE)
         return; /* flash window is RX; ignore writes */
     memcpy(r->data + (addr - r->base), &val, 4);
+    /* TEMP-MPYDIAG: sc-write census (REMOVE before commit). Logs the
+     * FIRST 8 word stores to 0x4ff3de80 (s_no_block_func[0], the word
+     * hart0's CAS loop guards) with writer hart + PC + value: proves
+     * whether hart0's CAS-loop sc ever commits a store vs hart1. */
+    if (addr == 0x4ff3de80u) {
+        static unsigned long p4_casw_n = 0;
+        if (p4_casw_n < 8) {
+            fprintf(stderr, "[CASW] n=%lu writer_hart=%d pc=%08x val=%08x\n",
+                    p4_casw_n, rv ? p4_hart(rv) : -1, rv ? rv->PC : 0, val);
+        }
+        p4_casw_n++;
+    }
+    /* An overlapping store by the peer hart clears its LR reservation
+     * (RISC-V forward-progress rule); a same-word sc store is the
+     * normal CAS success path and must clear the peer's reservation
+     * too (it observed a different value). Non-overlapping stores
+     * (other words, e.g. stack spills or FIFO polls) leave it live:
+     * a blanket any-address clear turns every peer store into a
+     * permanent sc failure (hart0 spun in compare_and_set forever
+     * once hart1 entered its IDLE loop). Guard each deref: this
+     * runs before soc/hart pointers exist. */
+    if (rv) {
+        esp32p4_t *soc = PRIV(rv)->esp32p4;
+        if (soc && soc->smp_enabled && soc->hart[0] && soc->hart[1]) {
+            riscv_t *other =
+                (rv == soc->hart[0]) ? soc->hart[1] : soc->hart[0];
+            if (other && other != rv && other->lr_valid &&
+                (addr & ~3u) == (other->lr_addr & ~3u))
+                other->lr_valid = false;
+        }
+    }
 }
 
 void esp32p4_write_s(riscv_t *rv, uint32_t addr, uint16_t val)
@@ -4388,6 +5018,17 @@ void esp32p4_write_s(riscv_t *rv, uint32_t addr, uint16_t val)
     if (r->base == P4_FLASH_I_BASE)
         return; /* flash window is RX; ignore writes */
     memcpy(r->data + (addr - r->base), &val, 2);
+    if (rv) {
+        esp32p4_t *soc = PRIV(rv)->esp32p4;
+        if (soc && soc->smp_enabled && soc->hart[0] && soc->hart[1]) {
+            riscv_t *other =
+                (rv == soc->hart[0]) ? soc->hart[1] : soc->hart[0];
+            if (other && other != rv && other->lr_valid &&
+                addr + 2u > (other->lr_addr & ~3u) &&
+                addr < ((other->lr_addr & ~3u) + 4u))
+                other->lr_valid = false;
+        }
+    }
 }
 
 void esp32p4_write_b(riscv_t *rv, uint32_t addr, uint8_t val)
@@ -4413,6 +5054,17 @@ void esp32p4_write_b(riscv_t *rv, uint32_t addr, uint8_t val)
     if (r->base == P4_FLASH_I_BASE)
         return; /* flash window is RX; ignore writes */
     r->data[addr - r->base] = val;
+    if (rv) {
+        esp32p4_t *soc = PRIV(rv)->esp32p4;
+        if (soc && soc->smp_enabled && soc->hart[0] && soc->hart[1]) {
+            riscv_t *other =
+                (rv == soc->hart[0]) ? soc->hart[1] : soc->hart[0];
+            if (other && other != rv && other->lr_valid &&
+                addr >= (other->lr_addr & ~3u) &&
+                addr < ((other->lr_addr & ~3u) + 4u))
+                other->lr_valid = false;
+        }
+    }
 }
 
 /* Route a guest PC to its backing bytes for instruction fetch.
@@ -4470,12 +5122,93 @@ uint32_t esp32p4_ifetch(riscv_t *rv, uint32_t addr)
         p4_md5_ecall = true; /* reuse flag: trailing ECALL skips PC+4 */
         return 0x00000073u; /* ecall (block-terminal) */
     }
-    /* ROM SPI-flash helpers (0x4fc00118 wait_idle, 0x4fc00168
-     * config_param): run NATIVELY. An earlier draft nop-hooked them,
-     * but the native bodies perform status side effects later code
-     * polls — suppressing them wedges the bootloader before
-     * console_init. The bodies are valid HP code that terminates
-     * against the instant-flash model. */
+    /* ROM interrupt slots (ELF symtabs of the CURRENT MPY build rule:
+     * esprv_intc_int_set_priority = esprv_int_set_priority = 0x4fc005ac,
+     * esprv_intc_int_set_threshold = esprv_int_set_threshold = 0x4fc005b0,
+     * esprv_intc_int_enable = esprv_int_enable = 0x4fc005b4,
+     * esprv_intc_int_disable = esprv_int_disable = 0x4fc005b8,
+     * esprv_intc_int_set_type = esprv_int_set_type = 0x4fc005bc,
+     * intr_matrix_set = esp_rom_route_intr_matrix = 0x4fc005c4.
+     * NOTE: esp32p4.rom.ld lists these 0xC HIGHER (5b8/5bc/5c0/5c4/5d0)
+     * — the linked firmware uses the ELF table above (verified: the
+     * guest calls threshold at 5b0, enable/disable/prio/type at
+     * 5b4/5b8/5ac/5bc, route at 5c4). ABI:
+     *  - enable/disable(mask): a0 = CPU-line bitmask (RV_EXTERNAL_INT
+     *    lines); enable sets clic_ie=1, disable clears it, for every
+     *    set bit of the calling hart's 32 external lines (CLIC
+     *    id 16+line). The SDK's ESP_INTR_ENABLE calls these via
+     *    esp_cpu_intr_enable/disable after routing the MAP.
+     *  - set_priority(line, prio): a0=line, a1=prio; store CTL byte.
+     *  - set_threshold(thresh): a0 = threshold value; store MMIO THRESH
+     *    (delivery takes max(MMIO, CSR MINTTHRESH), both >> 5).
+     *  - set_type(line, type): edge/level; stored (unused by delivery).
+     *  - intr_matrix_set(cpu, src, line): a0=cpu, a1=src, a2=line;
+     *    store into intc_intmap[cpu][src] (0 = unmapped). The SDK's
+     *    esp_intr_alloc routes every peripheral source through this.
+     * Covered on BOTH paths (live-gated ifetch hook here +
+     * PC-dispatched ecall cases). */
+    if (live && (addr == 0x4fc005acu || addr == 0x4fc005b0u ||
+                 addr == 0x4fc005b4u || addr == 0x4fc005b8u ||
+                 addr == 0x4fc005bcu || addr == 0x4fc005c4u)) {
+        esp32p4_t *rsoc = PRIV(rv)->esp32p4;
+        int rh = p4_hart(rv);
+        if (addr == 0x4fc005c4u) {
+            uint32_t cpu = rv->X[10], src = rv->X[11],
+                     line = rv->X[12] & 0x1Fu;
+            /* TEMP-MPYDIAG route trace (REMOVE with MAPW trace). */
+            fprintf(stderr, "[ROUTE] cpu=%u src=%u line=%u%s hart=%d\n",
+                    cpu, src, line,
+                    (src >= 53 && src <= 55) || (src >= 79 && src <= 80) ? " <=TICK/XCPU" : "",
+                    rh);
+            /* ROM ABI passes the raw CPU line (0..31, line 0 is
+             * live); store it directly. Do NOT subtract 16 here —
+             * that conversion is only for the MMIO MAP path whose
+             * HW register holds (line+16) with 0 = unmapped. */
+            if (rsoc && cpu < 2 && src < 160)
+                rsoc->intc_intmap[cpu][src] = line & 0x1Fu;
+        } else if (addr == 0x4fc005acu) {
+            uint32_t line = rv->X[10], prio = rv->X[11] & 0xFFu;
+            /* TEMP-MPYDIAG prio trace (REMOVE with CLICW). */
+            fprintf(stderr, "[ROMPRIO] hart=%d line=%u prio=%02x\n",
+                    rh, line, prio);
+            /* The ROM ABI passes the CPU *line* (0..31); lines >= 32
+             * are garbage from non-line callers — ignore them (an
+             * earlier draft indexed clic_ctl out of bounds). */
+            if (rsoc && line < 32)
+                rsoc->clic_ctl[rh][16 + line] = (uint8_t) prio;
+        } else if (addr == 0x4fc005b0u) {
+            uint32_t th = rv->X[10] & 0xFFu;
+            /* TEMP-MPYDIAG thresh trace (REMOVE with CLICW). */
+            fprintf(stderr, "[ROMTH] hart=%d thresh=%02x\n", rh, th);
+            /* INTTHRESH_STANDARD=1 on this P4 (rev>=3): the threshold
+             * lives in the per-hart MINTTHRESH CSR (0x347), NOT the
+             * MMIO THRESH reg. Mirror to both so the max() in delivery
+             * stays correct either way. */
+            if (rsoc) {
+                rsoc->clic_thresh[rh] = th;
+                if (rh < 2 && rsoc->hart[rh])
+                    rsoc->hart[rh]->csr_mintthresh = th;
+            }
+        } else if (addr == 0x4fc005bcu) {
+            /* set_type(line, type): edge/level select; stored for
+             * completeness (delivery treats all lines as level). */
+            uint32_t line = rv->X[10], ty = rv->X[11] & 0x3u;
+            fprintf(stderr, "[ROMTYPE] hart=%d line=%u type=%u\n",
+                    rh, line, ty);
+        } else {
+            uint32_t mask = rv->X[10];
+            /* TEMP-MPYDIAG CLIC-enable trace (REMOVE with CLICW). */
+            fprintf(stderr, "[ROMIE] hart=%d %s mask=%08x\n",
+                    rh, addr == 0x4fc005b4u ? "enable" : "disable", mask);
+            if (rsoc)
+                for (int l = 0; l < 32; l++)
+                    if (mask & (1u << l))
+                        rsoc->clic_ie[rh][16 + l] = (addr == 0x4fc005b4u) ? 1u : 0u;
+        }
+        rv->PC = rv->X[1];
+        p4_md5_ecall = true;
+        return 0x00000073u; /* ecall (block-terminal) */
+    }
     /* ROM UART slots (per esp32p4.rom.ld — slot JALs verified against
      * the real 128 KB dump: install_printf 0x30 -> 0x4fc03374,
      * tx_one_char 0x54 -> 0x4fc0a77c, flush 0x74 -> 0x4fc0a838,
@@ -4799,6 +5532,63 @@ void esp32p4_ecall_handler(riscv_t *rv)
     case 0x4fc000a8u: /* ets_set_appcpu_boot_addr(addr): record it */
         soc->appcpu_boot_addr = rv->X[10];
         break;
+    case 0x4fc005acu: /* esprv_intc_int_set_priority(line, prio). */
+        {
+            uint32_t line = rv->X[10], prio = rv->X[11] & 0xFFu;
+            int eh = p4_hart(rv);
+            /* TEMP-MPYDIAG prio trace (REMOVE with CLICW). */
+            fprintf(stderr, "[ROMPRIO-ecall] hart=%d line=%u prio=%02x\n",
+                    eh, line, prio);
+            /* Lines >= 32 are not CPU lines — ignore (OOB guard). */
+            if (soc && line < 32)
+                soc->clic_ctl[eh][16 + line] = (uint8_t) prio;
+        }
+        break;
+    case 0x4fc005b0u: /* esprv_intc_int_set_threshold(thresh). */
+        {
+            uint32_t th = rv->X[10] & 0xFFu;
+            /* TEMP-MPYDIAG thresh trace (REMOVE with CLICW). */
+            fprintf(stderr, "[ROMTH-ecall] hart=%d thresh=%02x\n",
+                    p4_hart(rv), th);
+            if (soc) {
+                int eh = p4_hart(rv);
+                soc->clic_thresh[eh] = th;
+                if (eh < 2 && soc->hart[eh])
+                    soc->hart[eh]->csr_mintthresh = th;
+            }
+        }
+        break;
+    case 0x4fc005bcu: /* esprv_intc_int_set_type(line, type): nop-store. */
+        break;
+    case 0x4fc005b4u: /* esprv_intc_int_enable(mask): CPU-line enable. */
+    case 0x4fc005b8u: /* esprv_intc_int_disable(mask): CPU-line disable. */
+        {
+            uint32_t mask = rv->X[10];
+            int eh = p4_hart(rv);
+            /* TEMP-MPYDIAG ROMIE trace (REMOVE with ROMIE trace). */
+            fprintf(stderr, "[ROMIE-ecall] hart=%d %s mask=%08x\n",
+                    eh, slot == 0x4fc005b4u ? "enable" : "disable", mask);
+            if (soc)
+                for (int l = 0; l < 32; l++)
+                    if (mask & (1u << l))
+                        soc->clic_ie[eh][16 + l] = (slot == 0x4fc005b4u) ? 1u : 0u;
+        }
+        break;
+    case 0x4fc005c4u: /* intr_matrix_set(cpu, src, line): MAP program. */
+        {
+            uint32_t cpu = rv->X[10], src = rv->X[11],
+                     line = rv->X[12] & 0x1Fu;
+            /* TEMP-MPYDIAG route trace (REMOVE with MAPW trace). */
+            fprintf(stderr, "[ROUTE-ecall] cpu=%u src=%u line=%u%s hart=%d\n",
+                    cpu, src, line,
+                    (src >= 53 && src <= 55) || (src >= 79 && src <= 80) ? " <=TICK/XCPU" : "",
+                    p4_hart(rv));
+            /* ROM ABI passes the raw CPU line (0..31, line 0 live);
+             * store directly (no -16; that is MMIO-MAP HW format). */
+            if (soc && cpu < 2 && src < 160)
+                soc->intc_intmap[cpu][src] = line & 0x1Fu;
+        }
+        break;
     case 0x4FC005E0u: /* MD5Init(ctx=a0): write IV + zero bitcount. */
         {
             uint8_t *p = esp32p4_guest_to_host(soc, rv->X[10]);
@@ -5057,18 +5847,20 @@ void esp32p4_check_interrupt(riscv_t *rv)
      * updated below only for compatibility with generic CSR reads.) */
     uint32_t lines = esp32_intc_raise(soc, h);
     rv->csr_mip = (rv->csr_mip & ~0x0FFFFFFEu) | lines;
-    /* Effective CLIC threshold: MMIO THRESH (never programmed by the SDK;
-     * stays 0) vs CSR MINTTHRESH (0x347, the SMP port's critical-section
-     * mask: xPortEnterCritical writes 127). Guest levels live in
-     * CTL[7:5] (SDK uses 0x20/0x80-style bytes), so compare in level
-     * domain: ROM's idle threshold 31 scales to 0 (everything fires,
-     * exactly the pre-MINTTHRESH behavior) while take()'s 127 scales to
-     * 3 (masks levels 0-3 inside critical sections, HW-faithful). */
+    /* Effective CLIC threshold: max(MMIO THRESH, CSR MINTTHRESH).
+     * Values are raw CSR/MMIO bytes in level domain already (guest
+     * levels live in CTL[7:5]... NO — CTL holds a full priority byte
+     * (SDK uses 0x20/0x80-style bytes) and the threshold slots carry
+     * raw threshold bytes (idle 0x1f, enable 0x00, critical 0x7f).
+     * Compare RAW bytes directly (no >> 5): idle 0x1f < tick 0x20
+     * fires; critical 0x7f masks levels 0x00-0x7e (only 0x80+
+     * console lines preempt). The old >> 5 scaling collapsed the
+     * whole working range (0x00-0x3f) to level 0-1 and let the tick
+     * storm through constantly. */
     uint32_t thresh = soc->clic_thresh[h] & 0xFFu;
     uint32_t mintthresh = rv->csr_mintthresh & 0xFFu;
     if (mintthresh > thresh)
         thresh = mintthresh;
-    thresh >>= 5;
     int best_id = -1;
     uint32_t best_level = 0;
     for (int id = 0; id < 64; id++) {
@@ -5089,13 +5881,13 @@ void esp32p4_check_interrupt(riscv_t *rv)
             if (soc->clic_ip_sw[h][id])
                 ip = 1;
         }
+        /* IE gates on bit 0 (HW enable). */
         if (!ip || !soc->clic_ie[h][id])
             continue;
-        /* Level = CTL[7:5] (NLBITS=3). Threshold 0 outside critical
-         * sections (SDK default + scaled ROM idle value), 3 inside
-         * take() — only level 4+ lines (e.g. 0x80 console lines)
-         * preempt critical sections, as on HW. */
-        uint32_t level = ((uint32_t) soc->clic_ctl[h][id]) >> 5;
+        /* Level/priority and threshold are raw bytes (SDK uses
+         * 0x20/0x80-style CTL bytes; threshold slots carry 0x00 /
+         * 0x1f / 0x7f). CLIC fires when level >= threshold. */
+        uint32_t level = (uint32_t) soc->clic_ctl[h][id];
         if (level < thresh)
             continue;
         if (best_id < 0 || level > best_level ||
@@ -5107,6 +5899,11 @@ void esp32p4_check_interrupt(riscv_t *rv)
     if (best_id < 0)
         return;
     dbg_trap_deliv++;
+    /* TEMP-MPYDIAG trap census (REMOVE with p4_trapnote). */
+    {
+        extern void p4_trapnote(riscv_t *, uint32_t);
+        p4_trapnote(rv, (uint32_t) best_id);
+    }
     /* mcause exccode = CLIC ID; always vector via MTVT + 4*ID. (The SDK
      * clears the ATTR byte to 0 when configuring priority yet relies on
      * vectored dispatch, so the P4 CLIC behaves as all-vectored; gating on
@@ -5355,60 +6152,131 @@ void esp32p4_periodic(riscv_t *rv)
         }
     }
 
-    /* I2C transfer completion: a trans_start was issued. Without a slave
-     * the address byte is never ACKed -> NACK + trans-complete, which the
-     * ISR maps to I2C_INTR_EVENT_NACK (I2C_EXT0 = INTMTX source 50). With
-     * the virtual device (0x50) the transfer is ACKed: writes are stored
-     * into its memory, reads return the memory contents via the RX fifo. */
-    if (soc->i2c_transfer_pending) {
-        soc->i2c_transfer_pending = 0;
-        if (soc->i2c_slave_active) {
-            uint8_t *t = soc->i2c_tx_fifo;
-            int tl = soc->i2c_tx_len;
-            /* Combined write-register-address + read (repeated start), as the
-             * Arduino Wire library emits for endTransmission(false)+requestFrom:
-             * tx_fifo = [WADDR, REG, RADDR]. Set the pointer from REG, then
-             * return dev_mem from there (the read phase of the same op). */
-            if (!soc->i2c_slave_rw && tl >= 3 &&
-                (t[0] & 1u) == 0u && (t[2] & 1u) == 1u &&
-                (t[0] >> 1) == (t[2] >> 1)) {
-                int p = t[1];
-                soc->i2c_dev_ptr = p;
-                soc->i2c_rx_len = 0;
-                soc->i2c_rx_pos = 0;
-                for (int i = 0; i < 8; i++) {
-                    soc->i2c_rx_fifo[i] = soc->i2c_dev_mem[(p++) & 15];
-                    soc->i2c_rx_len = 8;
-                }
-                soc->i2c_dev_ptr = p & 15;
-            } else if (soc->i2c_slave_rw) {
-                /* READ: return dev_mem from the current pointer, then
-                 * auto-increment (standard EEPROM sequential read). */
-                soc->i2c_rx_len = 0;
-                soc->i2c_rx_pos = 0;
-                int p = soc->i2c_dev_ptr;
-                for (int i = 0; i < 8; i++) {
-                    soc->i2c_rx_fifo[i] = soc->i2c_dev_mem[(p++) & 15];
-                    soc->i2c_rx_len = 8;
-                }
-                soc->i2c_dev_ptr = p & 15;
-            } else {
-                /* WRITE: tx_fifo[1] is the register/memory address; the
-                 * following bytes are stored there and auto-increment. */
-                int p = soc->i2c_dev_ptr;
-                for (int i = 1; i < soc->i2c_tx_len; i++) {
-                    if (i == 1) {
-                        soc->i2c_dev_ptr = soc->i2c_tx_fifo[i];
-                        p = soc->i2c_dev_ptr;
+    /* I2C command-list execution: the walker consumes the command
+     * regs [RSTART, WRITE(addr), ...] programmed by EITHER IDF driver
+     * (legacy Arduino via cmd_link — one hw op per command reg plus an
+     * END reg; new MicroPython driver via ops — hw ops followed by one
+     * END reg). The address byte travels in the TX FIFO: single-byte
+     * writes push it via DATA (i2c_master_write_byte -> data_byte ->
+     * one DATA store), and multi-byte payloads head the FIFO the same
+     * way. So: the first WRITE after an RSTART consumes its first FIFO
+     * byte as the ADDRESS ((addr>>1)==0x50 ACKs, else NACK; bit0 = R/W
+     * phase); remaining bytes of that WRITE plus later WRITEs are
+     * payload (first payload byte of a W phase = register pointer,
+     * rest store with auto-increment). READ assembles RX bytes from
+     * the pointer. On a NACK the walker stops WITHOUT consuming the
+     * STOP/END (real HW halts the list at the failing op: the ISR's
+     * NACK arm re-runs cmd_begin, which programs the STOP chunk as a
+     * fresh round and reports END_DET there). A STOP-led run (no prior
+     * NACK this round) raises END_DETECT (bit 3); a list run to END
+     * raises TRANS_COMPLETE (bit 7); a NACKed one raises NACK (bit 10)
+     * alone (real HW reports a NACKed address phase as NACK only —
+     * the master event decode checks NACK before END_DET/TRANS_DONE,
+     * and the ISR's NACK arm runs the next command chunk (the STOP)
+     * as its own round; raising COMPLETE too makes the event decode
+     * see TRANS_DONE first and the scan probe can never report
+     * NOT_FOUND). The CPU interrupt follows INT_ENA gating like HW.
+     * TX fifo drains. Done bits are NOT tracked (the legacy driver
+     * re-programs command regs verbatim each round, so a sticky done
+     * bit would wedge every round after the first); each walk stops
+     * at the first unprogrammed reg, so stale regs never re-execute. */
+    if (soc->i2c_exec_pending) {
+        soc->i2c_exec_pending = 0;
+        int nack = 0, got_stop = 0, addr_phase = 0, saw_stop = 0;
+        for (int c = 0; c < 8 && !got_stop; c++) {
+            uint32_t cmd = soc->i2c_reg[(0x58u >> 2) + c] & ~(1u << 31);
+            if (cmd == 0)
+                break; /* unprogrammed reg: end of this round's list */
+            unsigned op = (cmd >> 11) & 7u;
+            unsigned n = cmd & 0xFFu;
+            if (op == 6u) { /* RSTART: next WRITE's first FIFO byte is
+                             * the address. */
+                addr_phase = 1;
+                continue;
+            } else if (op == 1u) { /* WRITE */
+                if (addr_phase && n >= 1 &&
+                    soc->i2c_cmd_ptr < soc->i2c_tx_len) {
+                    /* Address byte heads the FIFO: ACK/NACK + phase. */
+                    uint32_t ab = soc->i2c_tx_fifo[soc->i2c_cmd_ptr++];
+                    addr_phase = 0;
+                    if ((ab >> 1) == P4_I2C_DEV_ADDR) {
+                        soc->i2c_slave_active = 1;
+                        soc->i2c_slave_rw = ab & 1u;
                     } else {
-                        soc->i2c_dev_mem[(p++) & 15] = soc->i2c_tx_fifo[i];
+                        soc->i2c_slave_active = 0;
+                        nack = 1;
+                    }
+                    /* Remaining bytes of this WRITE are payload. */
+                    for (unsigned k = 1; k < n; k++) {
+                        if (soc->i2c_cmd_ptr >= soc->i2c_tx_len)
+                            break;
+                        uint8_t b = soc->i2c_tx_fifo[soc->i2c_cmd_ptr++];
+                        if (!soc->i2c_slave_active || soc->i2c_slave_rw)
+                            continue;
+                        if (k == 1) {
+                            soc->i2c_dev_ptr = b; /* register pointer */
+                        } else {
+                            soc->i2c_dev_mem[(soc->i2c_dev_ptr++) & 15] = b;
+                            soc->i2c_dev_ptr &= 15;
+                        }
+                    }
+                } else {
+                    /* Payload-only WRITE (address stub or continuation):
+                     * all FIFO bytes are payload. First payload byte of
+                     * a fresh W phase is the register pointer. */
+                    addr_phase = 0;
+                    for (unsigned k = 0; k < n; k++) {
+                        if (soc->i2c_cmd_ptr >= soc->i2c_tx_len)
+                            break;
+                        uint8_t b = soc->i2c_tx_fifo[soc->i2c_cmd_ptr++];
+                        if (!soc->i2c_slave_active || soc->i2c_slave_rw)
+                            continue;
+                        if (k == 0 && soc->i2c_cmd_ptr == 1) {
+                            soc->i2c_dev_ptr = b; /* register pointer */
+                        } else {
+                            soc->i2c_dev_mem[(soc->i2c_dev_ptr++) & 15] = b;
+                            soc->i2c_dev_ptr &= 15;
+                        }
                     }
                 }
-                soc->i2c_dev_ptr = p & 15;
+            } else if (op == 3u) { /* READ: assemble RX bytes */
+                if (nack) {
+                    /* Address phase already failed: HW halts the list
+                     * at the failing op, so this READ never runs. */
+                    got_stop = 1;
+                } else if (!soc->i2c_slave_active)
+                    nack = 1;
+                else {
+                    for (unsigned k = 0; k < n; k++) {
+                        if (soc->i2c_rx_len < 32)
+                            soc->i2c_rx_fifo[soc->i2c_rx_len++] =
+                                soc->i2c_dev_mem[(soc->i2c_dev_ptr++) & 15];
+                    }
+                    soc->i2c_dev_ptr &= 15;
+                }
+            } else if (op == 2u) { /* STOP */
+                saw_stop = 1;
+                got_stop = 1;
+            } else if (op == 4u) { /* END */
+                got_stop = 1;
             }
-            soc->i2c_reg[0x20 >> 2] |= 1u << 7; /* trans complete, no nack */
+        }
+        if (nack) {
+            /* NACK alone (no END_DETECT, no TRANS_COMPLETE): real HW
+             * halts the list at the failing op and reports a NACKed
+             * address phase as NACK only — the master event decode
+             * checks NACK before END_DET/TRANS_DONE, and the ISR's NACK
+             * arm runs the next command chunk (the STOP) as its own
+             * round. Raising COMPLETE too makes the event decode see
+             * TRANS_DONE first and the scan probe can never report
+             * NOT_FOUND (scan-never-finds). */
+            soc->i2c_reg[0x20 >> 2] |= (1u << 10); /* NACK */
+        } else if (saw_stop) {
+            /* STOP-terminated round (the ISR's ACK_ERROR STOP chunk):
+             * END_DETECT only. */
+            soc->i2c_reg[0x20 >> 2] |= (1u << 3); /* END_DETECT */
         } else {
-            soc->i2c_reg[0x20 >> 2] |= (1u << 10) | (1u << 7); /* nack */
+            soc->i2c_reg[0x20 >> 2] |= 1u << 7; /* TRANS_COMPLETE */
         }
         soc->i2c_reg[0x4 >> 2] &= ~(1u << 5); /* trans_start self-clears */
         soc->i2c_tx_len = 0;
@@ -5656,18 +6524,43 @@ void esp32p4_periodic(riscv_t *rv)
         }
     }
 
-    /* feed host-injected bytes into the UART RX FIFO (throttled) */
-    if ((rv->csr_cycle & 0x1FFu) == 0)
+    /* feed host-injected bytes into the UART RX FIFO (throttled).
+     * The RX interrupt below only fires on new arrivals (edge): the
+     * periodic block re-raises the raw bit while bytes wait, but the
+     * INTC line itself is level-following and does NOT re-trap a hart
+     * that already took the IRQ — the ISR drains the FIFO, it does not
+     * poll. So a byte that arrives while its raw bit is already set
+     * (or whose edge was consumed before ENA was armed) would sit
+     * forever without waking the ISR. The poll therefore raises the
+     * edge here, when it actually appends bytes. */
+    if ((rv->csr_cycle & 0x1FFu) == 0) {
+        unsigned int before = (soc->uart_rx_head[0] - soc->uart_rx_tail[0]) &
+                              (UART_RX_FIFO_SZ - 1u);
         esp32p4_uart_rx_poll(soc);
+        unsigned int after = (soc->uart_rx_head[0] - soc->uart_rx_tail[0]) &
+                             (UART_RX_FIFO_SZ - 1u);
+        if (after != before) {
+            uint32_t *raw = &mmio32[UART_INT_RAW_REG >> 2];
+            if (!(*raw & (UART_RXFIFO_TOUT_BIT | 0x1u))) {
+                *raw |= UART_RXFIFO_TOUT_BIT | 0x1u;
+                if (mmio32[UART_INT_ENA_REG >> 2] &
+                    (UART_RXFIFO_TOUT_BIT | 0x1u))
+                    p4_intc_set(soc, P4_UART0_INTR_SOURCE);
+            }
+        }
+    }
 
     /* UART RX interrupt: bytes are waiting and the driver armed
-     * RXFIFO_TOUT (real HW fires it after rx_tout_thrhd idle bit times;
-     * the model fires it immediately, the ISR then drains the FIFO). */
+     * RXFIFO_FULL (bit 0, fires at the programmed threshold — MPY sets
+     * 120) or RXFIFO_TOUT (bit 8, fires after the idle timeout). The
+     * edge above fires on arrival; this level-follower keeps raw set
+     * while bytes wait so a late-armed ENA still sees them. */
     if (soc->uart_rx_head[0] != soc->uart_rx_tail[0]) {
         uint32_t *raw = &mmio32[UART_INT_RAW_REG >> 2];
-        if ((mmio32[UART_INT_ENA_REG >> 2] & UART_RXFIFO_TOUT_BIT) &&
-            !(*raw & UART_RXFIFO_TOUT_BIT)) {
-            *raw |= UART_RXFIFO_TOUT_BIT;
+        if ((mmio32[UART_INT_ENA_REG >> 2] &
+             (UART_RXFIFO_TOUT_BIT | 0x1u)) &&
+            !(*raw & (UART_RXFIFO_TOUT_BIT | 0x1u))) {
+            *raw |= UART_RXFIFO_TOUT_BIT | 0x1u;
             p4_intc_set(soc, P4_UART0_INTR_SOURCE);
         }
     }

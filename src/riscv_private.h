@@ -260,12 +260,18 @@ struct riscv_internal {
 
     uint32_t hart_id; /**< hardware thread ID (MHARTID CSR; 0 unless SMP) */
 
-    /* LR/SC reservation (value-based, SMP-safe): lrw records the loaded
-     * value; scw succeeds only if memory still holds it. This restores
-     * mutual exclusion when two harts interleave LR/SC pairs (the old
-     * always-succeed SC let both harts hold a spinlock). ABA matches
-     * are benign for lock words (free->owned->free still means free). */
+    /* LR/SC reservation (address-based per the RISC-V spec, SMP-safe):
+     * lrw records the reserved word address + live flag; scw succeeds
+     * iff the reservation is still live for that address. A peer
+     * hart's store clears it only when it overlaps the reserved word
+     * (esp32p4_write_w/s/b cross-hart invalidation). The old
+     * value-comparison check turned a peer hart's same-value poll
+     * store into a permanent sc failure (hart0 spun in
+     * esp_cpu_compare_and_set forever with a live reservation); a
+     * blanket any-address invalidation has the opposite failure
+     * (every peer store kills the reservation, sc never succeeds). */
     uint32_t lr_value;
+    uint32_t lr_addr;
     bool lr_valid;
 
 #ifdef __EMSCRIPTEN__
